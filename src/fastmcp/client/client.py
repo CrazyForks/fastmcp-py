@@ -29,6 +29,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server import FastMCP
 from fastmcp.utilities.exceptions import get_catch_handlers
 from fastmcp.utilities.mcp_config import MCPConfig
+from fastmcp.utilities.types import MCPContent
 
 from .transports import (
     ClientTransportT,
@@ -145,6 +146,7 @@ class Client(Generic[ClientTransportT]):
         progress_handler: ProgressHandler | None = None,
         timeout: datetime.timedelta | float | int | None = None,
         init_timeout: datetime.timedelta | float | int | None = None,
+        client_info: mcp.types.Implementation | None = None,
         auth: httpx.Auth | Literal["oauth"] | str | None = None,
     ):
         self.transport = cast(ClientTransportT, infer_transport(transport))
@@ -165,7 +167,7 @@ class Client(Generic[ClientTransportT]):
 
         # handle init handshake timeout
         if init_timeout is None:
-            init_timeout = fastmcp.settings.settings.client_init_timeout
+            init_timeout = fastmcp.settings.client_init_timeout
         if isinstance(init_timeout, datetime.timedelta):
             init_timeout = init_timeout.total_seconds()
         elif not init_timeout:
@@ -180,6 +182,7 @@ class Client(Generic[ClientTransportT]):
             "logging_callback": create_log_callback(log_handler),
             "message_handler": message_handler,
             "read_timeout_seconds": timeout,
+            "client_info": client_info,
         }
 
         if roots is not None:
@@ -656,9 +659,7 @@ class Client(Generic[ClientTransportT]):
         arguments: dict[str, Any] | None = None,
         timeout: datetime.timedelta | float | int | None = None,
         progress_handler: ProgressHandler | None = None,
-    ) -> list[
-        mcp.types.TextContent | mcp.types.ImageContent | mcp.types.EmbeddedResource
-    ]:
+    ) -> list[MCPContent]:
         """Call a tool on the server.
 
         Unlike call_tool_mcp, this method raises a ToolError if the tool call results in an error.
@@ -670,7 +671,7 @@ class Client(Generic[ClientTransportT]):
             progress_handler (ProgressHandler | None, optional): The progress handler to use for the tool call. Defaults to None.
 
         Returns:
-            list[mcp.types.TextContent | mcp.types.ImageContent | mcp.types.EmbeddedResource]:
+            list[mcp.types.TextContent | mcp.types.ImageContent | mcp.types.AudioContent | mcp.types.EmbeddedResource]:
                 The content returned by the tool.
 
         Raises:
