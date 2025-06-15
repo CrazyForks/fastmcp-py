@@ -1,5 +1,5 @@
 ---
-title: Gemini SDK
+title: Gemini SDK + FastMCP
 sidebarTitle: Gemini SDK
 description: Call FastMCP servers from the Google Gemini SDK
 icon: message-smile
@@ -67,7 +67,7 @@ mcp_client = Client("server.py")
 gemini_client = genai.Client()
 
 async def main():    
-    async with client:
+    async with mcp_client:
         response = await gemini_client.aio.models.generate_content(
             model="gemini-2.0-flash",
             contents="Roll 3 dice!",
@@ -98,7 +98,7 @@ For example, to connect to a remote, authenticated server, you can use the follo
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
 
-client = Client(
+mcp_client = Client(
     "https://my-server.com/sse",
     auth=BearerAuth("<your-token>"),
 )
