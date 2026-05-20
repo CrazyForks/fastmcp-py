@@ -287,9 +287,13 @@ def resolve_root_ref(schema: dict[str, Any]) -> dict[str, Any]:
                 # default, or examples next to the root $ref. Those fields still
                 # describe the root schema even when we can only resolve that
                 # root reference for circular schemas.
-                for key, value in schema.items():
-                    if key not in {"$ref", "$defs"}:
-                        resolved[key] = value
+                resolved.update(
+                    {
+                        key: value
+                        for key, value in schema.items()
+                        if key not in {"$ref", "$defs"}
+                    }
+                )
 
                 # Preserve $defs for nested references (other fields may still use them)
                 resolved["$defs"] = defs
