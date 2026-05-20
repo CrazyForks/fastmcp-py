@@ -177,6 +177,7 @@ class WorkOSProvider(OAuthProxy):
         consent_csp_policy: str | None = None,
         forward_resource: bool = True,
         fallback_refresh_token_expiry_seconds: int | None = None,
+        token_expiry_threshold_seconds: int = 0,
         extra_authorize_params: dict[str, str] | None = None,
         http_client: httpx.AsyncClient | None = None,
         enable_cimd: bool = True,
@@ -216,6 +217,9 @@ class WorkOSProvider(OAuthProxy):
             extra_authorize_params: Additional parameters to forward to WorkOS's authorization endpoint.
                 Useful for forcing scopes like `offline_access` so WorkOS issues a refresh token,
                 e.g. ``{"scope": "openid profile email offline_access"}``.
+            token_expiry_threshold_seconds: Number of seconds before actual expiry to consider
+                a token as expired (default 0). Prevents race conditions where a token
+                passes the expiry check but expires before the next operation completes.
             http_client: Optional httpx.AsyncClient for connection pooling in token verification.
                 When provided, the client is reused across verify_token calls and the caller
                 is responsible for its lifecycle. When None (default), a fresh client is created per call.
@@ -260,6 +264,7 @@ class WorkOSProvider(OAuthProxy):
             consent_csp_policy=consent_csp_policy,
             forward_resource=forward_resource,
             fallback_refresh_token_expiry_seconds=fallback_refresh_token_expiry_seconds,
+            token_expiry_threshold_seconds=token_expiry_threshold_seconds,
             extra_authorize_params=extra_authorize_params,
             valid_scopes=valid_scopes_final,
             enable_cimd=enable_cimd,
