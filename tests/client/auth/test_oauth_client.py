@@ -1,3 +1,4 @@
+import socket
 import time
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -6,6 +7,8 @@ import httpx
 import pytest
 from mcp.types import TextResourceContents
 
+import fastmcp.client.auth.oauth as oauth_module
+import fastmcp.utilities.http as http_module
 from fastmcp.client import Client
 from fastmcp.client.auth import OAuth
 from fastmcp.client.transports import StreamableHttpTransport
@@ -175,6 +178,100 @@ class TestOAuthClientUrlHandling:
 
         # Token storage should key by the full URL, not just the host
         assert oauth.token_storage_adapter._server_url == mcp_url
+
+    def test_oauth_uses_configured_callback_host_port_and_timeout(self):
+        oauth = OAuth(
+            mcp_url="https://example.com/mcp",
+            callback_port=8765,
+            callback_host="127.0.0.1",
+            callback_timeout=12.5,
+        )
+
+        assert oauth.context.client_metadata.redirect_uris is not None
+        assert str(oauth.context.client_metadata.redirect_uris[0]) == (
+            "http://127.0.0.1:8765/callback"
+        )
+        assert oauth._callback_timeout == 12.5
+
+    @pytest.mark.parametrize("callback_host", ["::1", "[::1]"])
+    def test_oauth_brackets_ipv6_callback_host_in_redirect_uri(
+        self, callback_host: str
+    ):
+        oauth = OAuth(
+            mcp_url="https://example.com/mcp",
+            callback_port=8765,
+            callback_host=callback_host,
+        )
+
+        assert oauth.context.client_metadata.redirect_uris is not None
+        assert str(oauth.context.client_metadata.redirect_uris[0]) == (
+            "http://[::1]:8765/callback"
+        )
+        assert oauth._callback_host == "::1"
+
+    def test_oauth_finds_available_port_on_callback_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        seen_hosts: list[str] = []
+
+        def find_available_port(host: str = "127.0.0.1") -> int:
+            seen_hosts.append(host)
+            return 8765
+
+        monkeypatch.setattr(oauth_module, "find_available_port", find_available_port)
+
+        oauth = OAuth(
+            mcp_url="https://example.com/mcp",
+            callback_host="[::1]",
+        )
+
+        assert seen_hosts == ["::1"]
+        assert oauth.redirect_port == 8765
+        assert oauth.context.client_metadata.redirect_uris is not None
+        assert str(oauth.context.client_metadata.redirect_uris[0]) == (
+            "http://[::1]:8765/callback"
+        )
+
+    @pytest.mark.parametrize(
+        ("host", "expected_family"),
+        [
+            ("localhost", socket.AF_INET),
+            ("127.0.0.1", socket.AF_INET),
+            ("::1", socket.AF_INET6),
+        ],
+    )
+    def test_available_port_uses_uvicorn_host_family(
+        self,
+        host: str,
+        expected_family: socket.AddressFamily,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        seen: list[tuple[socket.AddressFamily, tuple[str, int]]] = []
+
+        class FakeSocket:
+            def __init__(
+                self,
+                family: socket.AddressFamily,
+                socket_type: socket.SocketKind,
+            ):
+                self.family = family
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def bind(self, address: tuple[str, int]) -> None:
+                seen.append((self.family, address))
+
+            def getsockname(self) -> tuple[str, int]:
+                return host, 8765
+
+        monkeypatch.setattr(http_module.socket, "socket", FakeSocket)
+
+        assert http_module.find_available_port(host=host) == 8765
+        assert seen == [(expected_family, (host, 0))]
 
 
 class TestOAuthGeneratorCleanup:
