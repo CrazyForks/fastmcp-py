@@ -711,6 +711,96 @@ class TestResourceTemplates:
             assert user_template.name == "overwritten_get_user"
 
 
+class TestResourceTemplateQueryParams:
+    """Resource templates with RFC 6570 {?param} query params work through proxy."""
+
+    async def test_query_param_forwarded(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}{?format}")
+        def get_data(id: str, format: str = "json") -> str:
+            return f"id={id} format={format}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://123?format=xml")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=123 format=xml"
+
+    async def test_query_param_default_used_when_omitted(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}{?format}")
+        def get_data(id: str, format: str = "json") -> str:
+            return f"id={id} format={format}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://123")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=123 format=json"
+
+    async def test_multiple_query_params_forwarded(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}{?limit,offset}")
+        def get_data(id: str, limit: int = 10, offset: int = 0) -> str:
+            return f"id={id} limit={limit} offset={offset}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://abc?limit=5&offset=20")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=abc limit=5 offset=20"
+
+    async def test_encoded_path_param_preserved(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}")
+        def get_data(id: str) -> str:
+            return f"id={id}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://a%2Fb")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=a/b"
+
+    async def test_hyphenated_query_param_forwarded(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}{?api-version}")
+        def get_data(id: str, api_version: str = "v1") -> str:
+            return f"id={id} api_version={api_version}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://123?api-version=v2")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=123 api_version=v2"
+
+    def test_same_name_in_path_and_query_is_rejected(self):
+        remote = FastMCP("Remote")
+        with pytest.raises(ValueError, match="must be optional"):
+
+            @remote.resource("data://{id}{?id}")
+            def get_data(id: str) -> str:
+                return id
+
+    async def test_hyphenated_query_param_not_double_encoded(self):
+        remote = FastMCP("Remote")
+
+        @remote.resource("data://{id}{?api-version}")
+        def get_data(id: str, api_version: str = "v1") -> str:
+            return f"id={id} api_version={api_version}"
+
+        proxy = create_proxy(Client(remote))
+        async with Client(proxy) as client:
+            result = await client.read_resource("data://123?api-version=a%2Fb")
+        assert isinstance(result[0], TextResourceContents)
+        assert result[0].text == "id=123 api_version=a/b"
+
+
 class TestPrompts:
     async def test_get_prompts_server_method(self, proxy_server: FastMCPProxy):
         prompts = await proxy_server.list_prompts()
