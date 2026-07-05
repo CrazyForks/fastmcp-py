@@ -278,7 +278,7 @@ class OIDCProxy(OAuthProxy):
             allowed_client_redirect_uris: List of allowed redirect URI patterns for MCP clients.
                 Patterns support wildcards (e.g., "http://localhost:*", "https://*.example.com/*").
                 If None (default), DCR clients use registered redirect URIs, with loopback
-                ports allowed to vary for MCP compatibility.
+                ports allowed to vary for MCP compatibility. Unsafe browser schemes are rejected.
                 If empty list, no redirect URIs are allowed.
                 These are for MCP clients performing loopback redirects, NOT for the upstream OAuth app.
             client_storage: Storage backend for OAuth state (client registrations, encrypted tokens).

@@ -194,7 +194,8 @@ mcp = FastMCP(name="My Server", auth=auth)
   List of allowed redirect URI patterns for MCP clients. Patterns support
   wildcards (e.g., `"http://localhost:*"`, `"https://*.example.com/*"`).
   - `None` (default): DCR clients use registered redirect URIs, with loopback
-    ports allowed to vary for MCP compatibility
+    ports allowed to vary for MCP compatibility. Unsafe browser schemes such as
+    `javascript:`, `data:`, `file:`, and `vbscript:` are rejected.
   - Empty list `[]`: No redirect URIs allowed
   - Custom list: Only matching patterns allowed
 
@@ -559,7 +560,7 @@ auth = OAuthProxy(
 
 ### Redirect URI Validation
 
-By default, the OAuth proxy validates DCR clients against their registered redirect URIs while allowing loopback ports to vary for MCP compatibility. You can restrict which clients can connect at the server level by specifying allowed patterns:
+By default, the OAuth proxy validates DCR clients against their registered redirect URIs while allowing loopback ports to vary for MCP compatibility. Unsafe browser schemes such as `javascript:` are always rejected. You can restrict which clients can connect at the server level by specifying allowed patterns:
 
 ```python
 # Allow only localhost clients (common for development)

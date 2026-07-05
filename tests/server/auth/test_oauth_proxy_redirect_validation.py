@@ -89,6 +89,17 @@ class TestProxyDCRClient:
             AnyUrl("https://claude.ai/api/mcp/auth_callback")
         ) == AnyUrl("https://claude.ai/api/mcp/auth_callback")
 
+    def test_default_rejects_unsafe_registered_redirect_scheme(self):
+        """Stored DCR metadata cannot preserve unsafe browser schemes."""
+        client = ProxyDCRClient(
+            client_id="test",
+            client_secret="secret",
+            redirect_uris=[AnyUrl("javascript:alert(document.cookie)//")],
+        )
+
+        with pytest.raises(InvalidRedirectUriError):
+            client.validate_redirect_uri(AnyUrl("javascript:alert(document.cookie)//"))
+
     def test_custom_patterns(self):
         """Test custom redirect URI patterns."""
         client = ProxyDCRClient(
