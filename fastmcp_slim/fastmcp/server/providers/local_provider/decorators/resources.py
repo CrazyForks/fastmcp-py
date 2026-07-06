@@ -10,8 +10,8 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
 
-import mcp.types
-from mcp.types import Annotations, AnyFunction
+import mcp_types
+from mcp_types import Annotations
 
 import fastmcp
 from fastmcp.resources.base import Resource
@@ -19,6 +19,7 @@ from fastmcp.resources.function_resource import resource as standalone_resource
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
+from fastmcp.utilities.types import AnyFunction
 
 if TYPE_CHECKING:
     from fastmcp.server.providers.local_provider import LocalProvider
@@ -112,7 +113,7 @@ class ResourceDecoratorMixin:
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool = True,

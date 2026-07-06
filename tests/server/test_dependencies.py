@@ -2,14 +2,14 @@
 
 from contextlib import asynccontextmanager, contextmanager
 
-import mcp.types as mcp_types
 import pytest
-from mcp.types import TextContent, TextResourceContents
+from mcp_types import TextContent, TextResourceContents
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.dependencies import CurrentContext, Depends, Shared
 from fastmcp.server.context import Context
+from tests.conftest import make_server_request_context
 
 HUZZAH = "huzzah!"
 
@@ -136,13 +136,13 @@ async def test_dependencies_excluded_from_schema(mcp: FastMCP):
     ) -> str:
         return f"{name} is {age} years old"
 
-    result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+    result = await mcp._on_list_tools(make_server_request_context(), None)
     tool = next(t for t in result.tools if t.name == "my_tool")
 
-    assert "name" in tool.inputSchema["properties"]
-    assert "age" in tool.inputSchema["properties"]
-    assert "config" not in tool.inputSchema["properties"]
-    assert len(tool.inputSchema["properties"]) == 2
+    assert "name" in tool.input_schema["properties"]
+    assert "age" in tool.input_schema["properties"]
+    assert "config" not in tool.input_schema["properties"]
+    assert len(tool.input_schema["properties"]) == 2
 
 
 async def test_current_context_dependency(mcp: FastMCP):
@@ -468,11 +468,11 @@ async def test_connection_dependency_excluded_from_tool_schema(mcp: FastMCP):
     ) -> str:
         return name
 
-    result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+    result = await mcp._on_list_tools(make_server_request_context(), None)
     tool = next(t for t in result.tools if t.name == "with_connection")
 
-    assert "name" in tool.inputSchema["properties"]
-    assert "connection" not in tool.inputSchema["properties"]
+    assert "name" in tool.input_schema["properties"]
+    assert "connection" not in tool.input_schema["properties"]
 
 
 async def test_sync_tool_context_manager_stays_open(mcp: FastMCP):
@@ -590,9 +590,9 @@ async def test_external_user_cannot_override_dependency(mcp: FastMCP):
         return f"action={action},admin={admin}"
 
     # Verify dependency is NOT in the schema
-    result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+    result = await mcp._on_list_tools(make_server_request_context(), None)
     tool = next(t for t in result.tools if t.name == "check_permission")
-    assert "admin" not in tool.inputSchema["properties"]
+    assert "admin" not in tool.input_schema["properties"]
 
     # Normal call - dependency is resolved
     result = await mcp.call_tool("check_permission", {"action": "read"})
@@ -964,7 +964,6 @@ class TestAuthDependencies:
 
     async def test_current_access_token_excluded_from_tool_schema(self, mcp: FastMCP):
         """Test that CurrentAccessToken dependency is excluded from tool schema."""
-        import mcp.types as mcp_types
 
         from fastmcp.server.auth import AccessToken
         from fastmcp.server.dependencies import CurrentAccessToken
@@ -976,15 +975,14 @@ class TestAuthDependencies:
         ) -> str:
             return name
 
-        result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+        result = await mcp._on_list_tools(make_server_request_context(), None)
         tool = next(t for t in result.tools if t.name == "tool_with_token")
 
-        assert "name" in tool.inputSchema["properties"]
-        assert "token" not in tool.inputSchema["properties"]
+        assert "name" in tool.input_schema["properties"]
+        assert "token" not in tool.input_schema["properties"]
 
     async def test_token_claim_excluded_from_tool_schema(self, mcp: FastMCP):
         """Test that TokenClaim dependency is excluded from tool schema."""
-        import mcp.types as mcp_types
 
         from fastmcp.server.dependencies import TokenClaim
 
@@ -995,11 +993,11 @@ class TestAuthDependencies:
         ) -> str:
             return name
 
-        result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+        result = await mcp._on_list_tools(make_server_request_context(), None)
         tool = next(t for t in result.tools if t.name == "tool_with_claim")
 
-        assert "name" in tool.inputSchema["properties"]
-        assert "user_id" not in tool.inputSchema["properties"]
+        assert "name" in tool.input_schema["properties"]
+        assert "user_id" not in tool.input_schema["properties"]
 
     def test_current_access_token_exported_from_all(self):
         """Test that CurrentAccessToken is exported from __all__."""
@@ -1140,11 +1138,11 @@ class TestSharedDependencies:
         async def my_tool(name: str, db: str = Shared(get_db)) -> str:
             return name
 
-        result = await mcp._list_tools_mcp(mcp_types.ListToolsRequest())
+        result = await mcp._on_list_tools(make_server_request_context(), None)
         tool = next(t for t in result.tools if t.name == "my_tool")
 
-        assert "name" in tool.inputSchema["properties"]
-        assert "db" not in tool.inputSchema["properties"]
+        assert "name" in tool.input_schema["properties"]
+        assert "db" not in tool.input_schema["properties"]
 
     async def test_shared_in_resource(self, mcp: FastMCP):
         """Shared dependencies work in resource functions."""

@@ -3,11 +3,18 @@
 import logging
 
 try:
-    from mcp import McpError
+    from mcp import MCPError
 except ImportError:
 
-    class McpError(Exception):  # type: ignore[no-redef]
+    class MCPError(Exception):  # type: ignore[no-redef]
         """Fallback used when MCP dependencies are not installed."""
+
+
+# Catch-compatibility alias for the pre-v2 SDK name. `except McpError` must
+# catch SDK-raised `MCPError`, so this is a plain alias (a subclass would not
+# catch the base). Construction differs in v2 (`MCPError(code=, message=)`);
+# see the migration notes.
+McpError = MCPError
 
 
 class FastMCPDeprecationWarning(DeprecationWarning):

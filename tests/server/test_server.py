@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from textwrap import dedent
 from unittest import mock
 
-from mcp.types import TextContent, TextResourceContents
+from mcp_types import TextContent, TextResourceContents
 
 from fastmcp import Client, FastMCP
 from fastmcp.server.providers import LocalProvider
@@ -365,7 +365,7 @@ class TestMeta:
         async with Client(mcp) as client:
             templates = await client.list_resource_templates()
             template = next(
-                t for t in templates if t.uriTemplate == "test://template/{id}"
+                t for t in templates if t.uri_template == "test://template/{id}"
             )
             assert template.meta is not None
             assert set(template.meta["fastmcp"]["tags"]) == {

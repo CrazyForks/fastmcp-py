@@ -23,8 +23,8 @@ from typing import (
     overload,
 )
 
-import mcp.types
-from mcp.types import AnyFunction, ToolAnnotations
+import mcp_types
+from mcp_types import ToolAnnotations
 
 import fastmcp
 from fastmcp.exceptions import FastMCPDeprecationWarning
@@ -32,7 +32,7 @@ from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.base import Tool
 from fastmcp.tools.function_tool import FunctionTool
-from fastmcp.utilities.types import NotSet, NotSetT
+from fastmcp.utilities.types import AnyFunction, NotSet, NotSetT
 
 try:
     from prefab_ui.app import PrefabApp as _PrefabApp
@@ -184,7 +184,7 @@ class ToolDecoratorMixin:
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
@@ -207,7 +207,7 @@ class ToolDecoratorMixin:
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
@@ -233,7 +233,7 @@ class ToolDecoratorMixin:
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,

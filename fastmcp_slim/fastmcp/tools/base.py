@@ -11,10 +11,10 @@ from typing import (
     overload,
 )
 
-import mcp.types
+import mcp_types
 import pydantic_core
 from mcp.shared.tool_name_validation import validate_and_warn_tool_name
-from mcp.types import (
+from mcp_types import (
     CallToolResult,
     ContentBlock,
     Icon,
@@ -22,7 +22,7 @@ from mcp.types import (
     ToolAnnotations,
     ToolExecution,
 )
-from mcp.types import Tool as MCPTool
+from mcp_types import Tool as MCPTool
 from pydantic import BaseModel, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
@@ -105,7 +105,7 @@ class ToolResult(BaseModel):
     is_error: bool = Field(
         default=False,
         description="Whether this result represents a tool execution error. "
-        "When True, it maps to CallToolResult.isError so the error is returned "
+        "When True, it maps to CallToolResult.is_error so the error is returned "
         "to the client rather than raised.",
     )
 
@@ -167,9 +167,9 @@ class ToolResult(BaseModel):
         # reaches the client; the plain content/tuple returns can't carry it.
         if self.meta is not None or self.is_error:
             return CallToolResult(
-                structuredContent=self.structured_content,
+                structured_content=self.structured_content,
                 content=self.content,
-                isError=self.is_error,
+                is_error=self.is_error,
                 _meta=self.meta,  # type: ignore[call-arg]  # _meta is Pydantic alias for meta field
             )
         if self.structured_content is None:
@@ -235,8 +235,8 @@ class Tool(FastMCPComponent):
             name=overrides.get("name", self.name),
             title=overrides.get("title", title),
             description=overrides.get("description", self.description),
-            inputSchema=overrides.get("inputSchema", self.parameters),
-            outputSchema=overrides.get("outputSchema", self.output_schema),
+            input_schema=overrides.get("inputSchema", self.parameters),
+            output_schema=overrides.get("outputSchema", self.output_schema),
             icons=overrides.get("icons", self.icons),
             annotations=overrides.get("annotations", self.annotations),
             execution=overrides.get("execution", self.execution),
@@ -250,7 +250,7 @@ class Tool(FastMCPComponent):
             and "execution" not in overrides
             and not self.execution
         ):
-            mcp_tool.execution = ToolExecution(taskSupport=self.task_config.mode)
+            mcp_tool.execution = ToolExecution(task_support=self.task_config.mode)
 
         return mcp_tool
 
@@ -380,13 +380,13 @@ class Tool(FastMCPComponent):
         self,
         arguments: dict[str, Any],
         task_meta: TaskMeta,
-    ) -> mcp.types.CreateTaskResult: ...
+    ) -> mcp_types.CreateTaskResult: ...
 
     async def _run(
         self,
         arguments: dict[str, Any],
         task_meta: TaskMeta | None = None,
-    ) -> ToolResult | mcp.types.CreateTaskResult:
+    ) -> ToolResult | mcp_types.CreateTaskResult:
         """Server entry point that handles task routing.
 
         This allows ANY Tool subclass to support background execution by setting

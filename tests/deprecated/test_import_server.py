@@ -1,7 +1,7 @@
 import json
 from urllib.parse import quote
 
-from mcp.types import TextContent, TextResourceContents
+from mcp_types import TextContent, TextResourceContents
 
 from fastmcp.client.client import Client
 from fastmcp.server.server import FastMCP
@@ -555,7 +555,7 @@ async def test_import_conflict_resolution_templates():
     async with Client(main_app) as client:
         # The later imported server should win
         templates = await client.list_resource_templates()
-        template_uris = [t.uriTemplate for t in templates]
+        template_uris = [t.uri_template for t in templates]
         assert "users://{user_id}/profile" in template_uris
         assert (
             template_uris.count("users://{user_id}/profile") == 1

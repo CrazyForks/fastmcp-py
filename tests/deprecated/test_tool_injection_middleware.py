@@ -2,8 +2,8 @@
 
 import pytest
 from inline_snapshot import snapshot
-from mcp.types import TextContent
-from mcp.types import Tool as SDKTool
+from mcp_types import TextContent
+from mcp_types import Tool as SDKTool
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
@@ -69,7 +69,7 @@ class TestPromptToolMiddleware:
             [
                 TextContent(
                     type="text",
-                    text='[{"name":"greeting","title":null,"description":"Generate a greeting message.","arguments":[{"name":"name","description":null,"required":true}],"icons":null,"_meta":{"fastmcp":{"tags":[]}}},{"name":"farewell","title":null,"description":"Generate a farewell message.","arguments":[{"name":"name","description":null,"required":true}],"icons":null,"_meta":{"fastmcp":{"tags":[]}}}]',
+                    text='[{"name":"greeting","title":null,"description":"Generate a greeting message.","arguments":[{"name":"name","title":null,"description":null,"required":true}],"icons":null,"_meta":{"fastmcp":{"tags":[]}}},{"name":"farewell","title":null,"description":"Generate a farewell message.","arguments":[{"name":"name","title":null,"description":null,"required":true}],"icons":null,"_meta":{"fastmcp":{"tags":[]}}}]',
                 )
             ]
         )
@@ -81,7 +81,12 @@ class TestPromptToolMiddleware:
                     "title": None,
                     "description": "Generate a greeting message.",
                     "arguments": [
-                        {"name": "name", "description": None, "required": True}
+                        {
+                            "name": "name",
+                            "title": None,
+                            "description": None,
+                            "required": True,
+                        }
                     ],
                     "icons": None,
                     "_meta": {"fastmcp": {"tags": []}},
@@ -91,7 +96,12 @@ class TestPromptToolMiddleware:
                     "title": None,
                     "description": "Generate a farewell message.",
                     "arguments": [
-                        {"name": "name", "description": None, "required": True}
+                        {
+                            "name": "name",
+                            "title": None,
+                            "description": None,
+                            "required": True,
+                        }
                     ],
                     "icons": None,
                     "_meta": {"fastmcp": {"tags": []}},
@@ -115,7 +125,7 @@ class TestPromptToolMiddleware:
             [
                 TextContent(
                     type="text",
-                    text='{"_meta":null,"description":"Generate a greeting message.","messages":[{"role":"user","content":{"type":"text","text":"Hello, World!","annotations":null,"_meta":null}}]}',
+                    text='{"_meta":null,"description":"Generate a greeting message.","messages":[{"role":"user","content":{"type":"text","text":"Hello, World!","annotations":null,"_meta":null}}],"resultType":"complete"}',
                 )
             ]
         )
@@ -135,6 +145,7 @@ class TestPromptToolMiddleware:
                         },
                     }
                 ],
+                "resultType": "complete",
             }
         )
 

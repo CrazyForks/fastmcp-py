@@ -14,10 +14,15 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast, overload
 
 import anyio
 import httpx
-import mcp.types
+import mcp_types
 from exceptiongroup import catch
-from mcp import ClientSession, McpError
-from mcp.types import GetTaskResult, TaskStatusNotification
+from mcp import ClientSession, MCPError
+from mcp.client.extension import NotificationBinding
+from mcp_types import (
+    GetTaskResult,
+    TaskStatusNotification,
+    TaskStatusNotificationParams,
+)
 from pydantic import AnyUrl
 
 import fastmcp as fastmcp
@@ -57,10 +62,7 @@ from fastmcp.client.tasks import (
 from fastmcp.mcp_config import MCPConfig
 from fastmcp.utilities.exceptions import get_catch_handlers
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.timeout import (
-    normalize_timeout_to_seconds,
-    normalize_timeout_to_timedelta,
-)
+from fastmcp.utilities.timeout import normalize_timeout_to_seconds
 
 if TYPE_CHECKING:
     from fastmcp.server import FastMCP
@@ -70,11 +72,11 @@ else:
 from .transports import (
     ClientTransport,
     ClientTransportT,
-    FastMCP1Server,
     FastMCPTransport,
     MCPConfigTransport,
     NodeStdioTransport,
     PythonStdioTransport,
+    SDKServer,
     SessionKwargs,
     SSETransport,
     StreamableHttpTransport,
@@ -113,14 +115,14 @@ class ClientSessionState:
     session_task: asyncio.Task | None = None
     ready_event: anyio.Event = field(default_factory=anyio.Event)
     stop_event: anyio.Event = field(default_factory=anyio.Event)
-    initialize_result: mcp.types.InitializeResult | None = None
+    initialize_result: mcp_types.InitializeResult | None = None
 
 
 @dataclass
 class CallToolResult:
     """Parsed result from a tool call."""
 
-    content: list[mcp.types.ContentBlock]
+    content: list[mcp_types.ContentBlock]
     structured_content: dict[str, Any] | None
     meta: dict[str, Any] | None
     data: Any = None
@@ -207,7 +209,7 @@ class Client(
     @overload
     def __init__(
         self: Client[FastMCPTransport],
-        transport: FastMCP | FastMCP1Server,
+        transport: FastMCP | SDKServer,
         *args: Any,
         **kwargs: Any,
     ) -> None: ...
@@ -246,7 +248,7 @@ class Client(
         transport: (
             ClientTransportT
             | FastMCP
-            | FastMCP1Server
+            | SDKServer
             | AnyUrl
             | Path
             | MCPConfig
@@ -256,7 +258,7 @@ class Client(
         name: str | None = None,
         roots: RootsList | RootsHandler | None = None,
         sampling_handler: SamplingHandler | None = None,
-        sampling_capabilities: mcp.types.SamplingCapability | None = None,
+        sampling_capabilities: mcp_types.SamplingCapability | None = None,
         elicitation_handler: ElicitationHandler | None = None,
         log_handler: LogHandler | None = None,
         message_handler: MessageHandlerT | MessageHandler | None = None,
@@ -264,7 +266,7 @@ class Client(
         timeout: datetime.timedelta | float | int | None = None,
         auto_initialize: bool = True,
         init_timeout: datetime.timedelta | float | int | None = None,
-        client_info: mcp.types.Implementation | None = None,
+        client_info: mcp_types.Implementation | None = None,
         auth: httpx.Auth | Literal["oauth"] | str | None = None,
         verify: ssl.SSLContext | bool | str | None = None,
     ) -> None:
@@ -305,8 +307,8 @@ class Client(
 
         self._progress_handler = progress_handler
 
-        # Convert timeout to timedelta if needed
-        timeout = normalize_timeout_to_timedelta(timeout)
+        # Convert request timeout to float seconds (0 means disabled -> None)
+        read_timeout_seconds = normalize_timeout_to_seconds(timeout)
 
         # handle init handshake timeout (0 means disabled)
         if init_timeout is None:
@@ -320,8 +322,12 @@ class Client(
             "list_roots_callback": None,
             "logging_callback": create_log_callback(log_handler),
             "message_handler": message_handler or TaskNotificationHandler(self),
-            "read_timeout_seconds": timeout,
+            "read_timeout_seconds": read_timeout_seconds,
             "client_info": client_info,
+            # SDK v2 does not carry `notifications/tasks/status` in any protocol
+            # version's core notification tables, so it is never tee'd to the
+            # message_handler; a binding routes it to Task objects instead.
+            "notification_bindings": [self._task_status_binding()],
         }
 
         if roots is not None:
@@ -334,7 +340,7 @@ class Client(
             self._session_kwargs["sampling_capabilities"] = (
                 sampling_capabilities
                 if sampling_capabilities is not None
-                else mcp.types.SamplingCapability()
+                else mcp_types.SamplingCapability()
             )
 
         if elicitation_handler is not None:
@@ -384,7 +390,7 @@ class Client(
         return self._session_state.session
 
     @property
-    def initialize_result(self) -> mcp.types.InitializeResult | None:
+    def initialize_result(self) -> mcp_types.InitializeResult | None:
         """Get the result of the initialization request."""
         return self._session_state.initialize_result
 
@@ -395,7 +401,7 @@ class Client(
     def set_sampling_callback(
         self,
         sampling_callback: SamplingHandler,
-        sampling_capabilities: mcp.types.SamplingCapability | None = None,
+        sampling_capabilities: mcp_types.SamplingCapability | None = None,
     ) -> None:
         """Set the sampling callback for the client."""
         self._session_kwargs["sampling_callback"] = create_sampling_callback(
@@ -404,7 +410,7 @@ class Client(
         self._session_kwargs["sampling_capabilities"] = (
             sampling_capabilities
             if sampling_capabilities is not None
-            else mcp.types.SamplingCapability()
+            else mcp_types.SamplingCapability()
         )
 
     def set_elicitation_callback(
@@ -458,6 +464,10 @@ class Client(
             new_client._session_kwargs["message_handler"] = TaskNotificationHandler(
                 new_client
             )
+        # Rebind the task-status notification binding so it routes to the clone.
+        new_client._session_kwargs["notification_bindings"] = [
+            new_client._task_status_binding()
+        ]
 
         new_client.name += f":{secrets.token_hex(2)}"
 
@@ -483,7 +493,7 @@ class Client(
     async def initialize(
         self,
         timeout: datetime.timedelta | float | int | None = None,
-    ) -> mcp.types.InitializeResult:
+    ) -> mcp_types.InitializeResult:
         """Send an initialize request to the server.
 
         This method performs the MCP initialization handshake with the server,
@@ -511,7 +521,7 @@ class Client(
             client = Client(server, auto_initialize=False)
             async with client:
                 result = await client.initialize()
-                print(f"Server: {result.serverInfo.name}")
+                print(f"Server: {result.server_info.name}")
                 print(f"Instructions: {result.instructions}")
             ```
         """
@@ -617,7 +627,7 @@ class Client(
                             "Session task completed without exception but connection failed"
                         )
                     # Preserve specific exception types that clients may want to handle
-                    if isinstance(exception, httpx.HTTPStatusError | McpError):
+                    if isinstance(exception, httpx.HTTPStatusError | MCPError):
                         raise exception
                     raise RuntimeError(
                         f"Client failed to connect: {exception}"
@@ -781,8 +791,11 @@ class Client(
         Called when notifications/tasks/status is received from server.
         Updates Task object's cache and triggers events/callbacks.
         """
-        # Extract task ID from notification params
-        task_id = notification.params.taskId
+        self._handle_task_status_params(notification.params)
+
+    def _handle_task_status_params(self, params: TaskStatusNotificationParams) -> None:
+        """Route task status notification params to the matching Task object."""
+        task_id = params.task_id
         if not task_id:
             return
 
@@ -792,8 +805,28 @@ class Client(
             task = task_ref()  # Dereference weakref
             if task:
                 # Convert notification params to GetTaskResult (they share the same fields via Task)
-                status = GetTaskResult.model_validate(notification.params.model_dump())
+                status = GetTaskResult.model_validate(params.model_dump())
                 task._handle_status_notification(status)
+
+    def _task_status_binding(self) -> NotificationBinding[TaskStatusNotificationParams]:
+        """Build a binding routing `notifications/tasks/status` to Task objects.
+
+        SDK v2 drops notifications whose method is absent from the negotiated
+        version's core tables before they reach the message_handler; a binding is
+        the supported channel for observing such vendor notifications.
+        """
+        client_ref = weakref.ref(self)
+
+        async def _handler(params: TaskStatusNotificationParams) -> None:
+            client = client_ref()
+            if client is not None:
+                client._handle_task_status_params(params)
+
+        return NotificationBinding(
+            method="notifications/tasks/status",
+            params_type=TaskStatusNotificationParams,
+            handler=_handler,
+        )
 
     async def close(self):
         await self._disconnect(force=True)
@@ -804,7 +837,7 @@ class Client(
     async def ping(self) -> bool:
         """Send a ping request."""
         result = await self._await_with_session_monitoring(self.session.send_ping())
-        return isinstance(result, mcp.types.EmptyResult)
+        return isinstance(result, mcp_types.EmptyResult)
 
     async def cancel(
         self,
@@ -812,14 +845,12 @@ class Client(
         reason: str | None = None,
     ) -> None:
         """Send a cancellation notification for an in-progress request."""
-        notification = mcp.types.ClientNotification(
-            root=mcp.types.CancelledNotification(
-                method="notifications/cancelled",
-                params=mcp.types.CancelledNotificationParams(
-                    requestId=request_id,
-                    reason=reason,
-                ),
-            )
+        notification = mcp_types.CancelledNotification(
+            method="notifications/cancelled",
+            params=mcp_types.CancelledNotificationParams(
+                request_id=request_id,
+                reason=reason,
+            ),
         )
         await self.session.send_notification(notification)
 
@@ -831,41 +862,49 @@ class Client(
         message: str | None = None,
     ) -> None:
         """Send a progress notification."""
-        await self.session.send_progress_notification(
+        # Deprecated upstream in SDK v2 but deliberately kept per compat directive;
+        # removed with the multi-round-trip follow-up.
+        await self.session.send_progress_notification(  # ty: ignore[deprecated]
             progress_token, progress, total, message
         )
 
-    async def set_logging_level(self, level: mcp.types.LoggingLevel) -> None:
+    async def set_logging_level(self, level: mcp_types.LoggingLevel) -> None:
         """Send a logging/setLevel request."""
-        await self._await_with_session_monitoring(self.session.set_logging_level(level))
+        # Deprecated upstream in SDK v2 but deliberately kept per compat directive;
+        # removed with the multi-round-trip follow-up.
+        await self._await_with_session_monitoring(
+            self.session.set_logging_level(level)  # ty: ignore[deprecated]
+        )
 
     async def send_roots_list_changed(self) -> None:
         """Send a roots/list_changed notification."""
-        await self.session.send_roots_list_changed()
+        # Deprecated upstream in SDK v2 but deliberately kept per compat directive;
+        # removed with the multi-round-trip follow-up.
+        await self.session.send_roots_list_changed()  # ty: ignore[deprecated]
 
     # --- Completion ---
 
     async def complete_mcp(
         self,
-        ref: mcp.types.ResourceTemplateReference | mcp.types.PromptReference,
+        ref: mcp_types.ResourceTemplateReference | mcp_types.PromptReference,
         argument: dict[str, str],
         context_arguments: dict[str, Any] | None = None,
-    ) -> mcp.types.CompleteResult:
+    ) -> mcp_types.CompleteResult:
         """Send a completion request and return the complete MCP protocol result.
 
         Args:
-            ref (mcp.types.ResourceTemplateReference | mcp.types.PromptReference): The reference to complete.
+            ref (mcp_types.ResourceTemplateReference | mcp_types.PromptReference): The reference to complete.
             argument (dict[str, str]): Arguments to pass to the completion request.
             context_arguments (dict[str, Any] | None, optional): Optional context arguments to
                 include with the completion request. Defaults to None.
 
         Returns:
-            mcp.types.CompleteResult: The complete response object from the protocol,
+            mcp_types.CompleteResult: The complete response object from the protocol,
                 containing the completion and any additional metadata.
 
         Raises:
             RuntimeError: If called while the client is not connected.
-            McpError: If the request results in a TimeoutError | JSONRPCError
+            MCPError: If the request results in a TimeoutError | JSONRPCError
         """
         logger.debug(f"[{self.name}] called complete: {ref}")
 
@@ -878,24 +917,24 @@ class Client(
 
     async def complete(
         self,
-        ref: mcp.types.ResourceTemplateReference | mcp.types.PromptReference,
+        ref: mcp_types.ResourceTemplateReference | mcp_types.PromptReference,
         argument: dict[str, str],
         context_arguments: dict[str, Any] | None = None,
-    ) -> mcp.types.Completion:
+    ) -> mcp_types.Completion:
         """Send a completion request to the server.
 
         Args:
-            ref (mcp.types.ResourceTemplateReference | mcp.types.PromptReference): The reference to complete.
+            ref (mcp_types.ResourceTemplateReference | mcp_types.PromptReference): The reference to complete.
             argument (dict[str, str]): Arguments to pass to the completion request.
             context_arguments (dict[str, Any] | None, optional): Optional context arguments to
                 include with the completion request. Defaults to None.
 
         Returns:
-            mcp.types.Completion: The completion object.
+            mcp_types.Completion: The completion object.
 
         Raises:
             RuntimeError: If called while the client is not connected.
-            McpError: If the request results in a TimeoutError | JSONRPCError
+            MCPError: If the request results in a TimeoutError | JSONRPCError
         """
         result = await self.complete_mcp(
             ref=ref, argument=argument, context_arguments=context_arguments

@@ -22,15 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast, overload
 
 import httpx
-import mcp.types
+import mcp_types
 from key_value.aio.adapters.pydantic import PydanticAdapter
 from key_value.aio.protocols import AsyncKeyValue
 from key_value.aio.stores.memory import MemoryStore
 from mcp.server.lowlevel.server import LifespanResultT
-from mcp.shared.exceptions import McpError
-from mcp.types import (
+from mcp.shared.exceptions import MCPError
+from mcp_types import (
     Annotations,
-    AnyFunction,
     CallToolRequestParams,
     ToolAnnotations,
 )
@@ -82,7 +81,7 @@ from fastmcp.tools.function_tool import FunctionTool
 from fastmcp.tools.tool_transform import ToolTransformConfig
 from fastmcp.utilities.components import FastMCPComponent, _coerce_version
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.types import FastMCPBaseModel, NotSet, NotSetT
+from fastmcp.utilities.types import AnyFunction, FastMCPBaseModel, NotSet, NotSetT
 from fastmcp.utilities.versions import (
     VersionSpec,
     version_sort_key,
@@ -90,7 +89,7 @@ from fastmcp.utilities.versions import (
 
 if TYPE_CHECKING:
     from fastmcp.client import Client
-    from fastmcp.client.client import FastMCP1Server
+    from fastmcp.client.client import SDKServer
     from fastmcp.client.sampling import SamplingHandler
     from fastmcp.client.transports import ClientTransport, ClientTransportT
     from fastmcp.server.providers.openapi import ComponentFn as OpenAPIComponentFn
@@ -103,7 +102,7 @@ logger = get_logger(__name__)
 
 def _version_request_meta(
     version: VersionSpec | None,
-) -> mcp.types.RequestParams.Meta | None:
+) -> dict[str, Any] | None:
     if version is None:
         return None
 
@@ -123,9 +122,9 @@ def _version_request_meta(
     if not version_value:
         return None
 
-    return mcp.types.RequestParams.Meta.model_validate(
-        {"fastmcp": {"version": version_value}}
-    )
+    # SDK v2: request `_meta` is a plain dict (the `Meta` type alias), not the
+    # old `RequestParams.Meta` nested model.
+    return {"fastmcp": {"version": version_value}}
 
 
 # The MCP SDK warns "Tool X not listed, no validation will be performed"
@@ -325,7 +324,7 @@ class FastMCP(
         *,
         version: str | int | float | None = None,
         website_url: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         auth: AuthProvider | None = None,
         middleware: Sequence[Middleware] | None = None,
         providers: Sequence[Provider] | None = None,
@@ -341,7 +340,7 @@ class FastMCP(
         session_state_store: AsyncKeyValue | None = None,
         sampling_handler: SamplingHandler | None = None,
         sampling_handler_behavior: Literal["always", "fallback"] | None = None,
-        client_log_level: mcp.types.LoggingLevel | None = None,
+        client_log_level: mcp_types.LoggingLevel | None = None,
         experimental_capabilities: dict[str, dict[str, Any]] | None = None,
         **kwargs: Any,
     ):
@@ -404,12 +403,16 @@ class FastMCP(
             self._lifespan = cast(LifespanCallable[LifespanResultT], default_lifespan)
         self._lifespan_result: LifespanResultT | None = None
         self._lifespan_result_set: bool = False
+        # Snapshot of SharedContext ContextVar values captured during the
+        # lifespan, re-applied per request by FastMCPServerMiddleware because
+        # the SDK v2 dispatcher runs handlers in the sender's context.
+        self._shared_context_snapshot: dict[Any, Any] | None = None
         self._lifespan_ref_count: int = 0
         self._lifespan_lock: asyncio.Lock = asyncio.Lock()
         self._started: asyncio.Event = asyncio.Event()
 
         # Generate random ID if no name provided
-        self._mcp_server: LowLevelServer[LifespanResultT, Any] = LowLevelServer[
+        self._mcp_server: LowLevelServer[LifespanResultT] = LowLevelServer[
             LifespanResultT
         ](
             fastmcp=self,
@@ -435,11 +438,17 @@ class FastMCP(
             else fastmcp.settings.strict_input_validation
         )
 
-        self.client_log_level: mcp.types.LoggingLevel | None = (
+        self.client_log_level: mcp_types.LoggingLevel | None = (
             client_log_level
             if client_log_level is not None
             else fastmcp.settings.client_log_level
         )
+
+        # Per-session minimum log level requested by clients via logging/setLevel.
+        # Keyed by session id (a sentinel for stdio where session_id is None).
+        # v2 sessions are per-request so this state lives on the server, not the
+        # session object.
+        self._client_log_levels: dict[str, mcp_types.LoggingLevel] = {}
 
         self.experimental_capabilities: dict[str, dict[str, Any]] = (
             experimental_capabilities or {}
@@ -486,7 +495,7 @@ class FastMCP(
         return self._mcp_server.website_url
 
     @property
-    def icons(self) -> list[mcp.types.Icon]:
+    def icons(self) -> list[mcp_types.Icon]:
         if self._mcp_server.icons is None:
             return []
         else:
@@ -658,7 +667,7 @@ class FastMCP(
         async with fastmcp.server.context.Context(fastmcp=self) as ctx:
             if run_middleware:
                 mw_context = MiddlewareContext(
-                    message=mcp.types.ListToolsRequest(method="tools/list"),
+                    message=mcp_types.ListToolsRequest(method="tools/list"),
                     source="client",
                     type="request",
                     method="tools/list",
@@ -1195,7 +1204,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta,
-    ) -> mcp.types.CreateTaskResult: ...
+    ) -> mcp_types.CreateTaskResult: ...
 
     async def call_tool(
         self,
@@ -1205,7 +1214,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta | None = None,
-    ) -> ToolResult | mcp.types.CreateTaskResult:
+    ) -> ToolResult | mcp_types.CreateTaskResult:
         """Call a tool by name.
 
         This is the public API for executing tools. By default, middleware is applied.
@@ -1248,10 +1257,12 @@ class FastMCP(
         async with fastmcp.server.context.Context(fastmcp=self) as ctx:
             if run_middleware:
                 mw_context = MiddlewareContext[CallToolRequestParams](
-                    message=mcp.types.CallToolRequestParams(
+                    message=mcp_types.CallToolRequestParams(
                         name=name,
                         arguments=arguments or {},
-                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # pydantic alias
+                        # `_meta` carries the app-level `fastmcp` version key, which the
+                        # reserved-key RequestParamsMeta TypedDict can't express statically.
+                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # ty: ignore[invalid-argument-type]
                     ),
                     source="client",
                     type="request",
@@ -1375,7 +1386,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta,
-    ) -> mcp.types.CreateTaskResult: ...
+    ) -> mcp_types.CreateTaskResult: ...
 
     async def read_resource(
         self,
@@ -1384,7 +1395,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta | None = None,
-    ) -> ResourceResult | mcp.types.CreateTaskResult:
+    ) -> ResourceResult | mcp_types.CreateTaskResult:
         """Read a resource by URI.
 
         This is the public API for reading resources. By default, middleware is applied.
@@ -1416,11 +1427,12 @@ class FastMCP(
 
         async with fastmcp.server.context.Context(fastmcp=self) as ctx:
             if run_middleware:
-                uri_param = AnyUrl(uri)
                 mw_context = MiddlewareContext(
-                    message=mcp.types.ReadResourceRequestParams(
-                        uri=uri_param,
-                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # pydantic alias
+                    message=mcp_types.ReadResourceRequestParams(
+                        uri=str(uri),
+                        # `_meta` carries the app-level `fastmcp` version key, which the
+                        # reserved-key RequestParamsMeta TypedDict can't express statically.
+                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # ty: ignore[invalid-argument-type]
                     ),
                     source="client",
                     type="request",
@@ -1473,7 +1485,7 @@ class FastMCP(
                             exc_info=True,
                         )
                         raise
-                    except McpError:
+                    except MCPError:
                         logger.exception(f"Error reading resource {uri!r}")
                         raise
                     except Exception as e:
@@ -1517,7 +1529,7 @@ class FastMCP(
                         e.log_level, f"Error reading resource {uri!r}", exc_info=True
                     )
                     raise
-                except McpError:
+                except MCPError:
                     logger.exception(f"Error reading resource {uri!r}")
                     raise
                 except Exception as e:
@@ -1557,7 +1569,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta,
-    ) -> mcp.types.CreateTaskResult: ...
+    ) -> mcp_types.CreateTaskResult: ...
 
     async def render_prompt(
         self,
@@ -1567,7 +1579,7 @@ class FastMCP(
         version: VersionSpec | None = None,
         run_middleware: bool = True,
         task_meta: TaskMeta | None = None,
-    ) -> PromptResult | mcp.types.CreateTaskResult:
+    ) -> PromptResult | mcp_types.CreateTaskResult:
         """Render a prompt by name.
 
         This is the public API for rendering prompts. By default, middleware is applied.
@@ -1594,10 +1606,12 @@ class FastMCP(
         async with fastmcp.server.context.Context(fastmcp=self) as ctx:
             if run_middleware:
                 mw_context = MiddlewareContext(
-                    message=mcp.types.GetPromptRequestParams(
+                    message=mcp_types.GetPromptRequestParams(
                         name=name,
                         arguments=arguments,
-                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # pydantic alias
+                        # `_meta` carries the app-level `fastmcp` version key, which the
+                        # reserved-key RequestParamsMeta TypedDict can't express statically.
+                        _meta=_version_request_meta(version),  # type: ignore[unknown-argument]  # ty: ignore[invalid-argument-type]
                     ),
                     source="client",
                     type="request",
@@ -1638,7 +1652,7 @@ class FastMCP(
                         e.log_level, f"Error rendering prompt {name!r}", exc_info=True
                     )
                     raise
-                except McpError:
+                except MCPError:
                     logger.exception(f"Error rendering prompt {name!r}")
                     raise
                 except Exception as e:
@@ -1699,7 +1713,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
@@ -1721,7 +1735,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
@@ -1742,7 +1756,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
@@ -1867,7 +1881,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         annotations: Annotations | dict[str, Any] | None = None,
@@ -1998,7 +2012,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
@@ -2014,7 +2028,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
@@ -2029,7 +2043,7 @@ class FastMCP(
         version: str | int | None = None,
         title: str | None = None,
         description: str | None = None,
-        icons: list[mcp.types.Icon] | None = None,
+        icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
@@ -2439,7 +2453,7 @@ class FastMCP(
             Client[ClientTransportT]
             | ClientTransport
             | FastMCP[Any]
-            | FastMCP1Server
+            | SDKServer
             | AnyUrl
             | Path
             | MCPConfig
@@ -2489,7 +2503,7 @@ def create_proxy(
         Client[ClientTransportT]
         | ClientTransport
         | FastMCP[Any]
-        | FastMCP1Server
+        | SDKServer
         | AnyUrl
         | Path
         | MCPConfig

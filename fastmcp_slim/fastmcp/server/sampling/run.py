@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, cast
 
 import anyio
-from mcp.types import (
+from mcp_types import (
     ClientCapabilities,
     CreateMessageResult,
     CreateMessageResultWithTools,
@@ -24,8 +24,8 @@ from mcp.types import (
     ToolResultContent,
     ToolUseContent,
 )
-from mcp.types import CreateMessageRequestParams as SamplingParams
-from mcp.types import Tool as SDKTool
+from mcp_types import CreateMessageRequestParams as SamplingParams
+from mcp_types import Tool as SDKTool
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from pydantic import ValidationError
 from typing_extensions import TypeVar
@@ -88,7 +88,7 @@ class SampleStep:
     def is_tool_use(self) -> bool:
         """True if the LLM is requesting tool execution."""
         if isinstance(self.response, CreateMessageResultWithTools):
-            return self.response.stopReason == "toolUse"
+            return self.response.stop_reason == "toolUse"
         return False
 
     @property
@@ -222,15 +222,18 @@ async def call_sampling_handler(
     result = context.fastmcp.sampling_handler(
         messages,
         SamplingParams(
-            systemPrompt=system_prompt,
+            system_prompt=system_prompt,
             messages=messages,
             temperature=temperature,
-            maxTokens=max_tokens,
-            modelPreferences=_parse_model_preferences(model_preferences),
+            max_tokens=max_tokens,
+            model_preferences=_parse_model_preferences(model_preferences),
             tools=sdk_tools,
-            toolChoice=tool_choice,
+            tool_choice=tool_choice,
         ),
-        context.request_context,
+        # SamplingHandler is typed against the SDK's RequestContext placeholder,
+        # but FastMCP hands handlers its own FastMCPRequestContext wrapper at
+        # runtime; the two aren't structurally related in the type system.
+        context.request_context,  # ty: ignore[invalid-argument-type]
     )
 
     if inspect.isawaitable(result):
@@ -244,7 +247,7 @@ async def call_sampling_handler(
             role="assistant",
             content=TextContent(type="text", text=result),
             model="unknown",
-            stopReason="endTurn",
+            stop_reason="endTurn",
         )
 
     return result
@@ -287,14 +290,14 @@ async def execute_tools(
         if tool is None:
             return ToolResultContent(
                 type="tool_result",
-                toolUseId=tool_use.id,
+                tool_use_id=tool_use.id,
                 content=[
                     TextContent(
                         type="text",
                         text=f"Error: Unknown tool '{tool_use.name}'",
                     )
                 ],
-                isError=True,
+                is_error=True,
             )
 
         tracer = get_tracer()
@@ -309,7 +312,7 @@ async def execute_tools(
                 result_value = await tool.run(tool_use.input)
                 return ToolResultContent(
                     type="tool_result",
-                    toolUseId=tool_use.id,
+                    tool_use_id=tool_use.id,
                     content=[TextContent(type="text", text=str(result_value))],
                 )
             except ToolError as e:
@@ -324,9 +327,9 @@ async def execute_tools(
                 )
                 return ToolResultContent(
                     type="tool_result",
-                    toolUseId=tool_use.id,
+                    tool_use_id=tool_use.id,
                     content=[TextContent(type="text", text=str(e))],
-                    isError=True,
+                    is_error=True,
                 )
             except Exception as e:
                 if span.is_recording():
@@ -340,9 +343,9 @@ async def execute_tools(
                     error_text = f"Error executing tool '{tool_use.name}': {e}"
                 return ToolResultContent(
                     type="tool_result",
-                    toolUseId=tool_use.id,
+                    tool_use_id=tool_use.id,
                     content=[TextContent(type="text", text=error_text)],
-                    isError=True,
+                    is_error=True,
                 )
 
     # Check if any tool requires sequential execution
@@ -555,7 +558,9 @@ async def sample_step_impl(
                     tool_choice=effective_tool_choice,
                 )
             else:
-                response = await context.session.create_message(
+                # Deprecated upstream in SDK v2 but deliberately kept per compat
+                # directive; removed with the multi-round-trip follow-up.
+                response = await context.session.create_message(  # ty: ignore[deprecated]
                     messages=current_messages,
                     system_prompt=system_prompt,
                     temperature=temperature,
@@ -575,7 +580,7 @@ async def sample_step_impl(
     # Check if this is a tool use response
     is_tool_use_response = (
         isinstance(response, CreateMessageResultWithTools)
-        and response.stopReason == "toolUse"
+        and response.stop_reason == "toolUse"
     )
 
     # Always include the assistant response in history
@@ -718,7 +723,7 @@ async def sample_impl(
                                 content=[
                                     ToolResultContent(
                                         type="tool_result",
-                                        toolUseId=tool_call.id,
+                                        tool_use_id=tool_call.id,
                                         content=[
                                             TextContent(
                                                 type="text",
@@ -728,7 +733,7 @@ async def sample_impl(
                                                 ),
                                             )
                                         ],
-                                        isError=True,
+                                        is_error=True,
                                     )
                                 ],
                             )
