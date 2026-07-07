@@ -169,7 +169,6 @@ class ToolMeta:
     meta: dict[str, Any] | None = None
     app: Any = None
     task: bool | TaskConfig | None = None
-    exclude_args: list[str] | None = None
     timeout: float | None = None
     auth: AuthCheck | list[AuthCheck] | None = None
     enabled: bool = True
@@ -234,7 +233,6 @@ class FunctionTool(Tool):
         icons: list[Icon] | None = None,
         tags: set[str] | None = None,
         annotations: ToolAnnotations | None = None,
-        exclude_args: list[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
@@ -271,7 +269,6 @@ class FunctionTool(Tool):
                 ]
             )
             or output_schema is not NotSet
-            or exclude_args is not None
         )
 
         if metadata is not None and individual_params_provided:
@@ -298,22 +295,12 @@ class FunctionTool(Tool):
                 annotations=annotations,
                 meta=meta,
                 task=task,
-                exclude_args=exclude_args,
                 timeout=timeout,
                 auth=auth,
                 run_in_thread=True if run_in_thread is None else run_in_thread,
             )
 
-        if metadata.exclude_args and fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The `exclude_args` parameter is deprecated as of FastMCP 2.14. "
-                "Use dependency injection with `Depends()` instead for better lifecycle management. "
-                "See https://gofastmcp.com/servers/dependency-injection#using-depends for examples.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-
-        parsed_fn = ParsedFunction.from_function(fn, exclude_args=metadata.exclude_args)
+        parsed_fn = ParsedFunction.from_function(fn)
         func_name = metadata.name or parsed_fn.name
 
         if func_name == "<lambda>":
@@ -591,7 +578,6 @@ def tool(
     annotations: ToolAnnotations | dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    exclude_args: list[str] | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -610,7 +596,6 @@ def tool(
     annotations: ToolAnnotations | dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    exclude_args: list[str] | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -630,7 +615,6 @@ def tool(
     annotations: ToolAnnotations | dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    exclude_args: list[str] | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -672,7 +656,6 @@ def tool(
             annotations=annotations,
             meta=meta,
             task=resolve_task_config(task),
-            exclude_args=exclude_args,
             timeout=timeout,
             auth=auth,
             run_in_thread=run_in_thread,
@@ -691,7 +674,6 @@ def tool(
             annotations=annotations,
             meta=meta,
             task=task,
-            exclude_args=exclude_args,
             timeout=timeout,
             auth=auth,
             run_in_thread=run_in_thread,

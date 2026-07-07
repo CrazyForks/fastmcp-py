@@ -158,7 +158,6 @@ class ToolDecoratorMixin:
                     annotations=fmeta.annotations,
                     meta=tool_meta,
                     task=resolved_task,
-                    exclude_args=fmeta.exclude_args,
                     timeout=fmeta.timeout,
                     auth=fmeta.auth,
                     run_in_thread=fmeta.run_in_thread,
@@ -184,7 +183,6 @@ class ToolDecoratorMixin:
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
-        exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
@@ -206,7 +204,6 @@ class ToolDecoratorMixin:
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
-        exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
@@ -215,10 +212,9 @@ class ToolDecoratorMixin:
         run_in_thread: bool = True,
     ) -> Callable[[F], F]: ...
 
-    # NOTE: This method mirrors fastmcp.tools.tool() but adds registration,
-    # the `enabled` param, and supports the deprecated `exclude_args` param.
-    # When deprecated params are removed, this should delegate to the standalone
-    # decorator to reduce duplication.
+    # NOTE: This method mirrors fastmcp.tools.tool() but adds registration and
+    # the `enabled` param. It could delegate to the standalone decorator to
+    # reduce duplication.
     def tool(
         self: LocalProvider,
         name_or_fn: str | AnyFunction | None = None,
@@ -231,7 +227,6 @@ class ToolDecoratorMixin:
         tags: set[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
-        exclude_args: list[str] | None = None,
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
@@ -261,7 +256,6 @@ class ToolDecoratorMixin:
             tags: Optional set of tags for categorizing the tool
             output_schema: Optional JSON schema for the tool's output
             annotations: Optional annotations about the tool's behavior
-            exclude_args: Optional list of argument names to exclude from the tool schema
             meta: Optional meta information about the tool
             enabled: Whether the tool is enabled (default True). If False, adds to blocklist.
             task: Optional task configuration for background execution
@@ -327,7 +321,6 @@ class ToolDecoratorMixin:
                     tags=tags,
                     output_schema=output_schema,
                     annotations=annotations,
-                    exclude_args=exclude_args,
                     meta=meta,
                     task=resolved_task,
                     timeout=timeout,
@@ -353,7 +346,6 @@ class ToolDecoratorMixin:
                     annotations=annotations,
                     meta=meta,
                     task=task,
-                    exclude_args=exclude_args,
                     timeout=timeout,
                     auth=auth,
                     enabled=enabled,
@@ -394,7 +386,6 @@ class ToolDecoratorMixin:
             tags=tags,
             output_schema=output_schema,
             annotations=annotations,
-            exclude_args=exclude_args,
             meta=meta,
             enabled=enabled,
             task=task,
