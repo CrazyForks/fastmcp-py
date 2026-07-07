@@ -38,9 +38,7 @@ async def main():
 
     # 2. Proxy Server Creation
     print("\nStep 2: Creating the Proxy Server (InMemoryProxy)...")
-    print(
-        f"          (Using create_proxy to wrap '{original_server.name}' directly)"
-    )
+    print(f"          (Using create_proxy to wrap '{original_server.name}' directly)")
     proxy_server = create_proxy(original_server, name="InMemoryProxy")
     print(
         f"   -> Proxy Server '{proxy_server.name}' created, proxying '{original_server.name}'."

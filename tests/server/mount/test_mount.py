@@ -273,9 +273,7 @@ class TestMultipleServerMount:
         )
 
         # Create a proxy server that will fail to connect
-        unreachable_proxy = create_proxy(
-            unreachable_client, name="unreachable_proxy"
-        )
+        unreachable_proxy = create_proxy(unreachable_client, name="unreachable_proxy")
 
         # Mount the unreachable proxy
         main_app.mount(unreachable_proxy, "unreachable")

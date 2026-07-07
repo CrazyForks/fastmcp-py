@@ -12,11 +12,11 @@ from mcp_types import (
 from pydantic import BaseModel, Field
 
 from fastmcp import Client, Context, FastMCP
-from fastmcp.server import create_proxy
 from fastmcp.client.elicitation import ElicitRequestParams, ElicitResult
 from fastmcp.client.logging import LogMessage
 from fastmcp.client.sampling import RequestContext, SamplingMessage, SamplingParams
 from fastmcp.exceptions import ToolError
+from fastmcp.server import create_proxy
 from fastmcp.server.elicitation import AcceptedElicitation
 from fastmcp.server.providers.proxy import ProxyClient, _create_client_factory
 

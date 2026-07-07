@@ -7,7 +7,7 @@ import weakref
 import psutil
 import pytest
 
-from fastmcp import Client, FastMCP
+from fastmcp import Client
 from fastmcp.client.transports import PythonStdioTransport, StdioTransport
 
 
