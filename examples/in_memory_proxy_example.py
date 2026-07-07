@@ -9,11 +9,10 @@ It illustrates the pattern:
 
 import asyncio
 
-from mcp.types import TextContent
-
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.server import create_proxy
+from fastmcp.types import TextContent
 
 
 class EchoService:
@@ -64,8 +63,10 @@ async def main():
         print(f"\n   Calling 'echo' tool via proxy with message: '{message_to_echo}'")
         try:
             result = await final_client.call_tool("echo", {"message": message_to_echo})
-            if result and isinstance(result[0], TextContent):
-                print(f"      Result from proxied 'echo' call: '{result[0].text}'")
+            if result.content and isinstance(result.content[0], TextContent):
+                print(
+                    f"      Result from proxied 'echo' call: '{result.content[0].text}'"
+                )
             else:
                 print(
                     f"      Error: Unexpected result format from proxied 'echo' call: {result}"
