@@ -21,12 +21,13 @@ from mcp_types import (
 )
 from mcp_types import Prompt as SDKPrompt
 from mcp_types import Resource as SDKResource
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic.networks import AnyUrl
 from typing_extensions import TypeVar
 from uncalled_for import SharedContext
 
 import fastmcp
-from fastmcp.exceptions import FastMCPDeprecationWarning
+from fastmcp.exceptions import FastMCPDeprecationWarning, ToolError
 from fastmcp.resources.base import ResourceResult
 from fastmcp.server.dependencies import FastMCPRequestContext, fastmcp_request_ctx
 from fastmcp.server.elicitation import (
@@ -78,6 +79,47 @@ ResultT = TypeVar("ResultT", default=str)
 
 # Import ToolChoiceOption from sampling module (after other imports)
 from fastmcp.server.sampling.run import ToolChoiceOption  # noqa: E402
+
+# Warn-once guards for the sampling deprecation. Server-initiated createMessage
+# was removed from MCP as of 2026-07-28 (SEP-2577); the warning fires a single
+# time per process to flag that ctx.sample/ctx.sample_step are on their way out.
+_sample_deprecation_warned = False
+
+_SAMPLING_DEPRECATION_MESSAGE = (
+    "ctx.sample() and ctx.sample_step() are deprecated and will be removed in a "
+    "future FastMCP release. They rely on server-initiated createMessage "
+    "requests, which were removed from MCP as of 2026-07-28 (SEP-2577), so they "
+    "work only on session-based (handshake-era) connections. Call an LLM "
+    "directly from your server instead."
+)
+
+_SAMPLING_MODERN_ERROR = (
+    "server-initiated sampling is not available on MCP 2026-07-28 connections; "
+    "SEP-2577 removed it — call an LLM from your server instead."
+)
+
+_ELICIT_MODERN_ERROR = (
+    "elicitation via server-initiated requests is unavailable on 2026-07-28 "
+    "connections."
+)
+
+
+def _warn_sampling_deprecated() -> None:
+    """Emit the sampling deprecation warning once per process.
+
+    Gated on ``settings.deprecation_warnings`` like every other FastMCP
+    deprecation; fires a single time (module-level flag) rather than per call.
+    """
+    global _sample_deprecation_warned
+    if _sample_deprecation_warned or not fastmcp.settings.deprecation_warnings:
+        return
+    _sample_deprecation_warned = True
+    warnings.warn(
+        _SAMPLING_DEPRECATION_MESSAGE,
+        FastMCPDeprecationWarning,
+        stacklevel=3,
+    )
+
 
 _current_context: ContextVar[Context | None] = ContextVar("context", default=None)
 
@@ -862,6 +904,20 @@ class Context:
             return
         await self.request_context.close_sse_stream()
 
+    def _is_modern_protocol(self) -> bool:
+        """True when the negotiated MCP protocol era removed the back-channel.
+
+        Reads the negotiated protocol version from the active request context.
+        The 2026-07-28 era (SEP-2577) has no back-channel for server-initiated
+        requests such as sampling/elicitation. Returns False when no request
+        context is available (e.g. background task or pre-session), leaving the
+        existing wire path to surface its own error.
+        """
+        rc = self.request_context
+        if rc is None:
+            return False
+        return rc.protocol_version in MODERN_PROTOCOL_VERSIONS
+
     async def sample_step(
         self,
         messages: str | Sequence[str | SamplingMessage],
@@ -926,6 +982,9 @@ class Context:
                 # Continue with tool results
                 messages = step.history
         """
+        _warn_sampling_deprecated()
+        if self._is_modern_protocol():
+            raise ToolError(_SAMPLING_MODERN_ERROR)
         return await sample_step_impl(
             self,
             messages=messages,
@@ -1027,12 +1086,15 @@ class Context:
             - .result: The typed result (str for text, parsed object for structured)
             - .history: All messages exchanged during sampling
 
-        Note:
-            Background task support for sampling is planned for a future release.
-            Currently, sampling in background tasks requires using the low-level
-            session.create_message() API directly.
+        Deprecated:
+            Server-initiated sampling relies on the createMessage back-channel,
+            which MCP removed as of 2026-07-28 (SEP-2577). This method works only
+            on session-based (handshake-era) connections and will be removed in a
+            future FastMCP release. Call an LLM directly from your server instead.
         """
-        # TODO: Add background task support similar to elicit() when is_background_task
+        _warn_sampling_deprecated()
+        if self._is_modern_protocol():
+            raise ToolError(_SAMPLING_MODERN_ERROR)
         return await sample_impl(  # ty: ignore[invalid-return-type]
             self,
             messages=messages,
@@ -1213,6 +1275,12 @@ class Context:
                 schema=config.schema,
             )
         else:
+            # Foreground push path: server-initiated elicitation needs a
+            # back-channel, which the 2026-07-28 era removed (SEP-2577). Raise a
+            # clear era-aware error before hitting the wire instead of the SDK's
+            # opaque "Method not found". Handshake-era behavior is unchanged.
+            if self._is_modern_protocol():
+                raise ToolError(_ELICIT_MODERN_ERROR)
             # Standard request mode: use session.elicit directly
             result = await self.session.elicit(
                 message=message,
