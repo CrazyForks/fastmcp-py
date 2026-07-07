@@ -25,7 +25,6 @@ from typing import (
 import mcp_types
 from mcp_types import ToolAnnotations
 
-import fastmcp
 from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.base import Tool
@@ -308,53 +307,28 @@ class ToolDecoratorMixin:
                     f"See https://gofastmcp.com/servers/tools#using-with-methods"
                 )
 
-            resolved_task: bool | TaskConfig = task if task is not None else False
+            from fastmcp.tools.function_tool import ToolMeta
 
-            if fastmcp.settings.decorator_mode == "object":
-                tool_obj = Tool.from_function(
-                    fn,
-                    name=tool_name,
-                    version=version,
-                    title=title,
-                    description=description,
-                    icons=icons,
-                    tags=tags,
-                    output_schema=output_schema,
-                    annotations=annotations,
-                    meta=meta,
-                    task=resolved_task,
-                    timeout=timeout,
-                    auth=auth,
-                    run_in_thread=run_in_thread,
-                )
-                self._add_component(tool_obj)
-                if not enabled:
-                    self.disable(keys={tool_obj.key})
-                _maybe_apply_prefab_ui(self, tool_obj)
-                return tool_obj
-            else:
-                from fastmcp.tools.function_tool import ToolMeta
-
-                metadata = ToolMeta(
-                    name=tool_name,
-                    version=version,
-                    title=title,
-                    description=description,
-                    icons=icons,
-                    tags=tags,
-                    output_schema=output_schema,
-                    annotations=annotations,
-                    meta=meta,
-                    task=task,
-                    timeout=timeout,
-                    auth=auth,
-                    enabled=enabled,
-                    run_in_thread=run_in_thread,
-                )
-                target = fn.__func__ if hasattr(fn, "__func__") else fn
-                target.__fastmcp__ = metadata  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
-                tool_obj = self.add_tool(fn)
-                return fn
+            metadata = ToolMeta(
+                name=tool_name,
+                version=version,
+                title=title,
+                description=description,
+                icons=icons,
+                tags=tags,
+                output_schema=output_schema,
+                annotations=annotations,
+                meta=meta,
+                task=task,
+                timeout=timeout,
+                auth=auth,
+                enabled=enabled,
+                run_in_thread=run_in_thread,
+            )
+            target = fn.__func__ if hasattr(fn, "__func__") else fn
+            target.__fastmcp__ = metadata  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
+            self.add_tool(fn)
+            return fn
 
         if inspect.isroutine(name_or_fn):
             return decorate_and_register(name_or_fn, name)

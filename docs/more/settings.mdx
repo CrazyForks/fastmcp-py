@@ -97,5 +97,4 @@ When setting Docket values in a `.env` file, use a **double** underscore: `FASTM
 | `FASTMCP_HOME` | `Path` | Platform default | Data directory for FastMCP. Defaults to the platform-specific user data directory. |
 | `FASTMCP_ENV_FILE` | `str` | `.env` | Path to the `.env` file to load settings from. Must be set as an environment variable (see above). |
 | `FASTMCP_SERVER_DEPENDENCIES` | `list[str]` | `[]` | Additional dependencies to install in the server environment. |
-| `FASTMCP_DECORATOR_MODE` | `Literal["function", "object"]` | `function` | Controls what `@tool`, `@resource`, and `@prompt` decorators return. `function` returns the original function (default); `object` returns component objects (deprecated, will be removed). |
 | `FASTMCP_TEST_MODE` | `bool` | `false` | Enable test mode. |

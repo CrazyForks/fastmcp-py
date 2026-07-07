@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -30,9 +29,8 @@ from pydantic import Field, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 from pydantic.json_schema import SkipJsonSchema
 
-import fastmcp
-from fastmcp.decorators import get_fastmcp_meta, resolve_task_config
-from fastmcp.exceptions import FastMCPDeprecationWarning, ValidationError
+from fastmcp.decorators import get_fastmcp_meta
+from fastmcp.exceptions import ValidationError
 from fastmcp.tools.base import (
     Tool,
     ToolResult,
@@ -643,25 +641,6 @@ def tool(
             "See https://gofastmcp.com/servers/tools#using-with-methods"
         )
 
-    def create_tool(fn: Callable[..., Any], tool_name: str | None) -> FunctionTool:
-        # Create metadata first, then pass it
-        tool_meta = ToolMeta(
-            name=tool_name,
-            version=version,
-            title=title,
-            description=description,
-            icons=icons,
-            tags=tags,
-            output_schema=output_schema,
-            annotations=annotations,
-            meta=meta,
-            task=resolve_task_config(task),
-            timeout=timeout,
-            auth=auth,
-            run_in_thread=run_in_thread,
-        )
-        return FunctionTool.from_function(fn, metadata=tool_meta)
-
     def attach_metadata(fn: F, tool_name: str | None) -> F:
         metadata = ToolMeta(
             name=tool_name,
@@ -683,14 +662,6 @@ def tool(
         return fn
 
     def decorator(fn: F, tool_name: str | None) -> F:
-        if fastmcp.settings.decorator_mode == "object":
-            warnings.warn(
-                "decorator_mode='object' is deprecated and will be removed in a future version. "
-                "Decorators now return the original function with metadata attached.",
-                FastMCPDeprecationWarning,
-                stacklevel=4,
-            )
-            return create_tool(fn, tool_name)  # type: ignore[return-value]  # ty:ignore[invalid-return-type]
         return attach_metadata(fn, tool_name)
 
     if inspect.isroutine(name_or_fn):
