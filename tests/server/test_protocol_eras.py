@@ -34,9 +34,8 @@ from mcp_types.version import (
 )
 from pydantic import FileUrl
 
-import fastmcp
 from fastmcp import Client as FastMCPClient
-from fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP, settings
 from fastmcp.server.elicitation import AcceptedElicitation
 from fastmcp.server.middleware import Middleware
 
@@ -510,7 +509,7 @@ async def test_sampling_deprecation_warning_suppressible_via_settings(
 
     from fastmcp.exceptions import FastMCPDeprecationWarning
 
-    monkeypatch.setattr(fastmcp.settings, "deprecation_warnings", False)
+    monkeypatch.setattr(settings, "deprecation_warnings", False)
 
     mcp = FastMCP("no-warn")
 
