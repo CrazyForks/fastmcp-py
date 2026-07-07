@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
@@ -25,7 +24,6 @@ from mcp_types import Tool as MCPTool
 from pydantic import BaseModel, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from fastmcp.exceptions import FastMCPDeprecationWarning
 from fastmcp.utilities.authorization import AuthCheck
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
@@ -593,28 +591,3 @@ def _convert_to_content(
 
 
 __all__ = ["Tool", "ToolResult"]
-
-
-def __getattr__(name: str) -> Any:
-    """Deprecated re-exports for backwards compatibility."""
-    deprecated_exports = {
-        "FunctionTool": "FunctionTool",
-        "ParsedFunction": "ParsedFunction",
-        "tool": "tool",
-    }
-
-    if name in deprecated_exports:
-        import fastmcp
-
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                f"Importing {name} from fastmcp.tools.tool is deprecated. "
-                f"Import from fastmcp.tools.function_tool instead.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-        from fastmcp.tools import function_tool
-
-        return getattr(function_tool, name)
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
