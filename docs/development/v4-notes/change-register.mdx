@@ -245,23 +245,31 @@ The push-style Context features that require the server to call back into the cl
 | `ctx.info` / logging notifications | Supported | Supported |
 | Tools, resources, prompts, completions | Supported | Supported |
 | `ctx.elicit` | Supported | Not yet — MRTR rewrite pending |
-| `ctx.sample` | Supported | Not yet — being removed in 4.0 |
+| `ctx.sample` / `ctx.sample_step` | Supported (deprecated) | Removed — call an LLM server-side |
 | `ctx.list_roots` | Supported | Not yet — MRTR rewrite pending |
 | Tasks (via the FastMCP client) | Supported | Not yet |
 
-Tools that rely on `ctx.elicit`, `ctx.sample`, or `ctx.list_roots` continue to work against clients on the session-based eras.
+Tools that rely on `ctx.elicit` or `ctx.list_roots` continue to work against clients on the session-based eras. Sampling is the exception: it is deprecated on every era and will not return on modern connections (see the Deprecated entry below).
 
-Ordinary `ctx.info` and `ctx.sample` usage now emits an SDK-level `MCPDeprecationWarning` ("The logging/sampling capability is deprecated as of 2026-07-28 (SEP-2577)"). The warnings come from the SDK, not FastMCP, and are benign — the features keep working on session-based connections per the matrix. Users will see them and wonder, so the upgrade guide calls them out explicitly.
+Ordinary `ctx.info` usage emits an SDK-level `MCPDeprecationWarning` ("The logging capability is deprecated as of 2026-07-28 (SEP-2577)"). That warning comes from the SDK, not FastMCP, and is benign — logging keeps working on session-based connections per the matrix. `ctx.sample`/`ctx.sample_step` additionally emit a FastMCP-owned `FastMCPDeprecationWarning` (see below). The upgrade guide calls both out explicitly.
 
 Wire interop across the transition is verified: a 3.4.3 client against a v4 server and a v4 client against a 3.4.3 server are bidirectionally clean across 9 operations over HTTP (WS2).
 
 *Verify:* `docs/getting-started/upgrading/from-fastmcp-3.mdx` (the published matrix and SDK-warning note), `tests/server/test_protocol_eras.py`.
 
-### Push-feature degradation quality — Known gap
+### Sampling deprecated, era-gated — Deprecated
 
-The degradation error differs by feature on a `2026-07-28` connection: `ctx.list_roots` raises a clear `NoBackChannelError`, while `ctx.elicit` / `ctx.sample` surface a bare "Method not found" because those methods were removed from the 2026 server-request registry. This is sdk-feedback #10 and is captured by a strict xfail in `test_protocol_eras.py`. FastMCP's planned fix is to era-gate `ctx.elicit`/`ctx.sample` to raise a clear message before the wire.
+`ctx.sample()` and `ctx.sample_step()` are deprecated and slated for removal in a future FastMCP release. Server-initiated sampling relies on the `createMessage` back-channel that SEP-2577 removed from the wire as of `2026-07-28`, and unlike elicitation it has no multi-round-trip replacement (the agentic loop would exhaust the round-trip budget). Both methods now emit a `FastMCPDeprecationWarning` once per process (gated on `settings.deprecation_warnings`), and on a `2026-07-28` connection they raise a clear `ToolError` before touching the wire. The client-side sampling handler infrastructure (anthropic/openai/google_genai) is retained for future MRTR work and is not deprecated. The migration is to call an LLM directly from your server rather than borrowing the client's model.
 
-*Verify:* `tests/server/test_protocol_eras.py:319` (strict xfail referencing sdk-feedback #10).
+The dead TODO at `server/context.py` (a background-task sampling relay that was never built) is removed: that relay is not being built, so the note is gone rather than left as a promise.
+
+*Verify:* `fastmcp_slim/fastmcp/server/context.py` (`_warn_sampling_deprecated`, `_is_modern_protocol`, the `sample`/`sample_step` gates), `docs/servers/sampling.mdx` (deprecation banner), `tests/server/test_protocol_eras.py` (warning + era-gate tests).
+
+### Push-feature degradation quality — Resolved (was sdk-feedback #10)
+
+On a `2026-07-28` connection the degradation error used to differ by feature: `ctx.list_roots` raised a clear `NoBackChannelError`, while `ctx.elicit` / `ctx.sample` surfaced a bare "Method not found" because those methods attach a `related_request_id` and reach client dispatch before failing. FastMCP now era-gates `ctx.elicit` and `ctx.sample`/`ctx.sample_step` to raise a clear, era-aware `ToolError` before the wire ("server-initiated sampling is not available on MCP 2026-07-28 connections…" and "elicitation via server-initiated requests is unavailable on 2026-07-28 connections."). The strict xfail that captured #10 is flipped to a passing test.
+
+*Verify:* `tests/server/test_protocol_eras.py` (`test_elicit_sample_degradation_message_is_clear_on_modern`, now a real test), `server/context.py` (era gates).
 
 ### The xfail register — Known gap
 
