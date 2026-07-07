@@ -331,22 +331,22 @@ Without the extra, configuring a tool with `task=True` or `TaskConfig` will rais
 
 ### Deprecated Features
 
-These still work but emit warnings. Update when convenient.
+These were deprecated in v3. Items marked **Removed in v4** no longer work at all — update to the replacement shown. The rest still work but emit warnings; update when convenient.
 
-**mount() prefix → namespace**
+**mount() prefix → namespace** (Removed in v4)
 
 ```python
-# Deprecated
+# Removed in v4
 main.mount(subserver, prefix="api")
 
 # New
 main.mount(subserver, namespace="api")
 ```
 
-**import_server() → mount()**
+**import_server() → mount()** (Removed in v4)
 
 ```python
-# Deprecated
+# Removed in v4
 main.import_server(subserver)
 
 # New
@@ -380,10 +380,10 @@ from fastmcp.server.providers.openapi import OpenAPIProvider
 server = FastMCP("my_api", providers=[OpenAPIProvider(spec, client)])
 ```
 
-**add_tool_transformation() → add_transform()**
+**add_tool_transformation() → add_transform()** (Removed in v4)
 
 ```python
-# Deprecated
+# Removed in v4
 mcp.add_tool_transformation("name", config)
 
 # New
@@ -391,15 +391,19 @@ from fastmcp.server.transforms import ToolTransform
 mcp.add_transform(ToolTransform({"name": config}))
 ```
 
-**FastMCP.as_proxy() → create_proxy()**
+**FastMCP.as_proxy() → create_proxy()** (Removed in v4)
+
+The proxy target is passed positionally in both APIs, so most calls migrate unchanged. If you passed the target by keyword, note that the parameter was renamed from `backend=` to `target=`.
 
 ```python
-# Deprecated
+# Removed in v4
 proxy = FastMCP.as_proxy("http://example.com/mcp")
+proxy = FastMCP.as_proxy(backend="http://example.com/mcp")  # keyword form
 
 # New
 from fastmcp.server import create_proxy
 proxy = create_proxy("http://example.com/mcp")
+proxy = create_proxy(target="http://example.com/mcp")  # as_proxy(backend=X) → create_proxy(target=X)
 ```
 
 ## v2.14.0
