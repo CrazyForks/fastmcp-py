@@ -36,7 +36,6 @@ from fastmcp.exceptions import FastMCPDeprecationWarning, ValidationError
 from fastmcp.tools.base import (
     Tool,
     ToolResult,
-    ToolResultSerializerType,
 )
 from fastmcp.tools.function_parsing import ParsedFunction, _is_object_schema
 from fastmcp.utilities.async_utils import (
@@ -171,7 +170,6 @@ class ToolMeta:
     app: Any = None
     task: bool | TaskConfig | None = None
     exclude_args: list[str] | None = None
-    serializer: Any | None = None
     timeout: float | None = None
     auth: AuthCheck | list[AuthCheck] | None = None
     enabled: bool = True
@@ -238,7 +236,6 @@ class FunctionTool(Tool):
         annotations: ToolAnnotations | None = None,
         exclude_args: list[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
-        serializer: ToolResultSerializerType | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
         timeout: float | None = None,
@@ -268,7 +265,6 @@ class FunctionTool(Tool):
                     annotations,
                     meta,
                     task,
-                    serializer,
                     timeout,
                     auth,
                     run_in_thread,
@@ -303,20 +299,11 @@ class FunctionTool(Tool):
                 meta=meta,
                 task=task,
                 exclude_args=exclude_args,
-                serializer=serializer,
                 timeout=timeout,
                 auth=auth,
                 run_in_thread=True if run_in_thread is None else run_in_thread,
             )
 
-        if metadata.serializer is not None and fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The `serializer` parameter is deprecated. "
-                "Return ToolResult from your tools for full control over serialization. "
-                "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
         if metadata.exclude_args and fastmcp.settings.deprecation_warnings:
             warnings.warn(
                 "The `exclude_args` parameter is deprecated as of FastMCP 2.14. "
@@ -389,7 +376,6 @@ class FunctionTool(Tool):
             output_schema=final_output_schema,
             annotations=metadata.annotations,
             tags=metadata.tags or set(),
-            serializer=metadata.serializer,
             meta=metadata.meta,
             task_config=task_config,
             timeout=metadata.timeout,
@@ -606,7 +592,6 @@ def tool(
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
     exclude_args: list[str] | None = None,
-    serializer: Any | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -626,7 +611,6 @@ def tool(
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
     exclude_args: list[str] | None = None,
-    serializer: Any | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -647,7 +631,6 @@ def tool(
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
     exclude_args: list[str] | None = None,
-    serializer: Any | None = None,
     timeout: float | None = None,
     auth: AuthCheck | list[AuthCheck] | None = None,
     run_in_thread: bool = True,
@@ -690,7 +673,6 @@ def tool(
             meta=meta,
             task=resolve_task_config(task),
             exclude_args=exclude_args,
-            serializer=serializer,
             timeout=timeout,
             auth=auth,
             run_in_thread=run_in_thread,
@@ -710,7 +692,6 @@ def tool(
             meta=meta,
             task=task,
             exclude_args=exclude_args,
-            serializer=serializer,
             timeout=timeout,
             auth=auth,
             run_in_thread=run_in_thread,

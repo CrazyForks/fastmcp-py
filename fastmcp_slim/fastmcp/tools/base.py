@@ -7,7 +7,6 @@ from typing import (
     Annotated,
     Any,
     ClassVar,
-    TypeAlias,
     overload,
 )
 
@@ -57,9 +56,6 @@ if TYPE_CHECKING:
 # Re-export from function_tool module
 
 logger = get_logger(__name__)
-
-
-ToolResultSerializerType: TypeAlias = Callable[[Any], str]
 
 
 def resolve_serialize_by_alias(value: Any) -> bool:
@@ -196,12 +192,6 @@ class Tool(FastMCPComponent):
         ToolExecution | None,
         Field(description="Task execution configuration (SEP-1686)"),
     ] = None
-    serializer: Annotated[
-        SkipJsonSchema[ToolResultSerializerType | None],
-        Field(
-            description="Deprecated. Return ToolResult from your tools for full control over serialization."
-        ),
-    ] = None
     auth: Annotated[
         SkipJsonSchema[AuthCheck | list[AuthCheck] | None],
         Field(description="Authorization checks for this tool", exclude=True),
@@ -268,7 +258,6 @@ class Tool(FastMCPComponent):
         annotations: ToolAnnotations | None = None,
         exclude_args: list[str] | None = None,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
-        serializer: ToolResultSerializerType | None = None,  # Deprecated
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
         timeout: float | None = None,
@@ -289,7 +278,6 @@ class Tool(FastMCPComponent):
             annotations=annotations,
             exclude_args=exclude_args,
             output_schema=output_schema,
-            serializer=serializer,
             meta=meta,
             task=task,
             timeout=timeout,
@@ -313,7 +301,7 @@ class Tool(FastMCPComponent):
         """Convert a raw result to ToolResult.
 
         Handles ToolResult passthrough and converts raw values using the tool's
-        attributes (serializer, output_schema) for proper conversion.
+        attributes (output_schema) for proper conversion.
         """
         if isinstance(raw_value, ToolResult):
             return raw_value
@@ -330,7 +318,7 @@ class Tool(FastMCPComponent):
                     fastmcp_app_name=_get_fastmcp_app_name(self),
                 )
 
-        content = _convert_to_content(raw_value, serializer=self.serializer)
+        content = _convert_to_content(raw_value)
 
         # Bytes can't be represented as structured JSON content
         if isinstance(raw_value, bytes):
@@ -460,7 +448,6 @@ class Tool(FastMCPComponent):
         tags: set[str] | None = None,
         annotations: ToolAnnotations | NotSetT | None = NotSet,
         output_schema: dict[str, Any] | NotSetT | None = NotSet,
-        serializer: ToolResultSerializerType | None = None,  # Deprecated
         meta: dict[str, Any] | NotSetT | None = NotSet,
         transform_args: dict[str, ArgTransform] | None = None,
         transform_fn: Callable[..., Any] | None = None,
@@ -479,7 +466,6 @@ class Tool(FastMCPComponent):
             tags=tags,
             annotations=annotations,
             output_schema=output_schema,
-            serializer=serializer,
             meta=meta,
         )
 
@@ -505,25 +491,8 @@ class Tool(FastMCPComponent):
         }
 
 
-def _serialize_with_fallback(
-    result: Any, serializer: ToolResultSerializerType | None = None
-) -> str:
-    if serializer is not None:
-        try:
-            return serializer(result)
-        except Exception as e:
-            logger.warning(
-                "Error serializing tool result: %s",
-                e,
-                exc_info=True,
-            )
-
-    return default_serializer(result)
-
-
 def _convert_to_single_content_block(
     item: Any,
-    serializer: ToolResultSerializerType | None = None,
 ) -> ContentBlock:
     if isinstance(item, ContentBlock):
         return item
@@ -548,7 +517,7 @@ def _convert_to_single_content_block(
 
             return TextContent(type="text", text=base64.b64encode(item).decode("ascii"))
 
-    return TextContent(type="text", text=_serialize_with_fallback(item, serializer))
+    return TextContent(type="text", text=default_serializer(item))
 
 
 _PREFAB_TEXT_FALLBACK = "[Rendered Prefab UI]"
@@ -599,7 +568,6 @@ def _prefab_to_tool_result(app: Any, fastmcp_app_name: str | None = None) -> Too
 
 def _convert_to_content(
     result: Any,
-    serializer: ToolResultSerializerType | None = None,
 ) -> list[ContentBlock]:
     """Convert a result to a sequence of content objects."""
 
@@ -607,7 +575,7 @@ def _convert_to_content(
         return []
 
     if not isinstance(result, (list | tuple)):
-        return [_convert_to_single_content_block(result, serializer)]
+        return [_convert_to_single_content_block(result)]
 
     # If all items are ContentBlocks, return them as is
     if all(isinstance(item, ContentBlock) for item in result):
@@ -617,13 +585,13 @@ def _convert_to_content(
     # without aggregating them
     if any(isinstance(item, ContentBlock | Image | Audio | File) for item in result):
         return [
-            _convert_to_single_content_block(item, serializer)
+            _convert_to_single_content_block(item)
             if not isinstance(item, ContentBlock)
             else item
             for item in result
         ]
     # If none of the items are ContentBlocks, aggregate all items into a single TextContent
-    return [TextContent(type="text", text=_serialize_with_fallback(result, serializer))]
+    return [TextContent(type="text", text=default_serializer(result))]
 
 
 __all__ = ["Tool", "ToolResult"]

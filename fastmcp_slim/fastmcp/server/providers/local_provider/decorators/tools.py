@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import inspect
 import types
-import warnings
 from collections.abc import Callable
 from functools import partial
 from typing import (
@@ -27,7 +26,6 @@ import mcp_types
 from mcp_types import ToolAnnotations
 
 import fastmcp
-from fastmcp.exceptions import FastMCPDeprecationWarning
 from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.base import Tool
@@ -44,7 +42,6 @@ except ImportError:
 
 if TYPE_CHECKING:
     from fastmcp.server.providers.local_provider import LocalProvider
-    from fastmcp.tools.base import ToolResultSerializerType
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -162,7 +159,6 @@ class ToolDecoratorMixin:
                     meta=tool_meta,
                     task=resolved_task,
                     exclude_args=fmeta.exclude_args,
-                    serializer=fmeta.serializer,
                     timeout=fmeta.timeout,
                     auth=fmeta.auth,
                     run_in_thread=fmeta.run_in_thread,
@@ -192,7 +188,6 @@ class ToolDecoratorMixin:
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
-        serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
         run_in_thread: bool = True,
@@ -215,14 +210,13 @@ class ToolDecoratorMixin:
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
-        serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
         run_in_thread: bool = True,
     ) -> Callable[[F], F]: ...
 
     # NOTE: This method mirrors fastmcp.tools.tool() but adds registration,
-    # the `enabled` param, and supports deprecated params (serializer, exclude_args).
+    # the `enabled` param, and supports the deprecated `exclude_args` param.
     # When deprecated params are removed, this should delegate to the standalone
     # decorator to reduce duplication.
     def tool(
@@ -241,7 +235,6 @@ class ToolDecoratorMixin:
         meta: dict[str, Any] | None = None,
         enabled: bool = True,
         task: bool | TaskConfig | None = None,
-        serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
         run_in_thread: bool = True,
@@ -272,7 +265,6 @@ class ToolDecoratorMixin:
             meta: Optional meta information about the tool
             enabled: Whether the tool is enabled (default True). If False, adds to blocklist.
             task: Optional task configuration for background execution
-            serializer: Deprecated. Return ToolResult from your tools for full control over serialization.
 
         Returns:
             The registered FunctionTool or a decorator function.
@@ -290,14 +282,6 @@ class ToolDecoratorMixin:
                 return str(x)
             ```
         """
-        if serializer is not None and fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "The `serializer` parameter is deprecated. "
-                "Return ToolResult from your tools for full control over serialization. "
-                "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
         if isinstance(annotations, dict):
             annotations = ToolAnnotations(**annotations)
 
@@ -345,7 +329,6 @@ class ToolDecoratorMixin:
                     annotations=annotations,
                     exclude_args=exclude_args,
                     meta=meta,
-                    serializer=serializer,
                     task=resolved_task,
                     timeout=timeout,
                     auth=auth,
@@ -371,7 +354,6 @@ class ToolDecoratorMixin:
                     meta=meta,
                     task=task,
                     exclude_args=exclude_args,
-                    serializer=serializer,
                     timeout=timeout,
                     auth=auth,
                     enabled=enabled,
@@ -416,7 +398,6 @@ class ToolDecoratorMixin:
             meta=meta,
             enabled=enabled,
             task=task,
-            serializer=serializer,
             timeout=timeout,
             auth=auth,
             run_in_thread=run_in_thread,
