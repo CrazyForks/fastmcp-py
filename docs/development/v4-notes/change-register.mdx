@@ -289,10 +289,38 @@ FastMCP keeps its own DCR redirect-URI hardening (PRs #4419, #4408) regardless o
 
 *Verify:* recent commits `67527c1f` (block unsafe OAuth redirect schemes), `57a27992` (DNS rebinding), `cccb529f` (DCR redirect URI validation) on `main`.
 
-### Session-owner credential enforcement — Absorbed (security gain)
+## Removed in 4.0
 
-A streamable-HTTP session is now bound to the credential that created it. Once the session manager owns the server lifecycle (its `run()` drives FastMCP's lifespan through `_lifespan_proxy`), the SDK's `_session_owners` map is populated on session creation and checked on every subsequent request: a request that presents a *different* credential for an existing `Mcp-Session-Id` is answered with 404, exactly as if the session did not exist. This closes a gap where a leaked session id was usable by any bearer — before this, any valid token could drive someone else's session. Identity is the `(client_id, issuer, subject)` triple the token verifier supplies; components it does not populate degrade out of the comparison.
+Deprecations that warned in 3.x are removed in 4.0. Each entry below is a hard removal — the old surface raises `TypeError` / `AttributeError` rather than warning, unless noted otherwise.
 
-The enforcement is the SDK's, but it only activates on FastMCP's stateful HTTP path because FastMCP lets the manager enter the lifespan (see HTTP → Lifespan reconciliation above). No configuration is required.
+### Module and class shims
 
-*Verify:* `tests/server/http/test_session_owner_enforcement.py` (create with token A → reuse with token B → 404; reuse with token A → 200); SDK `streamable_http_manager.py` `_session_owners`.
+- **`fastmcp.server.proxy`** (deprecated 3.0) — Breaking. Import proxy classes (`FastMCPProxy`, `ProxyClient`, etc.) from `fastmcp.server.providers.proxy` instead.
+- **`fastmcp.server.openapi`** and its submodules (`server`, `components`, `routing`), including the **`FastMCPOpenAPI`** class (deprecated 3.0) — Breaking. Use `FastMCP` with an `OpenAPIProvider` from `fastmcp.server.providers.openapi` instead.
+- **`fastmcp.experimental.server.openapi`** and **`fastmcp.experimental.utilities.openapi`** shims (deprecated 2.14) — Breaking. Import from `fastmcp.server.providers.openapi` and `fastmcp.utilities.openapi` respectively.
+- **`fastmcp.server.apps`** and **`fastmcp.server.app`** shims (deprecated 3.2) — Breaking. Import from `fastmcp.apps` (e.g. `AppConfig`) or `fastmcp` (`FastMCPApp`) instead.
+- **`PromptToolMiddleware`** and **`ResourceToolMiddleware`** (deprecated 3.1) — Breaking. Use the `PromptsAsTools` / `ResourcesAsTools` transforms from `fastmcp.server.transforms` instead. The non-deprecated `ToolInjectionMiddleware` base class is retained.
+- **`StreamableHttpTransport(sse_read_timeout=...)`** (deprecated no-op) — Breaking. The parameter had no effect under the SDK v2 client; configure timeouts via `read_timeout_seconds` in `session_kwargs` or on the httpx client via `httpx_client_factory`. `SSETransport` still accepts `sse_read_timeout`.
+
+### `FastMCP` server methods and `mount()` kwargs
+
+The following `FastMCP` methods and parameters, deprecated since 3.0, are removed:
+
+- `FastMCP.as_proxy(...)` → `create_proxy(...)` (`from fastmcp.server import create_proxy`)
+- `FastMCP.import_server(sub)` → `mount(sub)`
+- `mount(prefix=...)` → `mount(namespace=...)`
+- `mount(as_proxy=...)` — removed; mounts always invoke the child's lifespan and middleware, so the flag was already meaningless. To proxy a server, wrap it with `create_proxy()` before mounting.
+- `FastMCP.add_tool_transformation(name, config)` → `add_transform(ToolTransform({name: config}))`
+- `FastMCP.remove_tool_transformation(name)` — removed; it was a no-op that only warned (transforms are immutable once added). Use `server.disable(keys=[...])` to hide tools.
+- `FastMCP.remove_tool(name)` → `mcp.local_provider.remove_tool(name)`
+
+The `_REMOVED_KWARGS` constructor shim (which raises helpful `TypeError`s for kwargs removed in 3.0) is retained through 4.0.
+
+### Tool and component parameters
+
+- **Tool-level `serializer` parameter** — removed from `@tool` / `mcp.tool()`, `Tool.from_function`, `Tool.from_tool`, `TransformedTool.from_tool`, the OpenAPI `OpenAPITool`, and the `mcp_mixin` tool decorator. Return a `ToolResult` from your tool for full control over serialization instead (see [Custom Serialization](/servers/tools#custom-serialization)). The server-level `tool_serializer` constructor kwarg was already removed in 3.0.
+- **Tool `exclude_args` parameter** — removed from the tool decorator and its plumbing (`ParsedFunction.from_function`, `Tool.from_function`, `mcp.tool()`). Use dependency injection with `Depends()` to hide parameters from the tool schema instead.
+- **`decorator_mode` setting** (`FASTMCP_DECORATOR_MODE`) and its `"object"` mode — removed. Decorators always return the original function with metadata attached; the object-returning machinery is gone. Access component objects through the server (e.g. `await mcp.get_tool("name")`) rather than the decorated function.
+- **Component-import compatibility shims** — the `__getattr__` shims that re-exported `FunctionTool` / `ParsedFunction` / `tool` from `fastmcp.tools.tool`, `FunctionResource` / `resource` from `fastmcp.resources.resource`, and `FunctionPrompt` / `prompt` from `fastmcp.prompts.prompt` are removed. Import these from their canonical modules (`fastmcp.tools.function_tool`, `fastmcp.resources.function_resource`, `fastmcp.prompts.function_prompt`) instead.
+
+*Verify:* deletions of `fastmcp_slim/fastmcp/server/proxy.py`, `fastmcp_slim/fastmcp/server/openapi/`, `fastmcp_slim/fastmcp/experimental/server/openapi/`, `fastmcp_slim/fastmcp/experimental/utilities/openapi/`, `fastmcp_slim/fastmcp/server/apps.py`, `fastmcp_slim/fastmcp/server/app.py`; the removed classes in `fastmcp_slim/fastmcp/server/middleware/tool_injection.py`; the removed parameter in `fastmcp_slim/fastmcp/client/transports/http.py`; `fastmcp_slim/fastmcp/server/server.py`; `fastmcp_slim/fastmcp/tools/base.py`, `tools/function_tool.py`, `tools/tool_transform.py`, `tools/function_parsing.py`; `fastmcp_slim/fastmcp/settings.py`, `resources/function_resource.py`, `prompts/function_prompt.py`, and the local-provider decorators; `resources/base.py`, `prompts/base.py`.

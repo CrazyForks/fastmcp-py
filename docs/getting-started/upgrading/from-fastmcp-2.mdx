@@ -355,10 +355,10 @@ main.mount(subserver)
 
 **Module import paths for proxy and OpenAPI**
 
-The proxy and OpenAPI modules have moved under `providers` to reflect v3's provider-based architecture:
+The proxy and OpenAPI modules moved under `providers` to reflect v3's provider-based architecture. The old `fastmcp.server.proxy` and `fastmcp.server.openapi` compatibility shims were **removed in 4.0** — import from the `providers` location instead:
 
 ```python test="skip"
-# Deprecated
+# Removed in 4.0
 from fastmcp.server.proxy import FastMCPProxy
 from fastmcp.server.openapi import FastMCPOpenAPI
 
@@ -367,10 +367,10 @@ from fastmcp.server.providers.proxy import FastMCPProxy
 from fastmcp.server.providers.openapi import OpenAPIProvider
 ```
 
-`FastMCPOpenAPI` itself is deprecated — use `FastMCP` with an `OpenAPIProvider` instead:
+`FastMCPOpenAPI` was **removed in 4.0** — use `FastMCP` with an `OpenAPIProvider` instead:
 
 ```python test="skip"
-# Deprecated
+# Removed in 4.0
 from fastmcp.server.openapi import FastMCPOpenAPI
 server = FastMCPOpenAPI(spec, client)
 
@@ -406,14 +406,16 @@ proxy = create_proxy("http://example.com/mcp")
 
 ### OpenAPI Parser Promotion
 
-The experimental OpenAPI parser is now standard. Update imports:
+The experimental OpenAPI parser is now standard. The `fastmcp.experimental.server.openapi` and `fastmcp.server.openapi` shims were both **removed in 4.0** — use `FastMCP` with an `OpenAPIProvider` instead:
 
 ```python test="skip"
 # Before
 from fastmcp.experimental.server.openapi import FastMCPOpenAPI
 
-# After
-from fastmcp.server.openapi import FastMCPOpenAPI
+# After (removed in 4.0 — use OpenAPIProvider)
+from fastmcp import FastMCP
+from fastmcp.server.providers.openapi import OpenAPIProvider
+server = FastMCP("my_api", providers=[OpenAPIProvider(spec, client)])
 ```
 
 ### Removed Deprecated Features
