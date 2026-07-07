@@ -75,7 +75,7 @@ BREAKING CHANGES (will crash at import or runtime):
 9. ENV VAR: FASTMCP_SHOW_CLI_BANNER renamed to FASTMCP_SHOW_SERVER_BANNER.
 
 10. DECORATORS: @mcp.tool, @mcp.resource, @mcp.prompt now return the original function, not a component object. Code that accesses .name, .description, or other component attributes on the decorated result will crash with AttributeError.
-   Fix: set FASTMCP_DECORATOR_MODE=object for v2 compat (itself deprecated).
+   Fix: access component objects via the server (e.g. await mcp.get_tool("name")) instead of the decorated function. The FASTMCP_DECORATOR_MODE=object escape hatch that existed in v3 was removed in FastMCP 4.0.
 
 11. OAUTH STORAGE: Default OAuth client storage changed from DiskStore to FileTreeStore due to pickle deserialization vulnerability in diskcache (CVE-2025-69872). Clients using default storage will re-register automatically on first connection. If using DiskStore explicitly, switch to FileTreeStore (with key/collection sanitization strategies) or add pip install 'py-key-value-aio[disk]'.
 
@@ -317,7 +317,7 @@ def greet(name: str) -> str:
 greet("World")  # Works! Returns "Hello, World!"
 ```
 
-If you have code that treats the decorated result as a `FunctionTool` (e.g., accessing `.name` or `.description`), set `FASTMCP_DECORATOR_MODE=object` for v2 compatibility. This escape hatch is itself deprecated and will be removed in a future release.
+If you have code that treats the decorated result as a `FunctionTool` (e.g., accessing `.name` or `.description`), the v2-compatible object-returning behavior was available in v3 via `FASTMCP_DECORATOR_MODE=object`. That escape hatch was removed in FastMCP 4.0 — decorators always return the original function now.
 
 **Background tasks require optional dependency**
 
