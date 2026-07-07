@@ -393,13 +393,17 @@ mcp.add_transform(ToolTransform({"name": config}))
 
 **FastMCP.as_proxy() → create_proxy()** (Removed in v4)
 
+The proxy target is passed positionally in both APIs, so most calls migrate unchanged. If you passed the target by keyword, note that the parameter was renamed from `backend=` to `target=`.
+
 ```python
 # Removed in v4
 proxy = FastMCP.as_proxy("http://example.com/mcp")
+proxy = FastMCP.as_proxy(backend="http://example.com/mcp")  # keyword form
 
 # New
 from fastmcp.server import create_proxy
 proxy = create_proxy("http://example.com/mcp")
+proxy = create_proxy(target="http://example.com/mcp")  # as_proxy(backend=X) → create_proxy(target=X)
 ```
 
 ## v2.14.0
