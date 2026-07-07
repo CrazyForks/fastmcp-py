@@ -80,10 +80,12 @@ ResultT = TypeVar("ResultT", default=str)
 # Import ToolChoiceOption from sampling module (after other imports)
 from fastmcp.server.sampling.run import ToolChoiceOption  # noqa: E402
 
-# Warn-once guards for the sampling deprecation. Server-initiated createMessage
+# Warn-once guard for the sampling deprecation. Server-initiated createMessage
 # was removed from MCP as of 2026-07-28 (SEP-2577); the warning fires a single
 # time per process to flag that ctx.sample/ctx.sample_step are on their way out.
-_sample_deprecation_warned = False
+# A mutable set (mutated in place, never rebound) rather than a `global` boolean
+# so the warn-once state is unambiguously read and written from the module.
+_sample_deprecation_warned: set[bool] = set()
 
 _SAMPLING_DEPRECATION_MESSAGE = (
     "ctx.sample() and ctx.sample_step() are deprecated and will be removed in a "
@@ -110,10 +112,9 @@ def _warn_sampling_deprecated() -> None:
     Gated on ``settings.deprecation_warnings`` like every other FastMCP
     deprecation; fires a single time (module-level flag) rather than per call.
     """
-    global _sample_deprecation_warned
     if _sample_deprecation_warned or not fastmcp.settings.deprecation_warnings:
         return
-    _sample_deprecation_warned = True
+    _sample_deprecation_warned.add(True)
     warnings.warn(
         _SAMPLING_DEPRECATION_MESSAGE,
         FastMCPDeprecationWarning,
@@ -918,6 +919,23 @@ class Context:
             return False
         return rc.protocol_version in MODERN_PROTOCOL_VERSIONS
 
+    def _server_can_sample(self) -> bool:
+        """True when a server-configured sampling handler can serve the request
+        without the client back-channel.
+
+        FastMCP supports a server-side sampling handler (``FastMCP(sampling_handler=...)``).
+        With ``sampling_handler_behavior="always"`` the handler always answers;
+        with ``"fallback"`` it answers whenever the client cannot. On modern
+        connections the client back-channel is gone, so either configuration lets
+        the server answer entirely server-side as long as a handler is set. (For
+        ``"always"`` without a handler the sampling implementation raises its own
+        clear "no handler configured" error, which is not an era concern.)
+        """
+        fastmcp = self.fastmcp
+        if fastmcp.sampling_handler_behavior == "always":
+            return True
+        return fastmcp.sampling_handler is not None
+
     async def sample_step(
         self,
         messages: str | Sequence[str | SamplingMessage],
@@ -983,7 +1001,13 @@ class Context:
                 messages = step.history
         """
         _warn_sampling_deprecated()
-        if self._is_modern_protocol():
+        # On modern (2026-07-28) connections the client back-channel is gone
+        # (SEP-2577). A server-configured sampling handler can still answer
+        # entirely server-side; only raise the era error when nothing can serve
+        # the request. When modern, force the handler path (never attempt the
+        # dead client) by passing client_available=False.
+        client_available = not self._is_modern_protocol()
+        if not client_available and not self._server_can_sample():
             raise ToolError(_SAMPLING_MODERN_ERROR)
         return await sample_step_impl(
             self,
@@ -997,6 +1021,7 @@ class Context:
             auto_execute_tools=execute_tools,
             mask_error_details=mask_error_details,
             tool_concurrency=tool_concurrency,
+            client_available=client_available,
         )
 
     @overload
@@ -1093,7 +1118,13 @@ class Context:
             future FastMCP release. Call an LLM directly from your server instead.
         """
         _warn_sampling_deprecated()
-        if self._is_modern_protocol():
+        # On modern (2026-07-28) connections the client back-channel is gone
+        # (SEP-2577). A server-configured sampling handler can still answer
+        # entirely server-side; only raise the era error when nothing can serve
+        # the request. When modern, force the handler path (never attempt the
+        # dead client) by passing client_available=False.
+        client_available = not self._is_modern_protocol()
+        if not client_available and not self._server_can_sample():
             raise ToolError(_SAMPLING_MODERN_ERROR)
         return await sample_impl(  # ty: ignore[invalid-return-type]
             self,
@@ -1106,6 +1137,7 @@ class Context:
             result_type=result_type,
             mask_error_details=mask_error_details,
             tool_concurrency=tool_concurrency,
+            client_available=client_available,
         )
 
     @overload
