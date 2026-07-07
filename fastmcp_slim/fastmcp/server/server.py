@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import secrets
 import warnings
 from collections.abc import (
@@ -47,7 +46,6 @@ from fastmcp.apps.config import (
 )
 from fastmcp.exceptions import (
     AuthorizationError,
-    FastMCPDeprecationWarning,
     FastMCPError,
     NotFoundError,
     PromptError,
@@ -178,9 +176,6 @@ def _check_removed_kwargs(kwargs: dict[str, Any]) -> None:
 
 
 Transport = Literal["stdio", "http", "sse", "streamable-http"]
-
-# Compiled URI parsing regex to split a URI into protocol and path components
-URI_PATTERN = re.compile(r"^([^:]+://)(.*?)$")
 
 
 LifespanCallable = Callable[
@@ -623,38 +618,6 @@ class FastMCP(
             ```
         """
         self._transforms.append(transform)
-
-    def add_tool_transformation(
-        self, tool_name: str, transformation: ToolTransformConfig
-    ) -> None:
-        """Add a tool transformation.
-
-        .. deprecated::
-            Use ``add_transform(ToolTransform({...}))`` instead.
-        """
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "add_tool_transformation is deprecated. Use "
-                "server.add_transform(ToolTransform({tool_name: config})) instead.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-        self.add_transform(ToolTransform({tool_name: transformation}))
-
-    def remove_tool_transformation(self, _tool_name: str) -> None:
-        """Remove a tool transformation.
-
-        .. deprecated::
-            Tool transformations are now immutable. Use enable/disable controls instead.
-        """
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "remove_tool_transformation is deprecated and has no effect. "
-                "Transforms are immutable once added. Use server.disable(keys=[...]) "
-                "to hide tools instead.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
 
     async def list_tools(self, *, run_middleware: bool = True) -> Sequence[Tool]:
         """List all enabled tools from providers.
@@ -1674,35 +1637,6 @@ class FastMCP(
         """
         return self._local_provider.add_tool(tool)
 
-    def remove_tool(self, name: str, version: str | None = None) -> None:
-        """Remove tool(s) from the server.
-
-        .. deprecated::
-            Use ``mcp.local_provider.remove_tool(name)`` instead.
-
-        Args:
-            name: The name of the tool to remove.
-            version: If None, removes ALL versions. If specified, removes only that version.
-
-        Raises:
-            NotFoundError: If no matching tool is found.
-        """
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "remove_tool() is deprecated. Use "
-                "mcp.local_provider.remove_tool(name) instead.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-        try:
-            self._local_provider.remove_tool(name, version)
-        except KeyError:
-            if version is None:
-                raise NotFoundError(f"Tool {name!r} not found") from None
-            raise NotFoundError(
-                f"Tool {name!r} version {version!r} not found"
-            ) from None
-
     @overload
     def tool(
         self,
@@ -2138,17 +2072,14 @@ class FastMCP(
         self,
         server: FastMCP[LifespanResultT],
         namespace: str | None = None,
-        as_proxy: bool | None = None,
         tool_names: dict[str, str] | None = None,
-        prefix: str | None = None,  # deprecated, use namespace
     ) -> None:
         """Mount another FastMCP server on this server with an optional namespace.
 
-        Unlike importing (with import_server), mounting establishes a dynamic connection
-        between servers. When a client interacts with a mounted server's objects through
-        the parent server, requests are forwarded to the mounted server in real-time.
-        This means changes to the mounted server are immediately reflected when accessed
-        through the parent.
+        Mounting establishes a dynamic connection between servers. When a client
+        interacts with a mounted server's objects through the parent server, requests
+        are forwarded to the mounted server in real-time. This means changes to the
+        mounted server are immediately reflected when accessed through the parent.
 
         When a server is mounted with a namespace:
         - Tools from the mounted server are accessible with namespaced names.
@@ -2174,47 +2105,14 @@ class FastMCP(
             server: The FastMCP server to mount.
             namespace: Optional namespace to use for the mounted server's objects. If None,
                 the server's objects are accessible with their original names.
-            as_proxy: Deprecated. Mounted servers now always have their lifespan and
-                middleware invoked. To create a proxy server, use create_proxy()
-                explicitly before mounting.
             tool_names: Optional mapping of original tool names to custom names. Use this
                 to override namespaced names. Keys are the original tool names from the
                 mounted server.
-            prefix: Deprecated. Use namespace instead.
         """
-        import warnings
-
         from fastmcp.server.providers.fastmcp_provider import FastMCPProvider
 
         if server is self:
             raise ValueError("Cannot mount a server onto itself")
-
-        # Handle deprecated prefix parameter
-        if prefix is not None:
-            warnings.warn(
-                "The 'prefix' parameter is deprecated, use 'namespace' instead",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-            if namespace is None:
-                namespace = prefix
-            else:
-                raise ValueError("Cannot specify both 'prefix' and 'namespace'")
-
-        if as_proxy is not None:
-            warnings.warn(
-                "as_proxy is deprecated and will be removed in a future version. "
-                "Mounted servers now always have their lifespan and middleware invoked. "
-                "To create a proxy server, use create_proxy() explicitly.",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-            # Still honor the flag for backward compatibility
-            if as_proxy:
-                from fastmcp.server.providers.proxy import FastMCPProxy
-
-                if not isinstance(server, FastMCPProxy):
-                    server = FastMCP.as_proxy(server)
 
         # Warn if parent masks errors but child doesn't (or vice versa)
         if self._mask_error_details and not server._mask_error_details:
@@ -2239,105 +2137,6 @@ class FastMCP(
 
         # Use add_provider with namespace (applies namespace in AggregateProvider)
         self.add_provider(provider, namespace=namespace or "")
-
-    async def import_server(
-        self,
-        server: FastMCP[LifespanResultT],
-        prefix: str | None = None,
-    ) -> None:
-        """
-        Import the MCP objects from another FastMCP server into this one,
-        optionally with a given prefix.
-
-        .. deprecated::
-            Use :meth:`mount` instead. ``import_server`` will be removed in a
-            future version.
-
-        Note that when a server is *imported*, its objects are immediately
-        registered to the importing server. This is a one-time operation and
-        future changes to the imported server will not be reflected in the
-        importing server. Server-level configurations and lifespans are not imported.
-
-        When a server is imported with a prefix:
-        - The tools are imported with prefixed names
-          Example: If server has a tool named "get_weather", it will be
-          available as "prefix_get_weather"
-        - The resources are imported with prefixed URIs using the new format
-          Example: If server has a resource with URI "weather://forecast", it will
-          be available as "weather://prefix/forecast"
-        - The templates are imported with prefixed URI templates using the new format
-          Example: If server has a template with URI "weather://location/{id}", it will
-          be available as "weather://prefix/location/{id}"
-        - The prompts are imported with prefixed names
-          Example: If server has a prompt named "weather_prompt", it will be available as
-          "prefix_weather_prompt"
-
-        When a server is imported without a prefix (prefix=None), its tools, resources,
-        templates, and prompts are imported with their original names.
-
-        Args:
-            server: The FastMCP server to import
-            prefix: Optional prefix to use for the imported server's objects. If None,
-                objects are imported with their original names.
-        """
-        import warnings
-
-        warnings.warn(
-            "import_server is deprecated, use mount() instead",
-            FastMCPDeprecationWarning,
-            stacklevel=2,
-        )
-
-        def add_resource_prefix(uri: str, prefix: str) -> str:
-            """Add prefix to resource URI: protocol://path → protocol://prefix/path."""
-            match = URI_PATTERN.match(uri)
-            if match:
-                protocol, path = match.groups()
-                return f"{protocol}{prefix}/{path}"
-            return uri
-
-        # Import tools from the server
-        for tool in await server.list_tools():
-            if prefix:
-                tool = tool.model_copy(update={"name": f"{prefix}_{tool.name}"})
-            self.add_tool(tool)
-
-        # Import resources and templates from the server
-        for resource in await server.list_resources():
-            if prefix:
-                new_uri = add_resource_prefix(str(resource.uri), prefix)
-                resource = resource.model_copy(update={"uri": new_uri})
-            self.add_resource(resource)
-
-        for template in await server.list_resource_templates():
-            if prefix:
-                new_uri_template = add_resource_prefix(template.uri_template, prefix)
-                template = template.model_copy(
-                    update={"uri_template": new_uri_template}
-                )
-            self.add_template(template)
-
-        # Import prompts from the server
-        for prompt in await server.list_prompts():
-            if prefix:
-                prompt = prompt.model_copy(update={"name": f"{prefix}_{prompt.name}"})
-            self.add_prompt(prompt)
-
-        if server._lifespan != default_lifespan:
-            from warnings import warn
-
-            warn(
-                message="When importing from a server with a lifespan, the lifespan from the imported server will not be used.",
-                category=RuntimeWarning,
-                stacklevel=2,
-            )
-
-        if prefix:
-            logger.debug(
-                f"[{self.name}] Imported server {server.name} with prefix '{prefix}'"
-            )
-        else:
-            logger.debug(f"[{self.name}] Imported server {server.name}")
 
     @classmethod
     def from_openapi(
@@ -2444,43 +2243,6 @@ class FastMCP(
             tags=tags,
         )
         return cls(name=server_name, providers=[provider], **settings)
-
-    @classmethod
-    def as_proxy(
-        cls,
-        backend: (
-            Client[ClientTransportT]
-            | ClientTransport
-            | FastMCP[Any]
-            | SDKServer
-            | AnyUrl
-            | Path
-            | MCPConfig
-            | dict[str, Any]
-            | str
-        ),
-        **settings: Any,
-    ) -> FastMCPProxy:
-        """Create a FastMCP proxy server for the given backend.
-
-        .. deprecated::
-            Use :func:`fastmcp.server.create_proxy` instead.
-            This method will be removed in a future version.
-
-        The `backend` argument can be either an existing `fastmcp.client.Client`
-        instance or any value accepted as the `transport` argument of
-        `fastmcp.client.Client`. This mirrors the convenience of the
-        `fastmcp.client.Client` constructor.
-        """
-        if fastmcp.settings.deprecation_warnings:
-            warnings.warn(
-                "FastMCP.as_proxy() is deprecated. Use create_proxy() from "
-                "fastmcp.server instead: `from fastmcp.server import create_proxy`",
-                FastMCPDeprecationWarning,
-                stacklevel=2,
-            )
-        # Call the module-level create_proxy function directly
-        return create_proxy(backend, **settings)
 
     @classmethod
     def generate_name(cls, name: str | None = None) -> str:
