@@ -753,9 +753,7 @@ class TestPathSafetyAttackCorpus:
         result = await template.read(arguments={"path": "docs/../docs/nested.txt"})
         assert result == "NESTED OK"
 
-    async def test_file_resource_read_allows_nested_path(
-        self, skill_with_secret: Path
-    ):
+    async def test_file_resource_read_allows_nested_path(self, skill_with_secret: Path):
         provider = SkillProvider(
             skill_path=skill_with_secret, supporting_files="resources"
         )
