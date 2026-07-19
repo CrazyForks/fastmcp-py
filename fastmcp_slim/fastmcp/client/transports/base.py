@@ -1,6 +1,7 @@
 import abc
 import contextlib
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
 import httpx2
@@ -20,7 +21,7 @@ from typing_extensions import TypedDict, Unpack
 ClientTransportT = TypeVar("ClientTransportT", bound="ClientTransport")
 
 
-class SessionKwargs(TypedDict, total=False):
+class ClientSessionKwargs(TypedDict, total=False):
     """Keyword arguments for the MCP ClientSession constructor."""
 
     read_timeout_seconds: float | None
@@ -32,6 +33,32 @@ class SessionKwargs(TypedDict, total=False):
     message_handler: MessageHandlerFnT | None
     client_info: mcp_types.Implementation | None
     notification_bindings: Sequence[NotificationBinding[Any]] | None
+
+
+@dataclass(frozen=True)
+class TransportOptions:
+    """How one client wants its connection built.
+
+    These belong to the client rather than to the transport, so a transport
+    shared between clients doesn't leak one client's settings to another.
+
+    Attributes:
+        session_class: The ClientSession class to instantiate. Proxies supply a
+            session that skips output-schema validation, since they relay
+            results rather than consume them.
+        forward_incoming_headers: Whether to forward the inbound request's
+            authorization header upstream. Only appropriate for proxies, where
+            the caller's credentials are meant to be propagated. Honored by the
+            HTTP and SSE transports; ignored by the others.
+    """
+
+    session_class: type[ClientSession] = ClientSession
+    forward_incoming_headers: bool = False
+
+
+# SessionKwargs stays exactly the ClientSession constructor's parameters, so a
+# transport can splat it into ClientSession without filtering.
+SessionKwargs = ClientSessionKwargs
 
 
 class ClientTransport(abc.ABC):
@@ -46,7 +73,10 @@ class ClientTransport(abc.ABC):
     @abc.abstractmethod
     @contextlib.asynccontextmanager
     async def connect_session(
-        self, **session_kwargs: Unpack[SessionKwargs]
+        self,
+        *,
+        transport_options: TransportOptions | None = None,
+        **session_kwargs: Unpack[SessionKwargs],
     ) -> AsyncIterator[ClientSession]:
         """
         Establishes a connection and yields an active ClientSession.
@@ -58,6 +88,9 @@ class ClientTransport(abc.ABC):
         within this context.
 
         Args:
+            transport_options: How the connecting client wants this connection
+                               built. Defaults apply when omitted. A transport
+                               that wraps others must pass this along.
             **session_kwargs: Keyword arguments to pass to the ClientSession
                               constructor (e.g., callbacks, timeouts).
 

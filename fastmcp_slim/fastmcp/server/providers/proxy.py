@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 import anyio
 import httpx2
 import mcp_types
+from mcp import ClientSession
 from mcp.server.connection import Connection
 from mcp.server.context import ServerRequestContext
 from mcp.shared.exceptions import MCPError
@@ -35,6 +36,7 @@ from fastmcp.client.roots import RootsList, create_roots_callback
 from fastmcp.client.sampling import create_sampling_callback
 from fastmcp.client.telemetry import client_span
 from fastmcp.client.transports import ClientTransportT
+from fastmcp.client.transports.base import TransportOptions
 from fastmcp.exceptions import ResourceError
 from fastmcp.mcp_config import MCPConfig
 from fastmcp.prompts import Message, Prompt, PromptResult
@@ -64,6 +66,31 @@ logger = get_logger(__name__)
 
 # Type alias for client factory functions
 ClientFactoryT = Callable[[], Client] | Callable[[], Awaitable[Client]]
+
+
+class _ForwardingClientSession(ClientSession):
+    """A session that does not enforce the backend's declared output schema.
+
+    `ClientSession.call_tool` normally validates a tool's structured content
+    against the output schema the backend advertised, raising if they disagree.
+    That check belongs to whoever consumes the result. A proxy only relays it,
+    and the end client runs the same check for itself, so enforcing it mid-path
+    turns a backend's schema bug into a proxy error and hides the real response.
+    """
+
+    async def validate_tool_result(
+        self, name: str, result: mcp_types.CallToolResult
+    ) -> None:
+        return None
+
+
+# Settings every proxy-backend connection uses: relay results without policing
+# the backend's output schema, and forward the caller's authorization header
+# upstream (appropriate for a proxy, where credentials are meant to propagate).
+PROXY_TRANSPORT_OPTIONS = TransportOptions(
+    session_class=_ForwardingClientSession,
+    forward_incoming_headers=True,
+)
 
 
 def _proxy_upstream_error(error: Exception) -> MCPError:
@@ -878,13 +905,16 @@ def _create_client_factory(
     if isinstance(target, Client):
         client = target
 
-        # Plain Clients used as proxy backends also need header forwarding,
-        # same as ProxyClient (which sets this in __init__).
-        from fastmcp.client.transports.http import StreamableHttpTransport
-        from fastmcp.client.transports.sse import SSETransport
+        def as_proxy_backend(c: Client) -> Client:
+            """Apply proxy connection settings to a copy we own.
 
-        if isinstance(client.transport, StreamableHttpTransport | SSETransport):
-            client.transport.forward_incoming_headers = True
+            The caller handed us their Client; configuring it in place would
+            change how their own connections behave, including whether their
+            credentials get forwarded upstream.
+            """
+            fresh = c.new()
+            fresh._transport_options = PROXY_TRANSPORT_OPTIONS
+            return fresh
 
         if client.is_connected() and type(client) is ProxyClient:
             logger.info(
@@ -893,23 +923,29 @@ def _create_client_factory(
             )
 
             def fresh_client_factory() -> Client:
-                return client.new()
+                return as_proxy_backend(client)
 
             return fresh_client_factory
 
         if client.is_connected():
             logger.info(
                 "Proxy detected connected client - reusing existing session for all requests. "
-                "This may cause context mixing in concurrent scenarios."
+                "This may cause context mixing in concurrent scenarios, and the session's "
+                "existing settings apply, so backend results are validated against their "
+                "declared output schema rather than relayed as-is. Pass a disconnected "
+                "client to avoid both."
             )
 
+            # The caller's session is already built, so there are no connection
+            # settings left to apply — proxy options only take effect at connect
+            # time. Reuse is opt-in via passing an already-connected client.
             def reuse_client_factory() -> Client:
                 return client
 
             return reuse_client_factory
 
         def fresh_client_factory() -> Client:
-            return client.new()
+            return as_proxy_backend(client)
 
         return fresh_client_factory
     else:
@@ -1201,14 +1237,7 @@ class ProxyClient(Client[ClientTransportT]):
                 self._proxy_restoring_handler_keys.add(key)
         super().__init__(transport=transport, **kwargs)  # ty: ignore[no-matching-overload]
 
-        # Enable forwarding of inbound HTTP headers (e.g. authorization) to
-        # the upstream server. This is only appropriate for proxy clients,
-        # where the caller's credentials should be propagated.
-        from fastmcp.client.transports.http import StreamableHttpTransport
-        from fastmcp.client.transports.sse import SSETransport
-
-        if isinstance(self.transport, StreamableHttpTransport | SSETransport):
-            self.transport.forward_incoming_headers = True
+        self._transport_options = PROXY_TRANSPORT_OPTIONS
 
     def _bind_restoring_handlers(self) -> None:
         if "roots" in self._proxy_restoring_handler_keys:

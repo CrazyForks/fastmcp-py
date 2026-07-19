@@ -11,7 +11,11 @@ from mcp.shared.memory import create_client_server_memory_streams
 from typing_extensions import Unpack
 
 from fastmcp import _install_hints
-from fastmcp.client.transports.base import ClientTransport, SessionKwargs
+from fastmcp.client.transports.base import (
+    ClientTransport,
+    SessionKwargs,
+    TransportOptions,
+)
 
 if TYPE_CHECKING:
     from fastmcp.server.server import FastMCP
@@ -52,8 +56,12 @@ class FastMCPTransport(ClientTransport):
 
     @contextlib.asynccontextmanager
     async def connect_session(
-        self, **session_kwargs: Unpack[SessionKwargs]
+        self,
+        *,
+        transport_options: TransportOptions | None = None,
+        **session_kwargs: Unpack[SessionKwargs],
     ) -> AsyncIterator[ClientSession]:
+        options = transport_options or TransportOptions()
         async with create_client_server_memory_streams() as (
             client_streams,
             server_streams,
@@ -88,7 +96,7 @@ class FastMCPTransport(ClientTransport):
                     )
 
                     try:
-                        async with ClientSession(
+                        async with options.session_class(
                             read_stream=client_read,
                             write_stream=client_write,
                             **session_kwargs,
