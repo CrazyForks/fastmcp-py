@@ -381,7 +381,9 @@ class TestResponseCachingMiddlewareIntegration:
         assert not hasattr(cached_resources[0], "fn")
         assert not hasattr(cached_prompts[0], "fn")
 
-        async with Client(mcp) as client:
+        # Pinned to legacy: the tool's `execution.task_support` (SEP-1686) is
+        # advertised in the handshake-era tool listing; the modern listing omits it.
+        async with Client(mcp, mode="legacy") as client:
             for _ in range(2):
                 tools = await client.list_tools()
                 resources = await client.list_resources()

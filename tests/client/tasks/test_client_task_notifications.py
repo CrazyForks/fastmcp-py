@@ -48,7 +48,7 @@ async def task_notification_server():
 
 async def test_task_receives_status_notification(task_notification_server):
     """Task object receives and processes status notifications."""
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 5}, task=True)
 
         # Wait for task to complete (notification should arrive)
@@ -60,7 +60,7 @@ async def test_task_receives_status_notification(task_notification_server):
 
 async def test_status_cache_updated_by_notification(task_notification_server):
     """Cached status is updated when notification arrives."""
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 10}, task=True)
 
         # Wait for completion (notification should update cache)
@@ -84,7 +84,7 @@ async def test_callback_invoked_on_notification(task_notification_server):
         """Sync callback."""
         callback_invocations.append(status)
 
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 7}, task=True)
 
         # Register callback
@@ -113,7 +113,7 @@ async def test_async_callback_invoked(task_notification_server):
         await asyncio.sleep(0.01)  # Simulate async work
         callback_invocations.append(status)
 
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 3}, task=True)
 
         # Register async callback
@@ -140,7 +140,7 @@ async def test_multiple_callbacks_all_invoked(task_notification_server):
     def callback2(status: GetTaskResult):
         callback2_calls.append(status.status)
 
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 8}, task=True)
 
         task.on_status_change(callback1)
@@ -166,7 +166,7 @@ async def test_callback_error_doesnt_break_notification(task_notification_server
     def working_callback(status: GetTaskResult):
         callback2_calls.append(status.status)
 
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 12}, task=True)
 
         task.on_status_change(failing_callback)
@@ -184,7 +184,7 @@ async def test_callback_error_doesnt_break_notification(task_notification_server
 
 async def test_wait_wakes_early_on_notification(task_notification_server):
     """wait() wakes up immediately when notification arrives, not after poll interval."""
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 15}, task=True)
 
         # Record timing
@@ -201,7 +201,7 @@ async def test_wait_wakes_early_on_notification(task_notification_server):
 
 async def test_notification_with_failed_task(task_notification_server):
     """Notifications work for failed tasks too."""
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("failing_task", {}, task=True)
 
         with pytest.raises(Exception):
@@ -232,7 +232,7 @@ async def test_fast_task_completion_delivered_via_notification(
     """
     received: list[str] = []
 
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("instant_task", {"value": 21}, task=True)
         task.on_status_change(lambda status: received.append(status.status))
 
@@ -247,7 +247,7 @@ async def test_fast_task_completion_delivered_via_notification(
 
 async def test_wait_returns_on_input_required(task_notification_server):
     """wait() should return immediately when task enters input_required, not hang."""
-    async with Client(task_notification_server) as client:
+    async with Client(task_notification_server, mode="legacy") as client:
         task = await client.call_tool("quick_task", {"value": 1}, task=True)
 
         # Directly inject an input_required status into the cache and signal the event.

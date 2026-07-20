@@ -91,6 +91,21 @@ class MCPConfigTransport(ClientTransport):
             self.transport = next(iter(self.config.mcpServers.values())).to_transport()
             self._transports.append(self.transport)
 
+    @property
+    def legacy_only(self) -> bool:
+        """Whether this config can only carry the legacy protocol era.
+
+        A single-server config delegates directly to the underlying transport
+        (no proxy), so it inherits that transport's era capability — a modern
+        Streamable HTTP backend must stay modern-capable under `mode="auto"`.
+        A multi-server config mounts each backend behind a legacy-era
+        `ProxyClient` on a composite server, so the composite it exposes is
+        legacy-era and `mode="auto"` should negotiate the handshake.
+        """
+        if len(self.config.mcpServers) == 1:
+            return self.transport.legacy_only
+        return True
+
     @contextlib.asynccontextmanager
     async def connect_session(
         self,

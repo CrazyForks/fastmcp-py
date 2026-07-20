@@ -52,7 +52,7 @@ async def test_list_tasks_creates_propagating_client_span(
 ):
     server = FastMCP("test-server")
 
-    async with Client(server) as client:
+    async with Client(server, mode="legacy") as client:
         await client.list_tasks()
 
     assert_propagating_client_span(trace_exporter, "tasks/list", "")
@@ -74,7 +74,7 @@ async def test_task_id_operations_create_propagating_client_spans(
         await asyncio.sleep(10)
         return "done"
 
-    async with Client(server) as client:
+    async with Client(server, mode="legacy") as client:
         completed_task = await client.call_tool("quick_tool", task=True)
         await completed_task.wait(timeout=2)
         trace_exporter.clear()

@@ -992,7 +992,10 @@ class TestTaskExecution:
                 request_state=None,
             )
 
-        async with Client(mcp) as client:
+        # Client-side background-task submission (`task=True`) is the handshake-era
+        # SEP-1686 model; in 2026-07-28 tasks moved to a separate extension, so pin
+        # the era the "reject a guard's input-required from within a task" rule lives in.
+        async with Client(mcp, mode="legacy") as client:
             task = await client.call_tool("book_flight", {}, task=True)
             with pytest.raises(MCPError, match="background task"):
                 await task.result()

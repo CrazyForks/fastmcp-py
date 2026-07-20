@@ -449,7 +449,7 @@ class TestSeamServerSpan:
     ):
         mcp = FastMCP("test-server")
 
-        async with Client(mcp) as client:
+        async with Client(mcp, mode="legacy") as client:
             await client.set_logging_level("info")
 
         spans = trace_exporter.get_finished_spans()
@@ -470,7 +470,7 @@ class TestSeamServerSpan:
         """A seam-spanned method must produce exactly one SERVER span, not two."""
         mcp = FastMCP("test-server")
 
-        async with Client(mcp) as client:
+        async with Client(mcp, mode="legacy") as client:
             await client.set_logging_level("info")
 
         spans = trace_exporter.get_finished_spans()
@@ -745,10 +745,14 @@ class TestProtocolVersionAttribute:
         self, trace_exporter: InMemorySpanExporter
     ):
         """Seam-only methods (never reaching the high-level path) also carry the
-        protocol version."""
+        protocol version.
+
+        Pinned to legacy: `logging/setLevel` is a handshake-era seam method the
+        modern (2026-07-28) protocol drops, so the span exists only on legacy.
+        """
         mcp = FastMCP("test-server")
 
-        async with Client(mcp) as client:
+        async with Client(mcp, mode="legacy") as client:
             await client.set_logging_level("info")
 
         spans = trace_exporter.get_finished_spans()

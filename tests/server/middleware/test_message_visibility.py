@@ -116,7 +116,7 @@ class TestUnroutableAndMalformed:
         recorder = HookRecorder()
         server.add_middleware(recorder)
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             with pytest.raises(MCPError):
                 await client.session._dispatcher.send_raw_request(
                     "does/not/exist", {}, {}
@@ -133,7 +133,7 @@ class TestUnroutableAndMalformed:
         recorder = HookRecorder()
         server.add_middleware(recorder)
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             with pytest.raises(MCPError):
                 await client.session._dispatcher.send_raw_request(
                     "tools/call", {"not_a_valid": "param"}, {}
@@ -216,7 +216,7 @@ class TestMessageModification:
         server = _adder()
         server.add_middleware(RewriteLevel())
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             await client.session._dispatcher.send_raw_request(
                 "logging/setLevel", {"level": "not-a-valid-level"}, {}
             )
@@ -227,7 +227,7 @@ class TestMessageModification:
         recorder = HookRecorder()
         server.add_middleware(recorder)
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             await client.session._dispatcher.send_raw_request(
                 "logging/setLevel", {"level": "debug"}, {}
             )
@@ -254,7 +254,7 @@ class TestMessageModification:
         server.add_middleware(recorder)
         server.add_middleware(RewriteMethod())
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             await client.session._dispatcher.send_raw_request("ping", {}, {})
 
         # Had the rewrite redirected dispatch, the component handler would have
@@ -284,7 +284,7 @@ class TestMessageModification:
         server.add_middleware(RepairAttempt())
         server.add_middleware(recorder)
 
-        async with Client(server) as client:
+        async with Client(server, mode="legacy") as client:
             with pytest.raises(MCPError):
                 await client.session._dispatcher.send_raw_request(
                     "tools/call", {"not_a_valid": "param"}, {}

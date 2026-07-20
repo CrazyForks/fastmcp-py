@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 from anyio import create_task_group
@@ -19,6 +20,42 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server import create_proxy
 from fastmcp.server.elicitation import AcceptedElicitation
 from fastmcp.server.providers.proxy import ProxyClient, _create_client_factory
+
+
+class TestProxyClientEraDefault:
+    """`ProxyClient` pins the handshake era independently of `Client`'s default.
+
+    `fastmcp.Client` defaults to `mode="auto"` (negotiate the newest mutual era),
+    but a proxy backend forwards the initialize handshake and server-initiated
+    push features (sampling / elicitation / roots / logging), which live only on
+    the handshake era. So `ProxyClient` must default to `"legacy"` regardless of
+    what `Client` defaults to — flipping the general client default must never
+    change proxy behavior.
+    """
+
+    def test_client_default_is_auto(self):
+        mcp = FastMCP("Backend")
+        assert Client(mcp).mode == "auto"
+
+    def test_proxy_client_defaults_to_legacy(self):
+        mcp = FastMCP("Backend")
+        assert ProxyClient(mcp).mode == "legacy"
+
+    def test_proxy_client_can_opt_into_auto(self):
+        """The legacy default is an override-able floor, not a hard pin."""
+        mcp = FastMCP("Backend")
+        assert ProxyClient(mcp, mode="auto").mode == "auto"
+
+    def test_create_proxy_backend_defaults_to_legacy(self):
+        """The backend client `create_proxy` builds is legacy by default too."""
+        mcp = FastMCP("Backend")
+        factory = _create_client_factory(mcp)
+        assert cast(Client, factory()).mode == "legacy"
+
+    def test_create_proxy_backend_honors_explicit_mode(self):
+        mcp = FastMCP("Backend")
+        factory = _create_client_factory(mcp, mode="auto")
+        assert cast(Client, factory()).mode == "auto"
 
 
 @pytest.fixture
@@ -97,7 +134,7 @@ class TestProxyClient:
         """
         Test that the proxy client correctly forwards the `echo` tool meta.
         """
-        async with Client(proxy_server) as client:
+        async with Client(proxy_server, mode="legacy") as client:
             tools = await client.list_tools()
             echo_tool = next(t for t in tools if t.name == "echo")
             assert echo_tool.meta == {"fastmcp": {"tags": ["echo"]}}
@@ -106,7 +143,7 @@ class TestProxyClient:
         """
         Test that the proxy client correctly forwards an error response.
         """
-        async with Client(proxy_server) as client:
+        async with Client(proxy_server, mode="legacy") as client:
             with pytest.raises(ToolError, match="Elicitation not supported"):
                 await client.call_tool("elicit", {})
 
@@ -121,7 +158,7 @@ class TestProxyClient:
             roots_handler_called = True
             return []
 
-        async with Client(proxy_server, roots=roots_handler) as client:
+        async with Client(proxy_server, mode="legacy", roots=roots_handler) as client:
             await client.call_tool("list_roots", {})
 
         assert roots_handler_called
@@ -130,7 +167,9 @@ class TestProxyClient:
         """
         Test that the proxy client correctly forwards the `list_roots` response.
         """
-        async with Client(proxy_server, roots=["file://x/y/z"]) as client:
+        async with Client(
+            proxy_server, mode="legacy", roots=["file://x/y/z"]
+        ) as client:
             result = await client.call_tool("list_roots", {})
             assert result.data == ["file://x/y/z"]
 
@@ -161,7 +200,9 @@ class TestProxyClient:
             )
             return ""
 
-        async with Client(proxy_server, sampling_handler=sampling_handler) as client:
+        async with Client(
+            proxy_server, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("sampling", {})
 
         assert sampling_handler_called
@@ -171,7 +212,7 @@ class TestProxyClient:
         Test that the proxy client correctly forwards the `sampling` response.
         """
         async with Client(
-            proxy_server, sampling_handler=lambda *args: "I love FastMCP"
+            proxy_server, mode="legacy", sampling_handler=lambda *args: "I love FastMCP"
         ) as client:
             result = await client.call_tool("sampling", {})
             assert result.data == "I love FastMCP"
@@ -199,7 +240,7 @@ class TestProxyClient:
             return ElicitResult(action="accept", content=response_type(name="Alice"))
 
         async with Client(
-            proxy_server, elicitation_handler=elicitation_handler
+            proxy_server, mode="legacy", elicitation_handler=elicitation_handler
         ) as client:
             await client.call_tool("elicit", {})
 
@@ -217,6 +258,7 @@ class TestProxyClient:
 
         async with Client(
             proxy_server,
+            mode="legacy",
             elicitation_handler=elicitation_handler,
         ) as client:
             result = await client.call_tool("elicit", {})
@@ -233,7 +275,7 @@ class TestProxyClient:
             return ElicitResult(action="decline")
 
         async with Client(
-            proxy_server, elicitation_handler=elicitation_handler
+            proxy_server, mode="legacy", elicitation_handler=elicitation_handler
         ) as client:
             result = await client.call_tool("elicit", {})
             assert result.data == "No name provided."
@@ -251,7 +293,9 @@ class TestProxyClient:
             assert message.level == "info"
             assert message.logger == "test"
 
-        async with Client(proxy_server, log_handler=log_handler) as client:
+        async with Client(
+            proxy_server, mode="legacy", log_handler=log_handler
+        ) as client:
             await client.call_tool(
                 "log", {"message": "Hello, world!", "level": "info", "logger": "test"}
             )
@@ -277,7 +321,9 @@ class TestProxyClient:
                 dict(progress=progress, total=total, message=message)
             )
 
-        async with Client(proxy_server, progress_handler=progress_handler) as client:
+        async with Client(
+            proxy_server, mode="legacy", progress_handler=progress_handler
+        ) as client:
             await client.call_tool("report_progress", {})
 
         assert PROGRESS_MESSAGES == EXPECTED_PROGRESS_MESSAGES
@@ -293,8 +339,8 @@ class TestProxyClient:
             results["logger_b"] = message
 
         async with (
-            Client(proxy_server, log_handler=log_handler_a) as client_a,
-            Client(proxy_server, log_handler=log_handler_b) as client_b,
+            Client(proxy_server, mode="legacy", log_handler=log_handler_a) as client_a,
+            Client(proxy_server, mode="legacy", log_handler=log_handler_b) as client_b,
         ):
             async with create_task_group() as tg:
                 tg.start_soon(
@@ -336,8 +382,12 @@ class TestProxyClient:
             results[name] = result.data
 
         async with (
-            Client(proxy_server, elicitation_handler=elicitation_handler_a) as client_a,
-            Client(proxy_server, elicitation_handler=elicitation_handler_b) as client_b,
+            Client(
+                proxy_server, mode="legacy", elicitation_handler=elicitation_handler_a
+            ) as client_a,
+            Client(
+                proxy_server, mode="legacy", elicitation_handler=elicitation_handler_b
+            ) as client_b,
         ):
             async with create_task_group() as tg:
                 tg.start_soon(
@@ -396,7 +446,7 @@ class TestProxyClient:
             return {"content": "Test content", "acknowledge": True}
 
         async with Client(
-            proxy_server, elicitation_handler=elicitation_handler
+            proxy_server, mode="legacy", elicitation_handler=elicitation_handler
         ) as client:
             result = await client.call_tool("elicit_with_defaults", {})
             assert result.data == "Content: Test content, Acknowledge: True"
@@ -406,7 +456,7 @@ class TestProxyClient:
         from fastmcp.server.providers.proxy import FastMCPProxy
 
         # Create a disconnected client (should use fresh sessions per request)
-        base_client = Client(fastmcp_server)
+        base_client = Client(fastmcp_server, mode="legacy")
 
         # Test both create_proxy convenience function and direct client_factory usage
         proxy_via_create_proxy = create_proxy(base_client)
@@ -488,7 +538,9 @@ class TestProxyServerInitiatedForwardingNonTool:
             roots_handler_called = True
             return ["file://from/client"]
 
-        async with Client(roots_proxy_server, roots=roots_handler) as client:
+        async with Client(
+            roots_proxy_server, mode="legacy", roots=roots_handler
+        ) as client:
             result = await client.read_resource("data://roots")
 
         assert roots_handler_called
@@ -504,7 +556,9 @@ class TestProxyServerInitiatedForwardingNonTool:
             roots_handler_called = True
             return ["file://from/client"]
 
-        async with Client(roots_proxy_server, roots=roots_handler) as client:
+        async with Client(
+            roots_proxy_server, mode="legacy", roots=roots_handler
+        ) as client:
             result = await client.read_resource("data://roots/abc")
 
         assert roots_handler_called
@@ -520,7 +574,9 @@ class TestProxyServerInitiatedForwardingNonTool:
             roots_handler_called = True
             return ["file://from/client"]
 
-        async with Client(roots_proxy_server, roots=roots_handler) as client:
+        async with Client(
+            roots_proxy_server, mode="legacy", roots=roots_handler
+        ) as client:
             result = await client.get_prompt("roots_prompt")
 
         assert roots_handler_called

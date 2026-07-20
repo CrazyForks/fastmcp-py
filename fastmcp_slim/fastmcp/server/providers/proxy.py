@@ -1220,7 +1220,10 @@ class ProxyClient(Client[ClientTransportT]):
         # via the handlers installed below) that proxies rely on. To round-trip
         # an upstream guard tool's InputRequiredResult (SEP-2322) instead, opt
         # into the modern era explicitly with `create_proxy(target, mode="auto")`
-        # — the two are mutually exclusive per session.
+        # — the two are mutually exclusive per session. This pin is explicit
+        # rather than inherited, so flipping `Client`'s own default to `"auto"`
+        # never changes proxy behavior.
+        kwargs.setdefault("mode", "legacy")
         # Install context-restoring handler wrappers BEFORE super().__init__
         # registers them with the Client's session kwargs.
         self._proxy_rc_ref = [None]
