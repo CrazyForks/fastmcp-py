@@ -260,13 +260,9 @@ async def test_nested_streamable_http_server_resolves_correctly(nested_server: s
 class TestTimeout:
     async def test_timeout(self, streamable_http_server: ASGIServer):
         # note this transport behaves differently than others and raises
-        # MCPError from the *client* context. Pinned to legacy: on a modern
-        # (server/discover) connection a connect-time timeout surfaces as a raw
-        # httpx.ReadTimeout from the probe rather than a wrapped MCPError.
+        # MCPError from the *client* context
         with pytest.raises(MCPError, match="timed out"):
-            async with streamable_http_server.client(
-                timeout=0.02, mode="legacy"
-            ) as client:
+            async with streamable_http_server.client(timeout=0.02) as client:
                 await client.call_tool("sleep", {"seconds": 0.05})
 
     async def test_timeout_tool_call(self, streamable_http_server: ASGIServer):
