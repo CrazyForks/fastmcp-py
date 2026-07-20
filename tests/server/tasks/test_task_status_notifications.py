@@ -58,7 +58,7 @@ async def notification_server():
 
 async def test_subscription_spawned_for_tool_task(notification_server: FastMCP):
     """Subscription task is spawned when tool task is created."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         # Create task - should spawn subscription
         task = await client.call_tool("quick_task", {"value": 5}, task=True)
 
@@ -72,7 +72,7 @@ async def test_subscription_spawned_for_tool_task(notification_server: FastMCP):
 
 async def test_subscription_handles_task_completion(notification_server: FastMCP):
     """Subscription properly handles task completion and cleanup."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         # Multiple tasks should each get their own subscription
         task1 = await client.call_tool("quick_task", {"value": 1}, task=True)
         task2 = await client.call_tool("quick_task", {"value": 2}, task=True)
@@ -94,7 +94,7 @@ async def test_subscription_handles_task_completion(notification_server: FastMCP
 
 async def test_subscription_handles_task_failure(notification_server: FastMCP):
     """Subscription properly handles task failure."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         task = await client.call_tool("failing_task", {}, task=True)
 
         # Task should fail
@@ -107,7 +107,7 @@ async def test_subscription_handles_task_failure(notification_server: FastMCP):
 
 async def test_subscription_for_prompt_tasks(notification_server: FastMCP):
     """Subscriptions work for prompt tasks."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         task = await client.get_prompt("test_prompt", {"name": "World"}, task=True)
 
         result = await task
@@ -120,7 +120,7 @@ async def test_subscription_for_prompt_tasks(notification_server: FastMCP):
 
 async def test_subscription_for_resource_tasks(notification_server: FastMCP):
     """Subscriptions work for resource tasks."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         task = await client.read_resource("test://resource", task=True)
 
         result = await task
@@ -135,7 +135,8 @@ async def test_subscriptions_cleanup_on_session_disconnect(
 ):
     """Subscriptions are cleaned up when session disconnects."""
     # Start session and create task
-    async with Client(notification_server) as client:
+    # Task submission is a handshake-era capability, so this pins the legacy era.
+    async with Client(notification_server, mode="legacy") as client:
         task = await client.call_tool("slow_task", {}, task=True)
         task_id = task.task_id
         # Disconnect before task completes (session __aexit__ cancels subscriptions)
@@ -148,7 +149,7 @@ async def test_subscriptions_cleanup_on_session_disconnect(
 
 async def test_multiple_concurrent_subscriptions(notification_server: FastMCP):
     """Multiple concurrent tasks each have their own subscription."""
-    async with Client(notification_server) as client:
+    async with Client(notification_server, mode="legacy") as client:
         # Start many tasks concurrently
         tasks = []
         for i in range(10):

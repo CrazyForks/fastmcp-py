@@ -1377,6 +1377,13 @@ class ProxyClient(Client[ClientTransportT]):
         # request, so the whole chain speaks one era end-to-end. An explicit
         # `mode=` (e.g. `create_proxy(target, mode="auto")`) pins the era and
         # overrides mirroring. The eras are mutually exclusive per session.
+        #
+        # The handshake default is pinned explicitly rather than inherited from
+        # `Client`, whose own default is `"auto"`: mirroring only applies when
+        # there is a front request to mirror, so this is the fallback for a
+        # directly-constructed ProxyClient, and it must not drift with the
+        # client default.
+        kwargs.setdefault("mode", "legacy")
         # Install context-restoring handler wrappers BEFORE super().__init__
         # registers them with the Client's session kwargs.
         self._proxy_rc_ref = [None]

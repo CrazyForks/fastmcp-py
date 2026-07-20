@@ -4,6 +4,10 @@ Regression focus: the `sampling create_message` span is created with
 `record_exception=False, set_status_on_exception=False` and records the
 exception manually in its `except` block. A failed sampling call must
 therefore produce exactly ONE exception event, not two.
+
+`ctx.sample` requires the server to send a request down to the client, which
+only the older protocol's back-channel supports, so every client below pins
+`mode="legacy"`.
 """
 
 from __future__ import annotations
@@ -181,7 +185,9 @@ class TestSamplingCreateMessageSpan:
             result = await context.sample(messages=question)
             return result.text or ""
 
-        async with Client(mcp, sampling_handler=sampling_handler) as client:
+        async with Client(
+            mcp, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -220,7 +226,9 @@ class TestSamplingCreateMessageSpan:
             return result.text or ""
 
         with pytest.raises(Exception):
-            async with Client(mcp, sampling_handler=sampling_handler) as client:
+            async with Client(
+                mcp, mode="legacy", sampling_handler=sampling_handler
+            ) as client:
                 await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -339,7 +347,9 @@ class TestAttributesSurviveANonForwardingSampler:
             result = await context.sample(messages=question)
             return result.text or ""
 
-        async with Client(mcp, sampling_handler=sampling_handler) as client:
+        async with Client(
+            mcp, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -465,7 +475,9 @@ class TestAttributeRestoreRespectsSampler:
             result = await context.sample(messages=question)
             return result.text or ""
 
-        async with Client(mcp, sampling_handler=sampling_handler) as client:
+        async with Client(
+            mcp, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -496,7 +508,9 @@ class TestAttributeRestoreRespectsSampler:
             result = await context.sample(messages=question)
             return result.text or ""
 
-        async with Client(mcp, sampling_handler=sampling_handler) as client:
+        async with Client(
+            mcp, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -647,7 +661,9 @@ class TestAttributeRestoreRespectsSampler:
             result = await context.sample(messages=question)
             return result.text or ""
 
-        async with Client(mcp, sampling_handler=sampling_handler) as client:
+        async with Client(
+            mcp, mode="legacy", sampling_handler=sampling_handler
+        ) as client:
             await client.call_tool("ask", {"question": "hi"})
 
         spans = _spans_named(trace_exporter, "sampling create_message")
@@ -758,7 +774,9 @@ class TestRestoreDoesNotChurnAttributeLimitEvictions:
                 result = await context.sample(messages=question)
                 return result.text or ""
 
-            async with Client(mcp, sampling_handler=sampling_handler) as client:
+            async with Client(
+                mcp, mode="legacy", sampling_handler=sampling_handler
+            ) as client:
                 await client.call_tool("ask", {"question": "hi"})
 
             spans = _spans_named(exporter, "sampling create_message")

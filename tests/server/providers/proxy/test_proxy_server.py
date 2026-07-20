@@ -165,7 +165,20 @@ def fastmcp_server():
 
 @pytest.fixture
 async def proxy_server(fastmcp_server):
-    """Fixture that creates a FastMCP proxy server."""
+    """Fixture that creates a FastMCP proxy server.
+
+    Passing an already-constructed `ProxyClient` as the target (rather than a
+    raw `FastMCP`/URL/etc.) means `create_proxy` reuses that client as-is
+    instead of building one through the era-mirroring factory — so this
+    backend stays pinned to `ProxyClient`'s own default of `mode="legacy"`
+    regardless of what era the front client negotiates. A test that actually
+    forwards a tool *call* through this fixture (not just a listing) needs
+    its own front `Client` pinned to `mode="legacy"` too: otherwise a modern
+    front's request `_meta` carries the reserved modern-envelope keys, which
+    `ProxyTool.run`'s legacy-backend path forwards verbatim onto this
+    legacy-locked backend session, and the backend server rejects it as a
+    protocol violation.
+    """
     return create_proxy(ProxyClient(transport=FastMCPTransport(fastmcp_server)))
 
 
@@ -196,13 +209,18 @@ async def test_create_proxy_with_transport(fastmcp_server):
 
 
 async def test_proxy_forwards_upstream_instructions():
-    """A proxy should surface the upstream server's instructions in the handshake."""
+    """A proxy should surface the upstream server's instructions in the handshake.
+
+    `FastMCPProxy` registers a `server/discover` handler that forwards the
+    upstream's instructions, mirroring what `ProxyInitializeMiddleware.on_initialize`
+    already does for the legacy handshake, so `client.session.instructions`
+    (era-neutral) resolves the same way on both protocol eras.
+    """
     upstream = FastMCP(name="upstream", instructions="USE_THIS_MARKER_123")
     proxy = create_proxy(upstream, name="proxy")
 
     async with Client(proxy) as client:
-        assert client.initialize_result is not None
-        assert client.initialize_result.instructions == "USE_THIS_MARKER_123"
+        assert client.session.instructions == "USE_THIS_MARKER_123"
 
 
 async def test_proxy_own_instructions_take_precedence():
@@ -211,8 +229,7 @@ async def test_proxy_own_instructions_take_precedence():
     proxy = create_proxy(upstream, name="proxy", instructions="proxy instructions")
 
     async with Client(proxy) as client:
-        assert client.initialize_result is not None
-        assert client.initialize_result.instructions == "proxy instructions"
+        assert client.session.instructions == "proxy instructions"
 
 
 async def test_proxy_instructions_none_when_upstream_has_none():
@@ -221,8 +238,7 @@ async def test_proxy_instructions_none_when_upstream_has_none():
     proxy = create_proxy(upstream, name="proxy")
 
     async with Client(proxy) as client:
-        assert client.initialize_result is not None
-        assert client.initialize_result.instructions is None
+        assert client.session.instructions is None
 
 
 def test_create_proxy_with_url():
@@ -254,7 +270,7 @@ async def test_proxy_with_async_client_factory():
 async def test_proxy_ping_forwards_to_remote_server(fastmcp_server):
     proxy = create_proxy(fastmcp_server)
 
-    async with Client(proxy) as client:
+    async with Client(proxy, mode="legacy") as client:
         assert await client.ping() is True
 
 
@@ -263,10 +279,19 @@ async def test_proxy_ping_surfaces_wrong_remote_path():
     async with run_server_async(remote, transport="http") as url:
         proxy = create_proxy(StreamableHttpTransport(url.removesuffix("/mcp")))
 
+        # This asserts the error surfaces from merely *connecting* to the proxy,
+        # with no operation performed. That only happens on the legacy handshake:
+        # `ProxyInitializeMiddleware.on_initialize` eagerly probes the backend
+        # during the front's own `initialize` call. A modern front negotiates
+        # `server/discover` instead, which never runs that middleware hook, so
+        # connecting succeeds regardless of backend health and the failure would
+        # only surface on first real use. Pinned because the subject here is
+        # that eager, handshake-time probe.
+        #
         # SDK v2 surfaces a wrong remote path as an HTTP "Not Found" rather than
         # the v1 "Session terminated" message.
         with pytest.raises(MCPError, match="Not Found"):
-            async with Client(proxy):
+            async with Client(proxy, mode="legacy"):
                 pass
 
 
@@ -277,8 +302,11 @@ async def test_proxy_initialize_forwards_remote_connection_error():
         provider_error_strategy="raise",
     )
 
+    # Same reasoning as test_proxy_ping_surfaces_wrong_remote_path above: the
+    # error surfaces from connecting alone only via the legacy handshake's
+    # eager backend probe in `ProxyInitializeMiddleware.on_initialize`.
     with pytest.raises(MCPError, match="Client failed to connect"):
-        async with Client(proxy):
+        async with Client(proxy, mode="legacy"):
             pass
 
 
@@ -301,6 +329,14 @@ async def test_proxy_list_tools_surfaces_remote_connection_error():
 
 
 async def test_proxy_list_tools_client_surfaces_remote_connection_error():
+    """With a modern front, connecting succeeds (no eager backend probe — see
+    test_proxy_ping_surfaces_wrong_remote_path) and the failure only surfaces
+    once `list_tools()` actually hits the dead backend. `ProxyProvider._list_tools`
+    now normalizes the raw `httpx2.ConnectError` from the failed backend connect
+    into the `MCPError("Client failed to connect...")` this test expects, the
+    same way `ProxyInitializeMiddleware.on_initialize` and `ProxyTool.run`
+    already did.
+    """
     port = find_available_port()
     proxy = create_proxy(
         StreamableHttpTransport(f"http://127.0.0.1:{port}/mcp"),
@@ -384,22 +420,26 @@ class TestTools:
     async def test_call_tool_result_same_as_original(
         self, fastmcp_server: FastMCP, proxy_server: FastMCPProxy
     ):
+        # proxy_server's backend is pinned to legacy (see its fixture docstring);
+        # match the front so a real tool call doesn't cross eras.
         async with Client(fastmcp_server) as original_client:
             result = await original_client.call_tool("greet", {"name": "Alice"})
-        async with Client(proxy_server) as proxy_client:
+        async with Client(proxy_server, mode="legacy") as proxy_client:
             proxy_result = await proxy_client.call_tool("greet", {"name": "Alice"})
 
         assert result.content == proxy_result.content
         assert result.data == proxy_result.data
 
     async def test_call_tool_calls_tool(self, proxy_server):
-        async with Client(proxy_server) as client:
+        # See proxy_server fixture docstring: its backend is pinned to legacy.
+        async with Client(proxy_server, mode="legacy") as client:
             proxy_result = await client.call_tool("add", {"a": 1, "b": 2})
         assert proxy_result.data == 3
 
     async def test_error_tool_raises_error(self, proxy_server):
+        # See proxy_server fixture docstring: its backend is pinned to legacy.
         with pytest.raises(ToolError, match="This is a test error"):
-            async with Client(proxy_server) as client:
+            async with Client(proxy_server, mode="legacy") as client:
                 await client.call_tool("error_tool", {})
 
     async def test_error_tool_with_image_content(self, proxy_server):
@@ -465,7 +505,8 @@ class TestTools:
                 meta={"custom_key": "custom_value", "processed": True},
             )
 
-        async with Client(proxy_server) as client:
+        # See proxy_server fixture docstring: its backend is pinned to legacy.
+        async with Client(proxy_server, mode="legacy") as client:
             result = await client.call_tool("tool_with_meta", {"value": "test"})
 
         assert isinstance(result.content[0], TextContent)
@@ -1197,7 +1238,15 @@ class TestProxyOutputSchemaEnforcement:
 
     async def _call_without_validating(self, server: FastMCP, tool: str):
         """Call through a client that does not enforce the schema itself."""
-        client = Client(server)
+        # This proxy's backend is built via `ProxyProvider(lambda: ProxyClient(...))`
+        # directly rather than through `create_proxy`'s era-mirroring factory, so it
+        # stays pinned to `ProxyClient`'s own default of `mode="legacy"` regardless
+        # of the front era (see the `proxy_server` fixture docstring above for the
+        # full explanation). Pin the end client to match: a modern front's request
+        # `_meta` carries reserved modern-envelope keys that `ProxyTool.run`'s
+        # legacy-backend path forwards verbatim, and this legacy-locked backend
+        # session rejects them as a protocol violation.
+        client = Client(server, mode="legacy")
         client._transport_options = TransportOptions(
             session_class=_ForwardingClientSession
         )
@@ -1239,7 +1288,9 @@ class TestProxyOutputSchemaEnforcement:
             ProxyProvider(lambda: ProxyClient(backend_violating_its_schema))
         )
 
-        async with Client(proxy) as client:
+        # `ProxyClient(backend_violating_its_schema)` above is pinned to legacy
+        # (see `_call_without_validating`'s comment); match the front here too.
+        async with Client(proxy, mode="legacy") as client:
             with pytest.raises(RuntimeError, match="Invalid structured content"):
                 await client.call_tool_mcp("undeclared_status", {})
 
@@ -1284,7 +1335,9 @@ class TestProxyOutputSchemaEnforcement:
         proxy = FastMCP("Proxy")
         proxy.add_provider(ProxyProvider(lambda: ProxyClient(backend)))
 
-        async with Client(proxy) as client:
+        # `ProxyClient(backend)` above is pinned to legacy (see
+        # `_call_without_validating`'s comment); match the front here too.
+        async with Client(proxy, mode="legacy") as client:
             await client.call_tool("echo", {"n": 1})
             lists_after_first = counts["list"]
 
@@ -1358,8 +1411,19 @@ class TestProxyForwardingAppliesToEveryBackendClient:
 
         return mcp
 
-    async def _forwarded(self, server: FastMCP, tool: str = "status"):
-        client = Client(server)
+    async def _forwarded(
+        self, server: FastMCP, tool: str = "status", mode: str = "auto"
+    ):
+        # `mode` follows the proxy backend's era: a plain Client or single-server
+        # config connects the backend directly, so it mirrors the front's auto
+        # era. A multi-server config instead mounts a router with a
+        # StatefulProxyClient per configured server leg — an already-constructed
+        # ProxyClient subclass, same as the `proxy_server` fixture above, pinned
+        # to `mode="legacy"` regardless of the front. Callers with that backend
+        # shape must pin the end client to legacy too, for the reason explained
+        # there (a modern front's request `_meta` gets forwarded verbatim onto a
+        # legacy-locked backend session and rejected as a protocol violation).
+        client = Client(server, mode=mode)
         client._transport_options = TransportOptions(
             session_class=_ForwardingClientSession
         )
@@ -1390,7 +1454,9 @@ class TestProxyForwardingAppliesToEveryBackendClient:
             config = MCPConfig.from_dict(
                 {"mcpServers": {"a": {"url": url}, "b": {"url": url}}}
             )
-            result = await self._forwarded(create_proxy(Client(config)), "a_status")
+            result = await self._forwarded(
+                create_proxy(Client(config)), "a_status", mode="legacy"
+            )
 
         assert result.is_error is False
         assert result.structured_content == {"status": "weird"}

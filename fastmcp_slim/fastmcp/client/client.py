@@ -8,7 +8,7 @@ import secrets
 import ssl
 import uuid
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,15 +31,21 @@ from mcp.client.caching import (
     ClientResponseCache,
     InMemoryResponseCacheStore,
 )
-from mcp.client.extension import NotificationBinding
+from mcp.client.extension import (
+    ClaimContext,
+    ClientExtension,
+    NotificationBinding,
+    ResultClaim,
+)
 from mcp.client.session import ClientRequestContext, MessageHandlerFnT
 from mcp_types import (
     GetTaskResult,
     TaskStatusNotification,
     TaskStatusNotificationParams,
 )
+from mcp_types.methods import validate_server_result
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
-from pydantic import AnyUrl
+from pydantic import AnyUrl, ValidationError
 
 import fastmcp as fastmcp
 from fastmcp.client.auth.oauth import OAuth
@@ -121,11 +127,11 @@ CacheableT = TypeVar("CacheableT", bound=mcp_types.CacheableResult)
 ConnectMode = Literal["legacy", "auto"] | str
 """How the client negotiates the protocol era at connect time.
 
-- ``"legacy"`` (the current default): the classic initialize handshake, byte-identical
-  to pre-v4 behavior for handshake-era servers.
-- ``"auto"``: probe ``server/discover`` at the newest modern version and adopt it, falling
-  back to the initialize handshake for any server that is not positive evidence of a modern
-  peer (a denylist fallback — see the SDK's ``negotiate_auto``).
+- ``"auto"`` (the default): probe ``server/discover`` at the newest modern version and
+  adopt it, falling back to the initialize handshake for any server that is not positive
+  evidence of a modern peer (a denylist fallback — see the SDK's ``negotiate_auto``).
+- ``"legacy"``: the classic initialize handshake, byte-identical to pre-v4 behavior for
+  handshake-era servers. Opt into this to force the old handshake.
 - a modern protocol-version string (e.g. ``"2026-07-28"``): adopt that version directly
   without probing, synthesizing a minimal ``DiscoverResult`` when none is supplied.
 
@@ -147,6 +153,154 @@ def _synthesize_discover(protocol_version: str) -> mcp_types.DiscoverResult:
         ttl_ms=0,
         cache_scope="public",
     )
+
+
+@asynccontextmanager
+async def _conformant_discover_only(
+    session: ClientSession,
+) -> AsyncIterator[None]:
+    """Hold ``session.send_discover`` to the same wire schema every later reply must meet.
+
+    ``negotiate_auto`` accepts a probe that parses as the version-free
+    ``DiscoverResult``, whose ``resultType``/``ttlMs``/``cacheScope`` all carry
+    SDK-side defaults. Every request *after* adoption is instead checked against
+    the strict per-version surface (``validate_server_result``), where those same
+    three fields are required. A server that answers ``server/discover`` without
+    them therefore passes the probe and then fails every subsequent call — the
+    connection is adopted into an era the peer cannot actually serve.
+
+    Closing that gap means judging the probe by the rule that will govern the rest
+    of the connection. A result that would be rejected later is not positive
+    evidence of a modern peer, so it is reported as an ordinary probe failure and
+    ``negotiate_auto`` falls back to the initialize handshake, exactly as it does
+    for a server with no ``server/discover`` at all.
+    """
+    send_discover = session.send_discover
+
+    async def _checked_send_discover(version: str) -> dict[str, Any]:
+        raw = await send_discover(version)
+        try:
+            validate_server_result("server/discover", version, raw)
+        except ValidationError as e:
+            # Ordered before the ValueError arm below: pydantic's ValidationError
+            # subclasses ValueError, so a broader clause first would swallow it.
+            logger.debug(
+                "server/discover at %s is not %s-conformant (%s); "
+                "falling back to the initialize handshake",
+                version,
+                version,
+                e,
+            )
+            raise MCPError(
+                code=mcp_types.INVALID_PARAMS,
+                message=(
+                    f"server/discover result is not conformant with {version}; "
+                    "treating the server as handshake-era"
+                ),
+            ) from e
+        except (KeyError, ValueError):
+            # No schema on file for this method/version pair, so there is nothing to
+            # judge the probe against; leave the verdict to negotiate_auto's parse.
+            return raw
+        return raw
+
+    # A transport may itself have installed a `send_discover` override, so restore
+    # whatever was there rather than assuming the class attribute.
+    had_own = "send_discover" in vars(session)
+    session.send_discover = _checked_send_discover  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        if had_own:
+            session.send_discover = send_discover  # ty: ignore[invalid-assignment]
+        else:
+            del session.send_discover
+
+
+@dataclass
+class _FoldedExtensions:
+    """`Client(extensions=...)` folded into the shapes `ClientSession` consumes.
+
+    `ad` maps each extension identifier to its advertised settings (the SEP-2133
+    capability ad), `claims` maps each identifier to its `ResultClaim`s, `bindings`
+    is the flat list of `NotificationBinding`s the extensions observe, and `by_model`
+    indexes every claim by its result model so a claimed `tools/call` result can be
+    routed back to the owning resolver.
+    """
+
+    ad: dict[str, dict[str, Any]]
+    claims: dict[str, tuple[ResultClaim[Any], ...]]
+    bindings: list[NotificationBinding[Any]]
+    by_model: dict[type[mcp_types.Result], ResultClaim[Any]]
+
+
+def _fold_extensions(
+    extensions: Sequence[ClientExtension] | None,
+) -> _FoldedExtensions:
+    """Decompose `ClientExtension` instances into `ClientSession` kwargs.
+
+    Mirrors the SDK Client's own folding, using only the public `ClientExtension`
+    surface (`settings()`, `claims()`, `notifications()`). Duplicate identifiers,
+    result-type tags, or notification methods across extensions raise here rather
+    than at session construction, naming both owners. `by_model` is the model→claim
+    index the resolution path uses to finish a claimed result.
+    """
+    folded = _FoldedExtensions(ad={}, claims={}, bindings=[], by_model={})
+    if not extensions:
+        return folded
+    if isinstance(extensions, Mapping):
+        raise TypeError(
+            "extensions= takes a sequence of ClientExtension instances; use "
+            "mcp.client.advertise(identifier, settings) for an advertise-only entry"
+        )
+    claim_owners: dict[str, str] = {}
+    binding_owners: dict[str, str] = {}
+    for extension in extensions:
+        identifier = getattr(extension, "identifier", None)
+        if identifier is None:
+            raise ValueError(
+                f"{type(extension).__name__} has no `identifier`; a ClientExtension "
+                "must set the `identifier` class attribute (or assign one in "
+                "`__init__`) before it can be used"
+            )
+        if identifier in folded.ad:
+            raise ValueError(
+                f"extension identifier {identifier!r} is passed more than once"
+            )
+        folded.ad[identifier] = extension.settings()
+        extension_claims = tuple(extension.claims())
+        for claim in extension_claims:
+            tag = claim.result_type
+            if tag in claim_owners:
+                owner = claim_owners[tag]
+                both = (
+                    f"extension {identifier!r} claims"
+                    if owner == identifier
+                    else f"extensions {owner!r} and {identifier!r} both claim"
+                )
+                raise ValueError(
+                    f"{both} resultType {tag!r}; a wire tag can have only one resolver"
+                )
+            claim_owners[tag] = identifier
+            # Each model pins its result_type Literal to one tag, so this cannot collide.
+            folded.by_model[claim.model] = claim
+        if extension_claims:
+            folded.claims[identifier] = extension_claims
+        for binding in extension.notifications():
+            if binding.method in binding_owners:
+                owner = binding_owners[binding.method]
+                both = (
+                    f"extension {identifier!r} binds"
+                    if owner == identifier
+                    else f"extensions {owner!r} and {identifier!r} both bind"
+                )
+                raise ValueError(
+                    f"{both} notification method {binding.method!r}; a method can "
+                    "have only one observer"
+                )
+            binding_owners[binding.method] = identifier
+            folded.bindings.append(binding)
+    return folded
 
 
 def _evicting_message_handler(
@@ -259,12 +413,13 @@ class Client(
         timeout: Optional timeout for requests (seconds or timedelta)
         init_timeout: Optional timeout for initial connection (seconds or timedelta).
             Set to 0 to disable. If None, uses the value in the FastMCP global settings.
-        mode: Protocol-era negotiation at connect time. `"legacy"` (the default) runs
-            the initialize handshake, byte-identical to pre-v4 behavior. `"auto"` probes
+        mode: Protocol-era negotiation at connect time. `"auto"` (the default) probes
             `server/discover` and negotiates the modern era, denylist-falling-back to the
-            handshake for legacy servers. A modern version string (e.g. `"2026-07-28"`)
-            adopts that version directly. `mode="auto"` as a future default is a
-            release-time decision; the conservative `"legacy"` is the default for now.
+            initialize handshake for any server that is not positive evidence of a modern
+            peer — safe against a mixed fleet of legacy and modern servers. `"legacy"`
+            forces the initialize handshake, byte-identical to pre-v4 behavior; opt into it
+            to pin the old handshake. A modern version string (e.g. `"2026-07-28"`) adopts
+            that version directly without a probe.
         prior_discover: A previously obtained `DiscoverResult` to adopt when `mode` is a
             version pin, reused instead of synthesizing a minimal one. Ignored otherwise.
         input_required_max_rounds: Cap on `InputRequiredResult` (SEP-2322) retry rounds
@@ -276,6 +431,19 @@ class Client(
             modern-only, so a cache is inert on legacy connections. A custom `CacheConfig`
             store requires `target_id`, since FastMCP transports expose no server URL to
             derive a shared-store identity from.
+        extensions: Opt-in client extensions (SEP-2133), a sequence of
+            `mcp.client.extension.ClientExtension` instances. Each contributes its
+            capability advertisement, its result claims, and its notification bindings,
+            all of which are threaded into the underlying session. User-supplied
+            notification bindings compose with FastMCP's internal task-status binding
+            rather than replacing it. A claimed `call_tool` result is resolved
+            transparently through the owning extension's resolver. For an advertise-only
+            entry, use `mcp.client.advertise(identifier, settings)`.
+        result_claims: Additional `ResultClaim`s (SEP-2133) keyed by the identifier of
+            an extension already advertised through `extensions`, merged with that
+            extension's own claims. Rarely needed directly; prefer declaring claims on
+            the extension itself. Claimed shapes are modern-only and inert on a legacy
+            connection.
 
     Examples:
         ```python
@@ -365,10 +533,12 @@ class Client(
         client_info: mcp_types.Implementation | None = None,
         auth: httpx2.Auth | Literal["oauth"] | str | None = None,
         verify: ssl.SSLContext | bool | str | None = None,
-        mode: ConnectMode = "legacy",
+        mode: ConnectMode = "auto",
         prior_discover: mcp_types.DiscoverResult | None = None,
         input_required_max_rounds: int = DEFAULT_INPUT_REQUIRED_MAX_ROUNDS,
         cache: CacheConfig | bool | None = None,
+        extensions: Sequence[ClientExtension] | None = None,
+        result_claims: Mapping[str, Sequence[ResultClaim[Any]]] | None = None,
     ) -> None:
         self.name = name or self.generate_name()
 
@@ -453,6 +623,14 @@ class Client(
                 self._response_cache, effective_message_handler
             )
 
+        # Opt-in client extensions (SEP-2133) and their result claims. Retained so
+        # `new()` can rebuild an independent set of session kwargs per clone.
+        self._extensions_arg = extensions
+        self._result_claims_arg = result_claims
+        # Model→claim index the resolution path uses; (re)built by
+        # `_build_extension_kwargs`.
+        self._claim_by_model: dict[type[mcp_types.Result], ResultClaim[Any]] = {}
+
         self._session_kwargs: SessionKwargs = {
             "sampling_callback": None,
             "list_roots_callback": None,
@@ -460,10 +638,7 @@ class Client(
             "message_handler": effective_message_handler,
             "read_timeout_seconds": read_timeout_seconds,
             "client_info": client_info,
-            # SDK v2 does not carry `notifications/tasks/status` in any protocol
-            # version's core notification tables, so it is never tee'd to the
-            # message_handler; a binding routes it to Task objects instead.
-            "notification_bindings": [self._task_status_binding()],
+            **self._build_extension_kwargs(),
         }
 
         if roots is not None:
@@ -687,10 +862,10 @@ class Client(
             )
         else:
             new_client._session_kwargs["message_handler"] = base_handler
-        # Rebind the task-status notification binding so it routes to the clone.
-        new_client._session_kwargs["notification_bindings"] = [
-            new_client._task_status_binding()
-        ]
+        # Rebuild the extension-contributed kwargs (capability ad, result claims,
+        # notification bindings) so the clone's task-status binding routes to the
+        # clone while user extensions still compose with it.
+        new_client._session_kwargs.update(new_client._build_extension_kwargs())
 
         new_client.name += f":{secrets.token_hex(2)}"
 
@@ -745,14 +920,22 @@ class Client(
         else:
             timeout = normalize_timeout_to_seconds(timeout)
 
+        # A legacy-only transport (SSE, a multi-server proxy config) cannot serve
+        # the modern era; treat "auto" as "legacy" there rather than probing
+        # server/discover, which some such servers answer but then cannot serve.
+        effective_mode = self.mode
+        if effective_mode == "auto" and self.transport.legacy_only:
+            effective_mode = "legacy"
+
         try:
             with anyio.fail_after(timeout):
-                if self.mode == "legacy":
+                if effective_mode == "legacy":
                     self._session_state.initialize_result = (
                         await self.session.initialize()
                     )
-                elif self.mode == "auto":
-                    await negotiate_auto(self.session)
+                elif effective_mode == "auto":
+                    async with _conformant_discover_only(self.session):
+                        await negotiate_auto(self.session)
                     # auto may have fallen back to the legacy handshake; surface its
                     # InitializeResult through the existing public property when so.
                     self._session_state.initialize_result = (
@@ -782,7 +965,7 @@ class Client(
         With `mode="auto"` or a pinned modern version, connect-time negotiation may adopt
         the modern `server/discover` era, which has no `InitializeResult`; in that case
         this method raises. Read `protocol_version` / `server_capabilities` instead, or use
-        `mode="legacy"` (the default) when you need the handshake result.
+        `mode="legacy"` when you need the handshake result.
 
         Args:
             timeout: Optional timeout for the initialization request (seconds or timedelta).
@@ -1169,6 +1352,73 @@ class Client(
                 # Convert notification params to GetTaskResult (they share the same fields via Task)
                 status = GetTaskResult.model_validate(params.model_dump())
                 task._handle_status_notification(status)
+
+    def _build_extension_kwargs(self) -> SessionKwargs:
+        """Session kwargs contributed by `extensions=` / `result_claims=`.
+
+        Folds the user's `ClientExtension` instances into the capability ad, result
+        claims, and notification bindings the SDK `ClientSession` consumes, then
+        merges in any explicitly-passed `result_claims`. The internal task-status
+        binding is always prepended to the folded bindings so user extensions
+        *compose* with it rather than clobbering it; a user extension that binds the
+        same `notifications/tasks/status` method surfaces a duplicate-method error
+        from the SDK rather than silently replacing FastMCP's routing.
+
+        Also rebuilds `self._claim_by_model`, the model→claim index the resolution
+        path uses to finish a claimed `tools/call` result, covering both the folded
+        extension claims and the explicit `result_claims` extras.
+        """
+        folded = _fold_extensions(self._extensions_arg)
+
+        claims: dict[str, tuple[ResultClaim[Any], ...]] = dict(folded.claims)
+        by_model: dict[type[mcp_types.Result], ResultClaim[Any]] = dict(folded.by_model)
+        for identifier, extra in (self._result_claims_arg or {}).items():
+            existing = claims.get(identifier, ())
+            claims[identifier] = (*existing, *extra)
+            for claim in extra:
+                by_model[claim.model] = claim
+        self._claim_by_model = by_model
+
+        kwargs: SessionKwargs = {
+            # The internal task binding must lead so user bindings extend it.
+            "notification_bindings": [
+                self._task_status_binding(),
+                *folded.bindings,
+            ],
+        }
+        if folded.ad:
+            kwargs["extensions"] = folded.ad
+        if claims:
+            kwargs["result_claims"] = claims
+        return kwargs
+
+    async def _resolve_claimed_result(
+        self,
+        name: str,
+        result: mcp_types.Result,
+        read_timeout_seconds: float | None,
+    ) -> mcp_types.CallToolResult:
+        """Finish a claimed `tools/call` result through its owning extension.
+
+        A modern server may answer `tools/call` with a claimed extension shape
+        (SEP-2133). The session parses it into the claim's model; this hands that
+        model to the owning claim's resolver — which may send follow-up requests
+        through the session — and returns the ordinary `CallToolResult` it
+        produces. Mirrors the SDK Client's resolution path, including the
+        output-schema revalidation the direct path performs.
+        """
+        claim = self._claim_by_model[type(result)]
+        final = await claim.resolve(
+            result,
+            ClaimContext(
+                session=self.session,
+                tool_name=name,
+                read_timeout_seconds=read_timeout_seconds,
+            ),
+        )
+        if not final.is_error:
+            await self.session.validate_tool_result(name, final)
+        return final
 
     def _task_status_binding(self) -> NotificationBinding[TaskStatusNotificationParams]:
         """Build a binding routing `notifications/tasks/status` to Task objects.

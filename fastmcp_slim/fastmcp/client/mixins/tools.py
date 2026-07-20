@@ -195,10 +195,20 @@ class ClientToolsMixin:
             read_timeout_seconds = normalize_timeout_to_seconds(timeout)
             progress_callback = progress_handler or self._progress_handler
 
+            # Only opt into claimed results (SEP-2133) when this client registered
+            # an extension that claims one; otherwise keep the SDK's default, which
+            # surfaces an unexpected claimed result as an error rather than parsing
+            # a shape we have no resolver for.
+            has_claims = bool(self._claim_by_model)
+
             async def _retry(
                 input_responses: mcp_types.InputResponses | None,
                 request_state: str | None,
-            ) -> mcp_types.CallToolResult | mcp_types.InputRequiredResult:
+            ) -> (
+                mcp_types.CallToolResult
+                | mcp_types.InputRequiredResult
+                | mcp_types.Result
+            ):
                 return await self.session.call_tool(
                     name=name,
                     arguments=arguments,
@@ -208,12 +218,26 @@ class ClientToolsMixin:
                     input_responses=input_responses,
                     request_state=request_state,
                     allow_input_required=True,
+                    allow_claimed=has_claims,
                 )
 
             first = await self._await_with_session_monitoring(_retry(None, None))
-            result = await self._await_with_session_monitoring(
+            driven = await self._await_with_session_monitoring(
                 self._drive_input_required(first, _retry)
             )
+            if isinstance(driven, mcp_types.CallToolResult):
+                result = driven
+            else:
+                # A claimed extension result (SEP-2133): resolve it through the
+                # owning extension's resolver into an ordinary CallToolResult.
+                # Resolution issues further session requests of its own (result
+                # validation lists tools; a resolver may make more), so it needs
+                # the same session monitoring as the calls above — otherwise a
+                # transport-level failure can kill the session runner while this
+                # await waits forever.
+                result = await self._await_with_session_monitoring(
+                    self._resolve_claimed_result(name, driven, read_timeout_seconds)
+                )
 
             # Reflect tool-level errors on the span so callers see ERROR
             # status even though the MCP protocol call itself succeeded.

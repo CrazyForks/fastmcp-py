@@ -37,9 +37,6 @@ client = Client("my_mcp_server.py")
 
 async def main():
     async with client:
-        # Basic server interaction
-        await client.ping()
-
         # List available operations
         tools = await client.list_tools()
         resources = await client.list_resources()
@@ -171,20 +168,30 @@ async with client:
 
 MCP has two protocol eras: the original *legacy* era, which begins every connection with an `initialize` handshake, and the *modern* era (protocol version `2026-07-28` and later), which a client discovers by probing the server's `server/discover` endpoint. The `mode` parameter controls which era the client negotiates when it connects.
 
-By default, `mode="legacy"`. This runs the initialize handshake and behaves identically to earlier FastMCP versions, so existing code connecting to any server keeps working unchanged.
+By default, `mode="auto"`. The client probes `server/discover` and adopts the modern protocol when the server responds; for any server that is not positive evidence of modern support, it falls back to the legacy handshake. This makes the default safe against a mixed fleet of legacy and modern servers.
 
 ```python
 from fastmcp import Client
 
-# Legacy handshake (the default)
+# Negotiate the newest era the server supports (the default)
+client = Client("https://example.com/mcp", mode="auto")
+```
+
+Set `mode="legacy"` to force the initialize handshake. This behaves identically to earlier FastMCP versions and is the opt-out if a server misbehaves under discovery or you need the legacy `initialize` result object.
+
+```python
 client = Client("https://example.com/mcp", mode="legacy")
 ```
 
-Set `mode="auto"` to negotiate the newest era the server supports. The client probes `server/discover` and adopts the modern protocol when the server responds; for any server that is not positive evidence of modern support, it falls back to the legacy handshake. This makes `"auto"` safe to use against a mixed fleet of legacy and modern servers.
+Legacy mode is also what you need for the capabilities that depend on a live session between client and server. The handshake opens a persistent back-channel the server can push requests down, and the modern era removed it. Pin `mode="legacy"` when your code relies on any of these:
 
-```python
-client = Client("https://example.com/mcp", mode="auto")
-```
+- **[Sampling](/clients/sampling)** — server-initiated LLM completion requests
+- **[Roots](/clients/roots)** — server-initiated requests for the client's roots
+- **[Elicitation](/clients/elicitation)** — server-initiated requests for user input, which modern connections replace with [input-required rounds](/clients/elicitation#input-required-rounds)
+- **[Background tasks](/clients/tasks)** — submitting an operation with `task=True`
+- `client.ping()` and `transport.get_session_id()`
+
+A FastMCP server serves both eras, so a default client negotiates the modern one and these raise an era-specific error. Pinning the handshake restores them.
 
 You can also pin a specific modern protocol version to adopt it directly, without a discovery probe:
 
@@ -201,7 +208,9 @@ async with Client("https://example.com/mcp", mode="auto") as client:
 ```
 
 <Note>
-`mode="auto"` is not the default yet — the conservative `"legacy"` remains the default to preserve byte-identical behavior against pre-2026 servers. Whether `"auto"` becomes the default is a future release decision.
+`mode="auto"` is the default as of FastMCP 4.0. Earlier versions defaulted to `"legacy"`. If a server behaves unexpectedly under discovery, or you depend on the legacy `initialize` result, pin the old behavior with `Client(..., mode="legacy")`.
+
+The SSE transport is legacy-only — it cannot carry the sessionless modern era — so a client connecting over SSE always negotiates the legacy handshake, even under `mode="auto"`. A multi-server config (`MCPConfigTransport` with more than one server) is likewise legacy-only, because it mounts each backend behind a legacy-era proxy; a single-server config mirrors its one backend transport's era.
 </Note>
 
 ## Response caching
@@ -260,6 +269,31 @@ client = Client("https://example.com/mcp", mode="auto", cache=config)
 
 The adapter serializes each result through a type-tagged envelope validated against an allowlist of cacheable result models, so a value naming an unknown type is treated as a cache miss rather than deserialized blindly. Each store instance owns its own collection namespace; `clear()` affects only that namespace, never another tenant's entries.
 
+## Client extensions
+
+<VersionBadge version="4.0.0" />
+
+Client extensions (SEP-2133) are the advanced mechanism a client uses to opt into vendor capabilities that live outside the core protocol. An extension is a `ClientExtension` instance that bundles three things: a capability *advertisement* the server can read, one or more *result claims* that let the client parse extra `tools/call` result shapes, and *notification bindings* that observe server notifications the core protocol doesn't define. Pass a sequence of them to `extensions=`.
+
+```python
+from fastmcp import Client
+from myproject.extensions import AppsExtension
+
+client = Client("https://example.com/mcp", extensions=[AppsExtension()])
+```
+
+Each extension's contributions are threaded into the underlying session. Notification bindings compose with FastMCP's own internal task-status binding rather than replacing it, so an extension that observes a custom notification and FastMCP's task tracking both work on the same connection. When a tool returns a shape an extension claims, `client.call_tool()` resolves it transparently through the owning claim's resolver and hands you back an ordinary result. Result claims and their advertisements are honored only on modern-era connections, so they are inert on a legacy handshake.
+
+For the rare case where you need to register additional result claims against an extension that is already advertised, pass them through `result_claims=`, keyed by the extension's identifier. Prefer declaring claims on the extension itself; this parameter merges extra claims with an extension's own.
+
+```python
+client = Client(
+    "https://example.com/mcp",
+    extensions=[AppsExtension()],
+    result_claims={"example.com/apps": [extra_claim]},
+)
+```
+
 ## Operations
 
 FastMCP clients interact with three types of server components.
@@ -301,6 +335,8 @@ See [Prompts](/clients/prompts) for detailed documentation including argument se
 
 The client supports callback handlers for advanced server interactions. These let you respond to server-initiated requests and receive notifications.
 
+Sampling, elicitation, and roots are all server-initiated, so they belong to the handshake era described under [protocol negotiation](#protocol-negotiation). A default client negotiates the newest era both peers share, where the server has no back-channel to push those requests down, so an example that exercises them pins `mode="legacy"`. Logging and progress arrive as notifications on the response stream and work in either era.
+
 ```python
 from fastmcp import Client
 from fastmcp.client.logging import LogMessage
@@ -317,6 +353,7 @@ async def sampling_handler(messages, params, context):
 
 client = Client(
     "my_mcp_server.py",
+    mode="legacy",
     log_handler=log_handler,
     progress_handler=progress_handler,
     sampling_handler=sampling_handler,

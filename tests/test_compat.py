@@ -231,7 +231,8 @@ class TestClientBehaviorCompat:
         assert result.data == "hi"
 
     async def test_ping_returns_bool(self, server):
-        client = Client(transport=FastMCPTransport(server))
+        # `ping` only exists on the older protocol, so this pins that era.
+        client = Client(transport=FastMCPTransport(server), mode="legacy")
         async with client:
             result = await client.ping()
         assert result is True

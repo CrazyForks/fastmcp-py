@@ -1,7 +1,7 @@
 """Tests for distributed notification queue (SEP-1686).
 
 Integration tests verify that the notification queue works end-to-end
-using Client(mcp) with the real memory:// Docket backend.
+using Client(mcp, mode="legacy") with the real memory:// Docket backend.
 No mocking of Redis, sessions, or Docket internals.
 """
 
@@ -54,6 +54,7 @@ class TestNotificationIntegration:
 
         async with Client(
             mcp,
+            mode="legacy",
             elicitation_handler=elicitation_handler,
         ) as client:
             task = await client.call_tool("elicit_tool", {}, task=True)
@@ -108,7 +109,7 @@ class TestNotificationIntegration:
 
         count_before = get_subscriber_count()
 
-        async with Client(mcp) as client:
+        async with Client(mcp, mode="legacy") as client:
             task = await client.call_tool("lifecycle_tool", {}, task=True)
             await asyncio.wait_for(tool_started.wait(), timeout=5.0)
 

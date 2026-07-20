@@ -825,6 +825,11 @@ class TestAuthMiddlewareCallTool:
 
 
 class TestAuthMiddlewareVersionedRequests:
+    # The resource/template/prompt denial cases are pinned to legacy: the
+    # authorization error message is surfaced to the client on the handshake
+    # era, but the modern server runner masks the raised denial as a generic
+    # "Internal server error". The tool case surfaces via an isError result and
+    # stays era-neutral.
     async def test_middleware_blocks_explicit_restricted_tool_version(self):
         """AuthMiddleware should check the requested tool version."""
         mcp = make_restricted_tag_server()
@@ -878,7 +883,7 @@ class TestAuthMiddlewareVersionedRequests:
 
         tok = set_token(make_token(scopes=["read"]))
         try:
-            async with Client(mcp) as client:
+            async with Client(mcp, mode="legacy") as client:
                 with pytest.raises(Exception, match="authorization|insufficient"):
                     await client.read_resource("data://info", version="1.0")
         finally:
@@ -898,7 +903,7 @@ class TestAuthMiddlewareVersionedRequests:
 
         tok = set_token(make_token(scopes=["read"]))
         try:
-            async with Client(mcp) as client:
+            async with Client(mcp, mode="legacy") as client:
                 with pytest.raises(Exception, match="authorization|insufficient"):
                     await client.read_resource("data://items/123", version="1.0")
         finally:
@@ -918,7 +923,7 @@ class TestAuthMiddlewareVersionedRequests:
 
         tok = set_token(make_token(scopes=["read"]))
         try:
-            async with Client(mcp) as client:
+            async with Client(mcp, mode="legacy") as client:
                 with pytest.raises(Exception, match="authorization|insufficient"):
                     await client.get_prompt("greet", version="1.0")
         finally:
@@ -942,6 +947,12 @@ class TestComponentAuthDenialMessage:
     The message must stay ambiguous ("not found or not authorized") rather than
     asserting the component does not exist (misleading) or that it exists but is
     forbidden (leaks existence to unauthorized callers).
+
+    The resource/prompt cases are pinned to legacy: their denial message is
+    surfaced only on the handshake era, where the read/get path converts the
+    error to a client-visible message; the modern server runner masks it as a
+    generic "Internal server error". The tool case surfaces via an isError
+    result and stays era-neutral.
     """
 
     async def test_call_tool_denied_by_component_auth(self):
@@ -972,7 +983,7 @@ class TestComponentAuthDenialMessage:
         token = make_token(scopes=["read"])
         tok = set_token(token)
         try:
-            async with Client(mcp) as client:
+            async with Client(mcp, mode="legacy") as client:
                 with pytest.raises(Exception) as exc_info:
                     await client.read_resource("data://secret")
             message = str(exc_info.value)
@@ -990,7 +1001,7 @@ class TestComponentAuthDenialMessage:
         token = make_token(scopes=["read"])
         tok = set_token(token)
         try:
-            async with Client(mcp) as client:
+            async with Client(mcp, mode="legacy") as client:
                 with pytest.raises(Exception) as exc_info:
                     await client.get_prompt("secret_prompt")
             message = str(exc_info.value)
