@@ -13,7 +13,9 @@ Use this when you need to respond to server requests for LLM completions.
 
 MCP servers can request LLM completions from clients during tool execution. This enables servers to delegate AI reasoning to the client, which controls which LLM is used and how requests are made.
 
-Sampling belongs to the handshake era of the MCP protocol, which is the only era that gives a server a back-channel to push requests down. A client left at its default `mode="auto"` negotiates the newest era it shares with the server, so against a FastMCP server it lands on the modern era and sampling requests fail. Every example on this page pins `mode="legacy"` for that reason. See [protocol negotiation](/clients/client#protocol-negotiation) for the full picture.
+<Note>
+**Sampling requires the older MCP protocol.** A server requests sampling by sending a request down to the client, and protocol version `2026-07-28` removed the server's ability to do that. Clients default to `mode="auto"`, which negotiates the newest version both sides support, so every example on this page passes `mode="legacy"`. See [protocol negotiation](/clients/client#protocol-negotiation).
+</Note>
 
 ## Handler Template
 

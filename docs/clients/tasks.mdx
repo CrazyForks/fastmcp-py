@@ -14,7 +14,9 @@ Use this when you need to run long operations asynchronously while doing other w
 
 The MCP task protocol lets you request operations to run in the background. The call returns a Task object immediately, letting you track progress, cancel operations, or await results.
 
-FastMCP submits a task over the session that the `initialize` handshake opens, which makes background execution a handshake-era capability. A client left at its default `mode="auto"` negotiates the newest era it shares with the server, so against a FastMCP server it lands on the modern era where task submission is unavailable. The examples on this page pin `mode="legacy"` for that reason. See [protocol negotiation](/clients/client#protocol-negotiation) for the full picture.
+<Note>
+**Background tasks require the older MCP protocol.** FastMCP submits a task over the session that the `initialize` handshake opens, and protocol version `2026-07-28` has no equivalent. Clients default to `mode="auto"`, which negotiates the newest version both sides support, so the examples on this page pass `mode="legacy"`. See [protocol negotiation](/clients/client#protocol-negotiation).
+</Note>
 
 ## Requesting Background Execution
 

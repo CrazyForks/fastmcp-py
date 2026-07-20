@@ -13,7 +13,9 @@ Use this when you need to tell servers what local resources the client has acces
 
 Roots inform servers about resources the client can provide. Servers can use this information to adjust behavior or provide more relevant responses.
 
-A server reads roots by asking the client for them, which requires the back-channel that only the handshake era of the MCP protocol provides. A client left at its default `mode="auto"` negotiates the newest era it shares with the server, so against a FastMCP server it lands on the modern era and the server's request for roots fails. Both examples below pin `mode="legacy"` for that reason. See [protocol negotiation](/clients/client#protocol-negotiation) for the full picture.
+<Note>
+**Roots require the older MCP protocol.** A server reads roots by sending a request down to the client, and protocol version `2026-07-28` removed the server's ability to do that. Clients default to `mode="auto"`, which negotiates the newest version both sides support, so the examples below pass `mode="legacy"`. See [protocol negotiation](/clients/client#protocol-negotiation).
+</Note>
 
 ## Static Roots
 
