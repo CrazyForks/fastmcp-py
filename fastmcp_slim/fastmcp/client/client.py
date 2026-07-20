@@ -8,7 +8,7 @@ import secrets
 import ssl
 import uuid
 import weakref
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,8 +43,9 @@ from mcp_types import (
     TaskStatusNotification,
     TaskStatusNotificationParams,
 )
+from mcp_types.methods import validate_server_result
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
-from pydantic import AnyUrl
+from pydantic import AnyUrl, ValidationError
 
 import fastmcp as fastmcp
 from fastmcp.client.auth.oauth import OAuth
@@ -152,6 +153,68 @@ def _synthesize_discover(protocol_version: str) -> mcp_types.DiscoverResult:
         ttl_ms=0,
         cache_scope="public",
     )
+
+
+@asynccontextmanager
+async def _conformant_discover_only(
+    session: ClientSession,
+) -> AsyncIterator[None]:
+    """Hold ``session.send_discover`` to the same wire schema every later reply must meet.
+
+    ``negotiate_auto`` accepts a probe that parses as the version-free
+    ``DiscoverResult``, whose ``resultType``/``ttlMs``/``cacheScope`` all carry
+    SDK-side defaults. Every request *after* adoption is instead checked against
+    the strict per-version surface (``validate_server_result``), where those same
+    three fields are required. A server that answers ``server/discover`` without
+    them therefore passes the probe and then fails every subsequent call — the
+    connection is adopted into an era the peer cannot actually serve.
+
+    Closing that gap means judging the probe by the rule that will govern the rest
+    of the connection. A result that would be rejected later is not positive
+    evidence of a modern peer, so it is reported as an ordinary probe failure and
+    ``negotiate_auto`` falls back to the initialize handshake, exactly as it does
+    for a server with no ``server/discover`` at all.
+    """
+    send_discover = session.send_discover
+
+    async def _checked_send_discover(version: str) -> dict[str, Any]:
+        raw = await send_discover(version)
+        try:
+            validate_server_result("server/discover", version, raw)
+        except ValidationError as e:
+            # Ordered before the ValueError arm below: pydantic's ValidationError
+            # subclasses ValueError, so a broader clause first would swallow it.
+            logger.debug(
+                "server/discover at %s is not %s-conformant (%s); "
+                "falling back to the initialize handshake",
+                version,
+                version,
+                e,
+            )
+            raise MCPError(
+                code=mcp_types.INVALID_PARAMS,
+                message=(
+                    f"server/discover result is not conformant with {version}; "
+                    "treating the server as handshake-era"
+                ),
+            ) from e
+        except (KeyError, ValueError):
+            # No schema on file for this method/version pair, so there is nothing to
+            # judge the probe against; leave the verdict to negotiate_auto's parse.
+            return raw
+        return raw
+
+    # A transport may itself have installed a `send_discover` override, so restore
+    # whatever was there rather than assuming the class attribute.
+    had_own = "send_discover" in vars(session)
+    session.send_discover = _checked_send_discover  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        if had_own:
+            session.send_discover = send_discover  # ty: ignore[invalid-assignment]
+        else:
+            del session.send_discover
 
 
 @dataclass
@@ -871,7 +934,8 @@ class Client(
                         await self.session.initialize()
                     )
                 elif effective_mode == "auto":
-                    await negotiate_auto(self.session)
+                    async with _conformant_discover_only(self.session):
+                        await negotiate_auto(self.session)
                     # auto may have fallen back to the legacy handshake; surface its
                     # InitializeResult through the existing public property when so.
                     self._session_state.initialize_result = (

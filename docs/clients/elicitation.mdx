@@ -13,6 +13,10 @@ Use this when you need to respond to server requests for user input during tool 
 
 Elicitation allows MCP servers to request structured input from users during operations. Instead of requiring all inputs upfront, servers can interactively ask for missing parameters, request clarification, or gather additional context.
 
+Two routes reach that outcome, and the protocol era the client negotiates decides which one applies. Handshake-era connections let the server push an elicitation request down the back-channel the handshake opens, which is the flow the next few sections describe. Modern-era connections work through [input-required rounds](#input-required-rounds) instead, where the server returns a description of what it needs and the client answers with a fresh call. You write the same `elicitation_handler` either way — FastMCP routes it to whichever mechanism the connection supports.
+
+A client left at its default `mode="auto"` negotiates the newest era it shares with the server, so the examples below pin `mode="legacy"` to exercise the server-initiated flow. See [protocol negotiation](/clients/client#protocol-negotiation) for the full picture.
+
 ## Handler Template
 
 ```python
@@ -54,6 +58,7 @@ async def elicitation_handler(
 
 client = Client(
     "my_mcp_server.py",
+    mode="legacy",
     elicitation_handler=elicitation_handler,
 )
 ```
@@ -138,6 +143,7 @@ async def elicitation_handler(message, response_type, params, context):
 
 client = Client(
     "my_mcp_server.py",
+    mode="legacy",
     elicitation_handler=elicitation_handler
 )
 ```
