@@ -3,6 +3,7 @@ from __future__ import annotations
 import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import mcp_types
@@ -37,6 +38,75 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# The request methods that FastMCP serves through a handler adapter, each of which
+# runs the FastMCP middleware chain interior (see MCPOperationsMixin). The root
+# dispatch leaves these to the interior dispatch and only observes them if they fail before
+# reaching it. Every other message is dispatched here at the root.
+_INTERIOR_METHODS = frozenset(
+    {
+        "tools/call",
+        "tools/list",
+        "resources/read",
+        "resources/list",
+        "resources/templates/list",
+        "prompts/get",
+        "prompts/list",
+    }
+)
+
+
+def _raw_message(ctx: ServerRequestContext) -> Any:
+    """The message payload handed to the root dispatch's ``on_message``/``on_request`` pass.
+
+    The raw inbound params mapping is used verbatim rather than a validated,
+    typed request model. This is deliberate: the outer pass must observe *every*
+    message, including malformed or unroutable ones, and reconstructing a typed
+    model would raise on exactly those messages and hide them from the hooks.
+    The method and request/notification kind are carried on the
+    ``MiddlewareContext`` itself, so observation middleware still has everything
+    it needs.
+    """
+    params = ctx.params
+    if isinstance(params, Mapping):
+        return dict(params)
+    return {} if params is None else params
+
+
+def _forward_ctx(
+    ctx: ServerRequestContext, mw_ctx: Any, original: Any
+) -> ServerRequestContext:
+    """Fold middleware edits to the *message* back into the SDK context.
+
+    The outer pass hands middleware a *copy* of the raw params (see
+    ``_raw_message``), so a hook that follows the documented inspect/modify
+    contract — mutating ``context.message`` or passing ``context.copy(message=...)``
+    to ``call_next`` — would otherwise have its edits silently dropped when the
+    bridge dispatched the original context. Rewriting through
+    ``dataclasses.replace`` is how the SDK documents altering what the handler
+    sees. An untouched message forwards the original context unchanged.
+
+    ``ctx.method`` is deliberately *not* rewritable here. Dispatch has already
+    branched on the method to decide that this message has no interior handler,
+    so redirecting it now — say, turning a ``ping`` into a ``tools/list`` — would
+    hand it to a component handler that runs the FastMCP chain a second time,
+    firing ``on_message`` and raw ``__call__`` overrides twice for one message
+    and duplicating whatever side effects (rate limiting, authorization,
+    logging) they carry. Rewriting the method is not part of the documented
+    middleware contract; only the message is.
+    """
+    message = mw_ctx.message
+    if isinstance(message, Mapping):
+        params: Mapping[str, Any] | None = dict(message)
+        # `_raw_message` renders absent params as `{}`; keep that distinction so
+        # an untouched notification still dispatches with `params=None`.
+        if ctx.params is None and message == original and not message:
+            params = None
+    else:
+        params = ctx.params
+    if params == ctx.params:
+        return ctx
+    return replace(ctx, params=params)
+
 
 def client_supports_extension(session: ServerSession, extension_id: str) -> bool:
     """Check whether the connected client supports a given MCP extension.
@@ -68,15 +138,40 @@ def client_supports_extension(session: ServerSession, extension_id: str) -> bool
 
 
 class FastMCPServerMiddleware:
-    """SDK v2 server middleware that routes ``initialize`` through FastMCP middleware.
+    """Root dispatch for the FastMCP middleware chain, in the SDK's middleware layer.
 
     v2 no longer lets FastMCP subclass ``ServerSession`` (the runner constructs
     it per request), so the old ``MiddlewareServerSession._received_request``
-    override is replaced by a ``ServerMiddleware``. This middleware binds the
-    FastMCP request-context ContextVar for the whole chain (covering
-    ``initialize``, where no handler adapter runs) and routes the initialize
-    request through the FastMCP middleware chain so ``on_initialize`` hooks fire
-    and can observe the ``InitializeResult`` or veto with ``MCPError``.
+    override is replaced by a ``ServerMiddleware`` — an ordinary entry in the
+    SDK's own middleware list. Sitting at the root of dispatch, this
+    is the single entry point through which *every* inbound message flows —
+    requests, notifications, cancellations, ``initialize``, and even malformed or
+    unroutable messages the SDK can still hand us. It binds the FastMCP
+    request-context ContextVar and re-applies the app-scoped ``SharedContext`` for
+    the whole chain, then runs the FastMCP ``Middleware`` chain so
+    ``on_message`` / ``on_request`` / ``on_notification`` observe the message.
+
+    Dispatch shapes:
+
+    - ``initialize`` runs the *whole* FastMCP chain here (``on_message`` ->
+      ``on_request`` -> ``on_initialize``) because there is no interior handler
+      adapter for it: the SDK builds the ``InitializeResult`` directly, so this is
+      the only place ``on_initialize`` can observe it or veto with ``MCPError``.
+    - The component methods (``tools/call``, ``tools/list``, ``resources/read``,
+      ...) still run their FastMCP chain *interior*, in the handler adapter, where
+      ``on_call_tool`` receives the typed component result and a tool exception
+      propagates through ``on_message``/``on_request`` exactly where the built-in
+      error/logging/timing middleware expect it. The root dispatch does not re-run the
+      chain for these — it only steps in when such a request fails *before* the
+      interior runs (malformed params, routing), so ``on_message`` still observes
+      the failure.
+    - Every other message — all notifications (including ``notifications/cancelled``
+      and ``notifications/initialized``), ``ping``, ``logging/setLevel``, and any
+      unroutable/non-component request — has no interior FastMCP dispatch, so the
+      root dispatch runs the ``"outer"`` pass (``on_message`` plus
+      ``on_request``/``on_notification``) here, wrapping the real SDK dispatch.
+      This closes the long-standing gap where these messages were invisible to
+      FastMCP middleware.
     """
 
     def __init__(self, fastmcp: FastMCP):
@@ -93,13 +188,88 @@ class FastMCPServerMiddleware:
             bind_request_context(ctx),
             self._seam_span(fastmcp, ctx),
         ):
-            # Only initialize requests (request_id present) go through FastMCP
-            # middleware here; every other request already binds the context in
-            # its own adapter, so we just pass through.
+            if fastmcp is None:
+                return await call_next(ctx)
             if ctx.method == "initialize" and ctx.request_id is not None:
-                if fastmcp is not None:
-                    return await self._run_initialize_mw(fastmcp, ctx, call_next)
+                return await self._run_initialize_mw(fastmcp, ctx, call_next)
+            if ctx.request_id is not None and ctx.method in _INTERIOR_METHODS:
+                return await self._dispatch_component(fastmcp, ctx, call_next)
+            return await self._run_outer_mw(fastmcp, ctx, call_next, _raise=None)
+
+    async def _dispatch_component(
+        self,
+        fastmcp: FastMCP,
+        ctx: ServerRequestContext,
+        call_next: CallNext,
+    ) -> HandlerResult:
+        """Delegate a component request to the interior chain, covering early failures.
+
+        The interior handler adapter runs the FastMCP chain itself and records
+        ``_interior_dispatched``. If the request instead fails before reaching it
+        (malformed params, method routing), the flag stays False and no hook fired
+        — so the root dispatch runs the ``"outer"`` pass to observe the failure, re-raising
+        the original error inside it so ``on_message``/``on_request`` see it.
+        """
+        from fastmcp.server.middleware.middleware import _interior_dispatched
+
+        token = _interior_dispatched.set(False)
+        try:
             return await call_next(ctx)
+        except (MCPError, ValidationError) as exc:
+            if _interior_dispatched.get():
+                raise
+            return await self._run_outer_mw(fastmcp, ctx, call_next, _raise=exc)
+        finally:
+            _interior_dispatched.reset(token)
+
+    async def _run_outer_mw(
+        self,
+        fastmcp: FastMCP,
+        ctx: ServerRequestContext,
+        call_next: CallNext,
+        *,
+        _raise: BaseException | None,
+    ) -> HandlerResult:
+        """Run the method-agnostic (``on_message``/``on_request``) hook pass.
+
+        ``call_next`` bridges to the real SDK dispatch (request-state boundary,
+        params validation, the notification handler), so these hooks observe the
+        actual wire outcome: a notification returns ``None``, an unroutable request
+        raises through ``call_next``. Message edits are folded back in through
+        ``_forward_ctx``.
+
+        When ``_raise`` is set the operation already failed before the interior
+        ran, and the bridge re-raises it rather than dispatching. This pass is
+        the *observation* path for that failure, not a retry: re-dispatching a
+        corrected component request would run its handler, which runs the FastMCP
+        chain interior, firing ``on_message`` and the raw ``__call__`` override a
+        second time for one message. A hook cannot repair a malformed
+        ``tools/call`` from here — it sees the failure, and the failure stands.
+        """
+        from fastmcp.server.context import Context
+        from fastmcp.server.middleware.middleware import MiddlewareContext
+
+        is_notification = ctx.request_id is None
+        original_message = _raw_message(ctx)
+
+        async def root_call_next(_mw_ctx: MiddlewareContext) -> HandlerResult:
+            if _raise is not None:
+                raise _raise
+            return await call_next(_forward_ctx(ctx, _mw_ctx, original_message))
+
+        async with Context(fastmcp=fastmcp, session=ctx.session) as fastmcp_ctx:
+            mw_context = MiddlewareContext(
+                message=original_message,
+                source="client",
+                type="notification" if is_notification else "request",
+                method=ctx.method,
+                fastmcp_context=fastmcp_ctx,
+            )
+            return await fastmcp._run_middleware(
+                mw_context,
+                cast("FastMCPCallNext[Any, Any]", root_call_next),
+                phase="outer",
+            )
 
     @contextmanager
     def _seam_span(

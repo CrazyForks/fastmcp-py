@@ -71,6 +71,11 @@ from fastmcp.server.caching import build_cache_hints
 from fastmcp.server.lifespan import Lifespan
 from fastmcp.server.low_level import LowLevelServer
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.middleware.middleware import (
+    MiddlewarePhase,
+    _dispatch_phase,
+    mark_interior_dispatched,
+)
 from fastmcp.server.mixins import LifespanMixin, MCPOperationsMixin, TransportMixin
 from fastmcp.server.providers import LocalProvider, Provider
 from fastmcp.server.providers.aggregate import AggregateProvider
@@ -571,8 +576,18 @@ class FastMCP(
         self,
         context: MiddlewareContext[Any],
         call_next: CallNext[Any, Any],
+        *,
+        phase: MiddlewarePhase = "all",
     ) -> Any:
-        """Builds and executes the middleware chain."""
+        """Builds and executes the middleware chain for a single dispatch phase.
+
+        ``phase`` selects whether a pass runs only the method-agnostic hooks
+        (``"outer"``, at the root dispatch) or only the typed per-method hook
+        (``"typed"``, interior); it defaults to ``"all"`` for the direct
+        programmatic path. It is conveyed through the ``_dispatch_phase``
+        ContextVar rather than the middleware call signature, so user middleware
+        overriding the documented ``__call__(context, call_next)`` is unaffected.
+        """
         chain = call_next
         for mw in reversed(self.middleware):
             next_chain: CallNext[Any, Any] = chain
@@ -585,7 +600,30 @@ class FastMCP(
                 return await mw(context, call_next)
 
             chain = cast(CallNext[Any, Any], wrapped)
-        return await chain(context)
+        token = _dispatch_phase.set(phase)
+        try:
+            return await chain(context)
+        finally:
+            _dispatch_phase.reset(token)
+
+    async def _dispatch_component_middleware(
+        self,
+        context: MiddlewareContext[Any],
+        call_next: CallNext[Any, Any],
+    ) -> Any:
+        """Run the interior middleware chain for a component operation.
+
+        This is the dispatch site for the component methods (``tools/call``,
+        ``tools/list``, ``resources/read``, ...). It runs the whole FastMCP chain
+        (``on_message`` -> ``on_request`` -> the typed per-method hook) in one
+        pass, so error-observing middleware see a tool exception propagate through
+        ``on_message``/``on_request`` exactly as they always have. It also records
+        (via ``mark_interior_dispatched``) that the chain fired for this wire
+        message, so the root dispatch knows not to observe it a second
+        time.
+        """
+        mark_interior_dispatched()
+        return await self._run_middleware(context, call_next, phase="all")
 
     def add_middleware(self, middleware: Middleware) -> None:
         self.middleware.append(middleware)
@@ -695,7 +733,7 @@ class FastMCP(
                     method="tools/list",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.list_tools(run_middleware=False),
                 )
@@ -831,7 +869,7 @@ class FastMCP(
                     method="resources/list",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.list_resources(run_middleware=False),
                 )
@@ -966,7 +1004,7 @@ class FastMCP(
                     method="resources/templates/list",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.list_resource_templates(
                         run_middleware=False
@@ -1100,7 +1138,7 @@ class FastMCP(
                     method="prompts/list",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.list_prompts(run_middleware=False),
                 )
@@ -1302,7 +1340,7 @@ class FastMCP(
                     method="tools/call",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.call_tool(
                         context.message.name,
@@ -1473,7 +1511,7 @@ class FastMCP(
                     method="resources/read",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.read_resource(
                         str(context.message.uri),
@@ -1674,7 +1712,7 @@ class FastMCP(
                     method="prompts/get",
                     fastmcp_context=ctx,
                 )
-                return await self._run_middleware(
+                return await self._dispatch_component_middleware(
                     context=mw_context,
                     call_next=lambda context: self.render_prompt(
                         context.message.name,
