@@ -209,19 +209,17 @@ async def test_create_proxy_with_transport(fastmcp_server):
 
 
 async def test_proxy_forwards_upstream_instructions():
-    """A proxy should surface the upstream server's instructions in the handshake."""
+    """A proxy should surface the upstream server's instructions in the handshake.
+
+    `FastMCPProxy` registers a `server/discover` handler that forwards the
+    upstream's instructions, mirroring what `ProxyInitializeMiddleware.on_initialize`
+    already does for the legacy handshake, so `client.session.instructions`
+    (era-neutral) resolves the same way on both protocol eras.
+    """
     upstream = FastMCP(name="upstream", instructions="USE_THIS_MARKER_123")
     proxy = create_proxy(upstream, name="proxy")
 
-    # TODO(mode="legacy" pin): `ProxyInitializeMiddleware.on_initialize` is the
-    # only place that copies the upstream's instructions onto the proxy's own
-    # handshake result, and `on_initialize` only fires for the legacy handshake.
-    # A front client on `mode="auto"` negotiates `server/discover` instead, whose
-    # result the SDK builds straight from `self.instructions` with no equivalent
-    # hook — so upstream instructions silently never reach a modern-era client
-    # through a proxy. `client.session.instructions` (era-neutral) comes back
-    # None here instead of "USE_THIS_MARKER_123". Real defect, not a test bug.
-    async with Client(proxy, mode="legacy") as client:
+    async with Client(proxy) as client:
         assert client.session.instructions == "USE_THIS_MARKER_123"
 
 
@@ -331,25 +329,22 @@ async def test_proxy_list_tools_surfaces_remote_connection_error():
 
 
 async def test_proxy_list_tools_client_surfaces_remote_connection_error():
+    """With a modern front, connecting succeeds (no eager backend probe — see
+    test_proxy_ping_surfaces_wrong_remote_path) and the failure only surfaces
+    once `list_tools()` actually hits the dead backend. `ProxyProvider._list_tools`
+    now normalizes the raw `httpx2.ConnectError` from the failed backend connect
+    into the `MCPError("Client failed to connect...")` this test expects, the
+    same way `ProxyInitializeMiddleware.on_initialize` and `ProxyTool.run`
+    already did.
+    """
     port = find_available_port()
     proxy = create_proxy(
         StreamableHttpTransport(f"http://127.0.0.1:{port}/mcp"),
         provider_error_strategy="raise",
     )
 
-    # TODO(mode="legacy" pin): with a modern front, connecting succeeds (no
-    # eager backend probe — see test_proxy_ping_surfaces_wrong_remote_path)
-    # and the failure only surfaces once `list_tools()` actually hits the
-    # dead backend. But `ProxyProvider._list_tools` only catches `MCPError`;
-    # a raw `httpx2.ConnectError` from the failed backend connect propagates
-    # unwrapped instead of becoming the `MCPError("Client failed to
-    # connect...")` this test expects. `ProxyInitializeMiddleware.on_initialize`
-    # and `ProxyTool.run` already normalize connection failures this way —
-    # the same `except (RuntimeError, TimeoutError, httpx2.HTTPError, ...)`
-    # handling appears to be missing from `ProxyProvider`'s list methods.
-    # Real defect, not a test bug.
     with pytest.raises(MCPError, match="Client failed to connect"):
-        async with Client(proxy, mode="legacy") as client:
+        async with Client(proxy) as client:
             await client.list_tools()
 
 
