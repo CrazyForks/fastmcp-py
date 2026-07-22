@@ -686,9 +686,12 @@ class Client(
         self, elicitation_callback: ElicitationHandler
     ) -> None:
         """Set the elicitation callback for the client."""
-        self._session_kwargs["elicitation_callback"] = create_elicitation_callback(
-            elicitation_callback
-        )
+        self._elicitation_callback = create_elicitation_callback(elicitation_callback)
+        self._session_kwargs["elicitation_callback"] = self._elicitation_callback
+        # Rebuild internal extensions (e.g. the tasks extension) so a background
+        # task's in-task input is answered through the newly-set handler, not the
+        # one captured when the client was constructed.
+        self._session_kwargs.update(self._build_extension_kwargs())
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""

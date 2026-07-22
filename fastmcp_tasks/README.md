@@ -45,7 +45,7 @@ async def analyze(dataset: str) -> str:
 `task=True` is a declaration of intent — this tool *may* run as a task — while the server, per the spec, decides per call whether to actually task it. Use `TaskConfig` for finer control:
 
 ```python
-from fastmcp_tasks import TaskConfig
+from fastmcp.utilities.tasks import TaskConfig
 
 
 @mcp.tool(task=TaskConfig(mode="required"))

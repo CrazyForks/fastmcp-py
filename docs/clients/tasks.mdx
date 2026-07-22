@@ -13,14 +13,17 @@ import { VersionBadge } from "/snippets/version-badge.mdx"
 Some tool calls take a while. The MCP background tasks extension lets a server run one in the background instead of holding the request open, and FastMCP's client drives the whole thing for you — most of the time you don't need to know a call was tasked at all.
 
 <Note>
-**Background tasks require the modern protocol.** The tasks capability is negotiated over `2026-07-28` connections. `mode="auto"` (the client default) negotiates it automatically; `mode="legacy"` never does, so a tasked tool just runs synchronously for a legacy-pinned client. See [protocol negotiation](/clients/client#protocol-negotiation).
+**Client task support is opt-in.** Install the `fastmcp-tasks` package (`pip install "fastmcp[tasks]"`) and import it — importing `fastmcp_tasks` anywhere (which you do to use `call_tool_task`) enables task support for every `Client` in the process. Without it, a `Client` never advertises the tasks capability, so the server runs its calls synchronously and background tasks simply don't happen.
+
+**Tasks also require the modern protocol.** The capability is negotiated over `2026-07-28` connections. `mode="auto"` (the client default) negotiates it automatically; `mode="legacy"` never does. See [protocol negotiation](/clients/client#protocol-negotiation).
 </Note>
 
 ## Transparent Calls
 
-Just call the tool. If the server runs it as a background task, `call_tool` polls it to completion under the hood and returns the same result you'd get from a synchronous call — the task is invisible.
+With task support enabled, just call the tool. If the server runs it as a background task, `call_tool` polls it to completion under the hood and returns the same result you'd get from a synchronous call — the task is invisible.
 
 ```python
+import fastmcp_tasks  # enables client task support
 from fastmcp import Client
 
 async with Client(server, mode="auto") as client:

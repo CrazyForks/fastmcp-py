@@ -69,26 +69,43 @@ _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 # ---------------------------------------------------------------------------
 
 
-async def _send_get(session: ClientSession, task_id: str) -> ClientGetTaskResult:
+async def _send_get(
+    session: ClientSession,
+    task_id: str,
+    read_timeout_seconds: float | None = None,
+) -> ClientGetTaskResult:
     """Send `tasks/get` and parse the detailed task response."""
     request = GetTaskRequest(params=GetTaskRequestParams(task_id=task_id))
-    return await session.send_request(request, ClientGetTaskResult)
+    return await session.send_request(
+        request, ClientGetTaskResult, request_read_timeout_seconds=read_timeout_seconds
+    )
 
 
 async def _send_update(
-    session: ClientSession, task_id: str, input_responses: dict[str, Any]
+    session: ClientSession,
+    task_id: str,
+    input_responses: dict[str, Any],
+    read_timeout_seconds: float | None = None,
 ) -> None:
     """Send `tasks/update` delivering the caller's answers to a parked task."""
     request = UpdateTaskRequest(
         params=UpdateTaskRequestParams(task_id=task_id, input_responses=input_responses)
     )
-    await session.send_request(request, mcp_types.Result)
+    await session.send_request(
+        request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
+    )
 
 
-async def _send_cancel(session: ClientSession, task_id: str) -> None:
+async def _send_cancel(
+    session: ClientSession,
+    task_id: str,
+    read_timeout_seconds: float | None = None,
+) -> None:
     """Send `tasks/cancel` to cooperatively cancel a task."""
     request = CancelTaskRequest(params=CancelTaskRequestParams(task_id=task_id))
-    await session.send_request(request, mcp_types.Result)
+    await session.send_request(
+        request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +152,7 @@ async def _answer_input_requests(
     task_id: str,
     input_requests: dict[str, Any],
     elicitation_callback: ElicitationFnT | None,
+    read_timeout_seconds: float | None = None,
 ) -> None:
     """Answer a task's outstanding input requests, then deliver via `tasks/update`.
 
@@ -170,7 +188,7 @@ async def _answer_input_requests(
             by_alias=True, mode="json", exclude_none=True
         )
 
-    await _send_update(session, task_id, responses)
+    await _send_update(session, task_id, responses, read_timeout_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -182,22 +200,29 @@ async def _drive_to_terminal(
     session: ClientSession,
     task_id: str,
     elicitation_callback: ElicitationFnT | None,
+    read_timeout_seconds: float | None = None,
 ) -> ClientGetTaskResult:
     """Poll `tasks/get` until the task reaches a terminal state.
 
     `working` sleeps and polls again; `input_required` answers the outstanding
     requests through the elicitation handler and re-enters; a terminal state
     (completed / failed / cancelled) is returned. Shared by the transparent
-    resolver and `ToolTask.result()`.
+    resolver and `ToolTask.result()`. `read_timeout_seconds`, when set, bounds
+    each `tasks/get`/`tasks/update` request so a stalled poll can't outlast the
+    per-call timeout the synchronous path would have honored.
     """
     backoff = MIN_POLL_INTERVAL
     while True:
-        current = await _send_get(session, task_id)
+        current = await _send_get(session, task_id, read_timeout_seconds)
         if current.status in _TERMINAL_STATES:
             return current
         if current.status == "input_required":
             await _answer_input_requests(
-                session, task_id, current.input_requests or {}, elicitation_callback
+                session,
+                task_id,
+                current.input_requests or {},
+                elicitation_callback,
+                read_timeout_seconds,
             )
             backoff = MIN_POLL_INTERVAL
             continue
@@ -266,7 +291,10 @@ class TasksClientExtension(ClientExtension):
         schema-valid so the SDK's output-schema revalidation passes.
         """
         final = await _drive_to_terminal(
-            ctx.session, create_result.task_id, self._elicitation_callback
+            ctx.session,
+            create_result.task_id,
+            self._elicitation_callback,
+            ctx.read_timeout_seconds,
         )
         if final.status == "completed":
             return _inlined_call_tool_result(final.result)
@@ -356,13 +384,16 @@ class ToolTask:
                     return current
             elif current.status in _TERMINAL_STATES:
                 return current
-            if loop.time() >= deadline:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
                 raise TimeoutError(
                     f"Task {self.task_id} did not reach "
                     f"{state or 'a terminal state'} within {timeout}s"
                 )
             delay, backoff = _next_poll_delay(current.poll_interval_ms, backoff)
-            await asyncio.sleep(delay)
+            # Never sleep past the deadline, so `wait` returns on time rather
+            # than up to one poll interval late.
+            await asyncio.sleep(min(delay, remaining))
 
     async def result(self) -> FastMCPCallToolResult:
         """Drive the task to completion and return its parsed result.

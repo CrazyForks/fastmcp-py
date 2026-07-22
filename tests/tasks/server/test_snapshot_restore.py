@@ -10,10 +10,12 @@ the edge cases around non-fastmcp keys and failed restores.
 
 from __future__ import annotations
 
+import contextvars
 from unittest.mock import patch
 
 from fastmcp_tasks.context import (
     TaskContextSnapshot,
+    _apply_snapshot_to_context,
     _recall_snapshot,
     get_task_context,
     restore_task_snapshot,
@@ -23,7 +25,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
     running_task_server,
@@ -78,6 +80,42 @@ async def test_get_access_token_in_bg_task_without_context_dep():
     assert final.status == "completed"
     assert final.result is not None
     assert final.result["structuredContent"] == {"result": "jwt-3897"}
+
+
+def test_apply_snapshot_restores_auth_and_headers_in_clean_context():
+    """The cross-process path: with nothing inherited, the snapshot alone makes
+    get_access_token()/get_http_headers() see the submitting caller.
+
+    A Redis-backed worker runs in a separate process and inherits none of the
+    submitter's context vars, so contextvar inheritance (which carries the token
+    on the same-process memory:// path) cannot help. Running in a fresh
+    `copy_context()` with no auth/request bound simulates that worker: only
+    `_apply_snapshot_to_context` populating the ambient vars makes the token and
+    headers reachable.
+    """
+    token = AccessToken(
+        token="jwt-remote",
+        client_id="remote-client",
+        scopes=["read"],
+        claims={"sub": "user-y"},
+    )
+    snapshot = TaskContextSnapshot(
+        access_token_json=token.model_dump_json(),
+        http_headers={"x-trace-id": "abc123"},
+    )
+
+    def run_in_clean_worker_context() -> None:
+        # Nothing bound here — no inheritance to fall back on.
+        assert get_access_token() is None
+        assert get_http_headers() == {}
+        _apply_snapshot_to_context(snapshot)
+        restored = get_access_token()
+        assert restored is not None
+        assert restored.token == "jwt-remote"
+        assert restored.client_id == "remote-client"
+        assert get_http_headers()["x-trace-id"] == "abc123"
+
+    contextvars.copy_context().run(run_in_clean_worker_context)
 
 
 async def test_restore_failure_is_nonfatal():

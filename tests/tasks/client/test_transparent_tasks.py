@@ -154,3 +154,23 @@ async def test_in_task_input_without_handler_errors(guard_server: FastMCP):
     async with Client(guard_server, mode="auto") as client:
         with pytest.raises(ToolError, match="no elicitation handler"):
             await client.call_tool("plan_dinner", {})
+
+
+async def test_in_task_input_answered_by_handler_set_after_construction(
+    guard_server: FastMCP,
+):
+    """An elicitation handler set via set_elicitation_callback reaches in-task input.
+
+    The tasks client extension is built at construction; set_elicitation_callback
+    must rebuild it so a later-configured handler still answers a task's input.
+    """
+
+    async def handle_elicitation(message, response_type, params, context):
+        return DinnerPrefs(cuisine="Thai", vegetarian=True)
+
+    client = Client(guard_server, mode="auto")
+    client.set_elicitation_callback(handle_elicitation)
+    async with client:
+        result = await client.call_tool("plan_dinner", {})
+
+    assert result.data == "Tonight: a vegetarian Thai dinner!"

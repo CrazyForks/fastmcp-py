@@ -293,7 +293,12 @@ async def restore_task_snapshot(key: str = TaskKey()) -> None:
             )
         if raw is None:
             return
-        _remember_snapshot(task_id, TaskContextSnapshot.from_json(raw))
+        snapshot = TaskContextSnapshot.from_json(raw)
+        _remember_snapshot(task_id, snapshot)
+        # Restore the ambient request context (auth token, headers) so core's
+        # get_access_token()/get_http_headers() see the submitting caller inside
+        # the worker, exactly as a normal request would.
+        _apply_snapshot_to_context(snapshot)
     except Exception:
         _logger.warning("Failed to restore task snapshot for %s", key, exc_info=True)
 
@@ -400,6 +405,51 @@ def resolve_worker_server() -> FastMCP | None:
     if task_info is None:
         return None
     return get_task_server(task_info.task_id)
+
+
+def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
+    """Populate the ambient request context a worker's tool body reads.
+
+    A Docket worker has no live request or SDK auth context — especially a
+    Redis-backed worker in a separate process. Rather than teach core's
+    ``get_access_token()`` / ``get_http_headers()`` about tasks, this restores
+    the *same* context vars a normal request would set, so those functions work
+    unchanged: the SDK auth context var (from the snapshotted token) and a
+    minimal HTTP request rebuilt from the snapshotted headers. Runs inside
+    ``restore_task_snapshot`` (a Docket dependency), whose context vars propagate
+    to the tool the same way the snapshot var already does.
+    """
+    if snapshot.access_token_json is not None:
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        from fastmcp.server.auth import AccessToken
+
+        token = AccessToken.model_validate_json(snapshot.access_token_json)
+        auth_context_var.set(AuthenticatedUser(token))
+
+    if snapshot.http_headers:
+        from starlette.requests import Request
+
+        from fastmcp.server.http import _current_http_request
+
+        _current_http_request.set(
+            Request(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/",
+                    "raw_path": b"/",
+                    "query_string": b"",
+                    "headers": [
+                        (name.encode("latin-1"), value.encode("latin-1"))
+                        for name, value in snapshot.http_headers.items()
+                    ],
+                }
+            )
+        )
 
 
 async def make_task_context() -> Context | None:
