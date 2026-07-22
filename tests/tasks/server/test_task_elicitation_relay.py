@@ -62,6 +62,7 @@ async def _drive(server: FastMCP, name: str, answers: list[dict[str, Any]]) -> s
         await update_task(server, created.task_id, {key: answer})
     final = await wait_for_task(server, created.task_id)
     assert final.status == "completed", final.error
+    assert final.result is not None
     return final.result["content"][0]["text"]
 
 
@@ -214,4 +215,5 @@ async def test_unanswered_input_times_out_to_cancel(monkeypatch):
         # Never answer; the worker's bounded wait resolves to cancel.
         final = await wait_for_task(mcp, created.task_id, timeout=10.0)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["content"][0]["text"] == "Cancelled as expected"

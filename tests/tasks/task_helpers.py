@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from fastmcp_tasks.handlers import tasks_cancel, tasks_get, tasks_update
 from fastmcp_tasks.models import (
@@ -37,6 +37,7 @@ from fastmcp_tasks.models import (
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.context import ServerRequestContext
+from mcp.server.session import ServerSession
 from mcp_types import CLIENT_CAPABILITIES_META_KEY
 
 from fastmcp.server.auth import AccessToken
@@ -91,7 +92,7 @@ def _opted_in_request(
         "_meta": opt_in_meta(settings),
     }
     srctx = ServerRequestContext(
-        session=SimpleNamespace(),
+        session=cast(ServerSession, SimpleNamespace()),
         lifespan_context={},
         protocol_version="2026-07-28",
         method="tools/call",
@@ -202,9 +203,7 @@ async def run_task(
     timeout: float = 5.0,
 ) -> GetTaskResult:
     """Submit a task and wait for it to reach a terminal state."""
-    created = await submit_task(
-        server, name, arguments, access_token=access_token
-    )
+    created = await submit_task(server, name, arguments, access_token=access_token)
     return await wait_for_task(
         server, created.task_id, access_token=access_token, timeout=timeout
     )

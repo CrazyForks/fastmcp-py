@@ -47,7 +47,9 @@ async def test_same_client_can_access_all_its_tasks(task_server: FastMCP):
         second = await run_task(
             task_server, "secret_tool", {"data": "second"}, access_token=token
         )
+        assert first.result is not None
         assert "first" in first.result["content"][0]["text"]
+        assert second.result is not None
         assert "second" in second.result["content"][0]["text"]
 
 
@@ -55,6 +57,7 @@ async def test_unauthenticated_client_can_access_its_tasks(task_server: FastMCP)
     """An anonymous caller can resolve tasks in the anonymous keyspace."""
     async with running_task_server(task_server):
         final = await run_task(task_server, "secret_tool", {"data": "hello"})
+        assert final.result is not None
         assert "hello" in final.result["content"][0]["text"]
 
 

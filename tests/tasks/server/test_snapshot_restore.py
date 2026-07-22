@@ -48,6 +48,7 @@ async def test_snapshot_restored_before_user_code_runs():
         final = await wait_for_task(mcp, created.task_id)
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": True}
 
 
@@ -75,6 +76,7 @@ async def test_get_access_token_in_bg_task_without_context_dep():
         final = await wait_for_task(mcp, created.task_id)
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": "jwt-3897"}
 
 
@@ -99,6 +101,7 @@ async def test_restore_failure_is_nonfatal():
             final = await wait_for_task(mcp, created.task_id)
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": False}
 
 

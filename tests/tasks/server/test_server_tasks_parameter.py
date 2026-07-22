@@ -130,6 +130,7 @@ async def test_task_with_custom_tool_name():
     async with running_task_server(mcp):
         final = await run_task(mcp, "custom-tool-name")
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {
             "result": "result from custom-named tool"
         }

@@ -99,6 +99,7 @@ async def test_concurrent_background_tasks_with_context():
     assert len(finals) == 4
     for final in finals:
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"]["result"].startswith("bg:")
 
 
@@ -134,6 +135,7 @@ async def test_concurrent_background_tasks_with_progress():
     assert len(finals) == 4
     for final in finals:
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"]["result"].startswith("bg:")
 
 
@@ -202,6 +204,7 @@ async def test_sync_context_functions_work_in_background_without_deps():
         final = await wait_for_task(mcp, created.task_id)
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"has_headers": "False"}
 
 
@@ -225,4 +228,5 @@ async def test_sync_context_functions_work_in_background_with_context():
         final = await wait_for_task(mcp, created.task_id)
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"]["is_background"] == "True"

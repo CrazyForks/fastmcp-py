@@ -356,6 +356,7 @@ class TestBackgroundTaskIntegration:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "done"}
 
     async def test_context_wiring_in_background_task(self):
@@ -382,6 +383,7 @@ class TestBackgroundTaskIntegration:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {
             "task_id_set": True,
             "is_background": True,
@@ -406,6 +408,7 @@ class TestBackgroundTaskIntegration:
             parked = await wait_for_task(
                 mcp, created.task_id, target_states=frozenset({"input_required"})
             )
+            assert parked.input_requests is not None
             key = next(iter(parked.input_requests))
             await update_task(
                 mcp,
@@ -415,6 +418,7 @@ class TestBackgroundTaskIntegration:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "Hello, Bob!"}
 
     async def test_elicit_decline_flow(self):
@@ -436,11 +440,13 @@ class TestBackgroundTaskIntegration:
             parked = await wait_for_task(
                 mcp, created.task_id, target_states=frozenset({"input_required"})
             )
+            assert parked.input_requests is not None
             key = next(iter(parked.input_requests))
             await update_task(mcp, created.task_id, {key: {"action": "decline"}})
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "User declined"}
 
     async def test_elicit_with_pydantic_model(self):
@@ -466,6 +472,7 @@ class TestBackgroundTaskIntegration:
             parked = await wait_for_task(
                 mcp, created.task_id, target_states=frozenset({"input_required"})
             )
+            assert parked.input_requests is not None
             key = next(iter(parked.input_requests))
             await update_task(
                 mcp,
@@ -475,6 +482,7 @@ class TestBackgroundTaskIntegration:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "Alice is 30"}
 
 
@@ -511,6 +519,7 @@ class TestAccessTokenInBackgroundTasks:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {
             "result": "roundtrip-jwt|test-client"
         }
@@ -530,6 +539,7 @@ class TestAccessTokenInBackgroundTasks:
             final = await wait_for_task(mcp, created.task_id)
 
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "no-token"}
 
 

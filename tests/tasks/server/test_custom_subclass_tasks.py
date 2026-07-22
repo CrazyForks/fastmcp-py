@@ -92,6 +92,7 @@ async def test_custom_tool_background_execution(custom_tool_server):
         final = await run_task(custom_tool_server, "custom_tool", {})
 
     assert final.status == "completed"
+    assert final.result is not None
     assert "Custom tool executed" in final.result["content"][0]["text"]
 
 
@@ -101,6 +102,7 @@ async def test_custom_tool_with_arguments(custom_tool_server):
         final = await run_task(custom_tool_server, "custom_logic", {"duration": 1})
 
     assert final.status == "completed"
+    assert final.result is not None
     assert "Completed after 1 units" in final.result["content"][0]["text"]
 
 

@@ -180,6 +180,7 @@ class TestToolExecutionMetadata:
             return "ok"
 
         tool = await mcp.get_tool("my_tool")
+        assert tool is not None
         execution = tool.to_mcp_tool().execution
         assert isinstance(execution, ToolExecution)
         assert execution.task_support == "optional"
@@ -194,6 +195,7 @@ class TestToolExecutionMetadata:
             return "ok"
 
         tool = await mcp.get_tool("my_tool")
+        assert tool is not None
         execution = tool.to_mcp_tool().execution
         assert isinstance(execution, ToolExecution)
         assert execution.task_support == "required"
@@ -208,6 +210,7 @@ class TestToolExecutionMetadata:
             return "ok"
 
         tool = await mcp.get_tool("my_tool")
+        assert tool is not None
         assert tool.to_mcp_tool().execution is None
 
 

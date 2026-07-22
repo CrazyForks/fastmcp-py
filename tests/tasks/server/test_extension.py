@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from fastmcp_tasks.models import (
@@ -19,6 +20,7 @@ from fastmcp_tasks.models import (
     CreateTaskResult,
 )
 from mcp.server.context import ServerRequestContext
+from mcp.server.session import ServerSession
 from mcp.shared.exceptions import MCPError
 
 from fastmcp import FastMCP
@@ -140,6 +142,7 @@ async def test_required_tool_tasks_when_opted_in():
         created = await submit_task(mcp, "must_task", {"n": 10})
         final = await wait_for_task(mcp, created.task_id)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"]["result"] == 11
 
 
@@ -197,6 +200,7 @@ async def test_task_arguments_are_coerced_like_sync_path():
     async with running_task_server(mcp):
         # "6" coerces to int 6 exactly as the synchronous path would.
         final = await run_task(mcp, "square", {"n": "6"})
+        assert final.result is not None
         assert final.result["structuredContent"]["result"] == 36
 
 
@@ -308,7 +312,7 @@ async def test_legacy_era_opt_in_is_ignored():
     mcp = _tasks_server()
     async with running_task_server(mcp):
         srctx = ServerRequestContext(
-            session=SimpleNamespace(),
+            session=cast(ServerSession, SimpleNamespace()),
             lifespan_context={},
             protocol_version="2025-06-18",
             method="tools/call",
@@ -324,7 +328,7 @@ async def test_legacy_era_required_tool_raises_missing_capability():
     mcp = _tasks_server()
     async with running_task_server(mcp):
         srctx = ServerRequestContext(
-            session=SimpleNamespace(),
+            session=cast(ServerSession, SimpleNamespace()),
             lifespan_context={},
             protocol_version="2025-06-18",
             method="tools/call",

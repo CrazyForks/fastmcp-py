@@ -45,9 +45,7 @@ __all__ = [
 #: the tasks extension in for the request.
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32003
 
-TaskStatus = Literal[
-    "working", "input_required", "completed", "failed", "cancelled"
-]
+TaskStatus = Literal["working", "input_required", "completed", "failed", "cancelled"]
 
 
 class _TaskFields(BaseModel):
@@ -69,7 +67,9 @@ class _TaskFields(BaseModel):
     created_at: str = Field(serialization_alias="createdAt")
     last_updated_at: str = Field(serialization_alias="lastUpdatedAt")
     ttl_ms: float | None = Field(serialization_alias="ttlMs")
-    status_message: str | None = Field(default=None, serialization_alias="statusMessage")
+    status_message: str | None = Field(
+        default=None, serialization_alias="statusMessage"
+    )
     poll_interval_ms: float | None = Field(
         default=None, serialization_alias="pollIntervalMs"
     )

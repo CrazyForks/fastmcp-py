@@ -73,6 +73,7 @@ async def test_background_tool_receives_docket_dependency(dependency_server):
         final = await run_task(dependency_server, "tool_with_docket_dependency", {})
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": "Docket: True"}
     assert len(dependency_server._injected_values) == 1
     dep_type, dep_value = dependency_server._injected_values[0]
@@ -88,6 +89,7 @@ async def test_background_tool_receives_server_dependency(dependency_server):
         final = await run_task(dependency_server, "tool_with_server_dependency", {})
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {
         "result": f"Server: {dependency_server.name}"
     }
@@ -107,6 +109,7 @@ async def test_background_tool_receives_custom_depends(dependency_server):
         )
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": 50}  # 5 * 10
     assert len(dependency_server._injected_values) == 1
     dep_type, dep_value = dependency_server._injected_values[0]
@@ -124,6 +127,7 @@ async def test_background_tool_with_multiple_dependencies(dependency_server):
         )
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {
         "result": f"test on {dependency_server.name}"
     }
@@ -180,6 +184,7 @@ async def test_dependency_context_managers_cleaned_up_in_background():
         final = await run_task(mcp, "use_connection", {"name": "test"})
 
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": "Used: connection"}
     assert cleanup_called == ["enter", "exit"]
 

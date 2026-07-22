@@ -53,7 +53,9 @@ async def test_tasks_get_returns_status_and_inlined_result():
 
         final = await wait_for_task(mcp, created.task_id)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": 42}
+        assert final.result is not None
         assert final.result["isError"] is False
 
 

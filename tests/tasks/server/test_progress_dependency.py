@@ -48,6 +48,7 @@ async def test_progress_in_background_task():
         created = await submit_task(mcp, "test_task", {})
         final = await wait_for_task(mcp, created.task_id)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "done"}
 
 
@@ -97,6 +98,7 @@ async def test_progress_status_message_in_background_task():
         release.set()
         final = await wait_for_task(mcp, created.task_id)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "done"}
 
 

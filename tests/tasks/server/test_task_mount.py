@@ -20,6 +20,7 @@ Two architectural notes vs. SEP-1686:
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import mcp_types as mt
 import pytest
@@ -31,7 +32,7 @@ from mcp_types import ToolExecution
 from fastmcp import Context, FastMCP
 from fastmcp.server.dependencies import CurrentFastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.server.providers.proxy import ProxyTool
+from fastmcp.server.providers.proxy import ClientFactoryT, ProxyTool
 from fastmcp.tools.base import ToolResult
 from fastmcp.utilities.tasks import TaskConfig
 from fastmcp_tasks import TasksExtension
@@ -90,6 +91,7 @@ class TestMountedToolTasks:
             assert created.status == "working"
             final = await wait_for_task(parent_server, created.task_id)
             assert final.status == "completed"
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == 72
 
     async def test_mounted_and_parent_tasks_both_work(self, parent_server):
@@ -102,7 +104,9 @@ class TestMountedToolTasks:
             )
             parent_final = await wait_for_task(parent_server, parent_created.task_id)
             child_final = await wait_for_task(parent_server, child_created.task_id)
+            assert parent_final.result is not None
             assert parent_final.result["structuredContent"]["result"] == 50
+            assert child_final.result is not None
             assert child_final.result["structuredContent"]["result"] == 6
 
     async def test_sync_only_mounted_tool_runs_synchronously(self, parent_server):
@@ -129,6 +133,7 @@ class TestMountedToolTasksNoPrefix:
                 parent,
                 (await submit_task(parent, "multiply", {"a": 5, "b": 6})).task_id,
             )
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == 30
 
 
@@ -137,7 +142,7 @@ class TestMountedTaskDependencies:
         child = FastMCP("dep-child")
 
         @child.tool(task=True)
-        async def tool_with_docket(docket: CurrentDocket = CurrentDocket()) -> str:  # type: ignore[assignment,valid-type]
+        async def tool_with_docket(docket: Docket = CurrentDocket()) -> str:
             return f"docket available: {docket is not None}"
 
         parent = FastMCP("dep-parent")
@@ -149,6 +154,7 @@ class TestMountedTaskDependencies:
                 parent,
                 (await submit_task(parent, "child_tool_with_docket", {})).task_id,
             )
+            assert final.result is not None
             assert "docket available: True" in final.result["content"][0]["text"]
 
 
@@ -157,7 +163,7 @@ class TestMountedTaskServerContext:
         child = FastMCP("child")
 
         @child.tool(task=True)
-        async def whoami(server: CurrentFastMCP = CurrentFastMCP()) -> str:  # type: ignore[assignment,valid-type]
+        async def whoami(server: FastMCP = CurrentFastMCP()) -> str:
             return f"server name: {server.name}"
 
         parent = FastMCP("parent")
@@ -168,6 +174,7 @@ class TestMountedTaskServerContext:
             final = await wait_for_task(
                 parent, (await submit_task(parent, "child_whoami", {})).task_id
             )
+            assert final.result is not None
             assert "server name: child" in final.result["content"][0]["text"]
 
     async def test_context_fastmcp_resolves_to_child_server(self):
@@ -185,6 +192,7 @@ class TestMountedTaskServerContext:
             final = await wait_for_task(
                 parent, (await submit_task(parent, "child_whoami_ctx", {})).task_id
             )
+            assert final.result is not None
             assert "context server: child" in final.result["content"][0]["text"]
 
 
@@ -217,7 +225,9 @@ class TestMultipleMounts:
                     await submit_task(parent, "math2_subtract", {"a": 10, "b": 5})
                 ).task_id,
             )
+            assert r1.result is not None
             assert r1.result["structuredContent"]["result"] == 15
+            assert r2.result is not None
             assert r2.result["structuredContent"]["result"] == 5
 
     async def test_same_function_names_do_not_collide(self):
@@ -246,7 +256,9 @@ class TestMultipleMounts:
                 parent,
                 (await submit_task(parent, "c2_process", {"value": 10})).task_id,
             )
+            assert r1.result is not None
             assert r1.result["structuredContent"]["result"] == 20
+            assert r2.result is not None
             assert r2.result["structuredContent"]["result"] == 30
 
     async def test_nested_mount_prefix_accumulation(self):
@@ -267,6 +279,7 @@ class TestMultipleMounts:
                 parent,
                 (await submit_task(parent, "child_gc_deep_tool", {})).task_id,
             )
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == "deep"
 
 
@@ -286,6 +299,8 @@ class TestMountedTaskMetadata:
 
         child_mcp = child_tool.to_mcp_tool(name=child_tool.name)
         parent_mcp = parent_tool.to_mcp_tool(name=parent_tool.name)
+        assert child_mcp.execution is not None
+        assert parent_mcp.execution is not None
         assert child_mcp.execution.task_support == "optional"
         assert parent_mcp.execution.task_support == "optional"
 
@@ -296,7 +311,7 @@ class TestMountedTaskMetadata:
             input_schema={"type": "object", "properties": {}},
             execution=ToolExecution(task_support="optional"),
         )
-        proxy = ProxyTool.from_mcp_tool(lambda: None, mcp_tool)  # type: ignore[arg-type]
+        proxy = ProxyTool.from_mcp_tool(cast(ClientFactoryT, lambda: None), mcp_tool)
         result = proxy.to_mcp_tool(name=proxy.name)
         assert result.execution is not None
         assert result.execution.task_support == "optional"
@@ -339,6 +354,7 @@ class TestMountedTaskConfigModes:
                     await submit_task(parent_with_modes, "child_optional_tool", {})
                 ).task_id,
             )
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == "optional result"
 
     async def test_required_mode_with_task_through_mount(self, parent_with_modes):
@@ -349,6 +365,7 @@ class TestMountedTaskConfigModes:
                     await submit_task(parent_with_modes, "child_required_tool", {})
                 ).task_id,
             )
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == "required result"
 
     async def test_required_mode_without_task_through_mount(self, parent_with_modes):
@@ -417,6 +434,7 @@ class TestMiddlewareWithMountedTasks:
         async with running_task_server(parent):
             created = await submit_task(parent, "c_gc_compute", {"x": 5})
             final = await wait_for_task(parent, created.task_id)
+            assert final.result is not None
             assert final.result["structuredContent"]["result"] == 10
 
         assert calls == ["parent:before", "parent:after", "grandchild:tool"]

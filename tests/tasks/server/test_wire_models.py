@@ -22,6 +22,7 @@ from fastmcp_tasks.models import (
     CancelTaskResult,
     CreateTaskResult,
     GetTaskResult,
+    TaskStatus,
     UpdateTaskResult,
 )
 from jsonschema import Draft202012Validator
@@ -72,10 +73,10 @@ def test_create_task_result_matches_schema():
         ("cancelled", {}),
     ],
 )
-def test_get_task_result_matches_schema(status: str, payload: dict[str, Any]):
+def test_get_task_result_matches_schema(status: TaskStatus, payload: dict[str, Any]):
     result = GetTaskResult(
         task_id="t1",
-        status=status,  # type: ignore[arg-type]
+        status=status,
         created_at=_ISO,
         last_updated_at=_ISO,
         ttl_ms=900000,
@@ -111,9 +112,7 @@ def test_null_ttl_is_permitted_by_schema():
     )
     dumped = result.model_dump(by_alias=True, mode="json", exclude_none=False)
     # Drop the other None optionals the runner would also drop, keeping ttlMs=null.
-    dumped = {
-        k: v for k, v in dumped.items() if v is not None or k == "ttlMs"
-    }
+    dumped = {k: v for k, v in dumped.items() if v is not None or k == "ttlMs"}
     _validate("CreateTaskResult", dumped)
 
 

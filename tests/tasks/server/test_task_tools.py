@@ -84,6 +84,7 @@ async def test_task_tool_coerces_model_arguments():
         final = await run_task(mcp, "inspect_items", arguments)
 
     assert sync_result.structured_content == expected
+    assert final.result is not None
     assert final.result["structuredContent"] == expected
 
 
@@ -99,6 +100,7 @@ async def test_task_arguments_are_coerced_like_sync_path():
     async with running_task_server(mcp):
         final = await run_task(mcp, "square", {"n": "1"})
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": 1}
 
 
@@ -137,6 +139,7 @@ async def test_valid_argument_submits_under_strict_validation():
     async with running_task_server(mcp):
         final = await run_task(mcp, "square", {"n": 4})
     assert final.status == "completed"
+    assert final.result is not None
     assert final.result["structuredContent"] == {"result": 16}
 
 
@@ -202,6 +205,7 @@ async def test_tool_task_executes_in_background():
         finish.set()
         final = await wait_for_task(mcp, created.task_id)
         assert final.status == "completed"
+        assert final.result is not None
         assert final.result["structuredContent"] == {"result": "completed"}
 
 
