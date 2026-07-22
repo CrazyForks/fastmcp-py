@@ -31,6 +31,7 @@ from fastmcp_tasks.context import (
     register_task_server,
 )
 from fastmcp_tasks.dependencies import _current_docket
+from fastmcp_tasks.input_store import save_current_leg, save_task_args
 from fastmcp_tasks.keys import build_task_key, task_redis_prefix
 from fastmcp_tasks.models import CreateTaskResult
 
@@ -74,8 +75,9 @@ async def create_task(
     # argument-splatting match what the worker will invoke.
     component = await _registered_task_component(context, tool)
 
+    raw_arguments = dict(arguments or {})
     coerced = coerce_task_arguments(
-        component, dict(arguments or {}), strict=_strict_input_validation()
+        component, raw_arguments, strict=_strict_input_validation()
     )
 
     task_id = secrets.token_urlsafe(32)
@@ -114,6 +116,13 @@ async def create_task(
         await redis.set(created_at_key, created_at, ex=ttl_seconds)
         await redis.set(poll_interval_key, str(poll_interval_ms), ex=ttl_seconds)
 
+    # End-and-reenter state: the raw (wire) arguments feed every leg, re-coerced
+    # per leg, and the leg pointer starts at leg 1 (the base task key). A guard
+    # return re-enters by enqueuing the next leg with these same arguments (see
+    # handlers.enqueue_next_leg).
+    await save_task_args(docket, task_scope, task_id, raw_arguments, ttl_seconds)
+    await save_current_leg(docket, task_scope, task_id, task_key, 1, ttl_seconds)
+
     await snapshot.save(docket, task_scope, task_id, ttl_seconds)
 
     await add_component_to_docket(
@@ -148,6 +157,47 @@ def _owning_server(tool: Tool, fallback: FastMCP) -> FastMCP:
     if isinstance(tool, FastMCPProviderTool):
         return tool._server
     return fallback
+
+
+async def registered_component_for_key(server: FastMCP, component_key: str) -> Tool:
+    """Return the Docket-registered task component matching ``component_key``.
+
+    ``get_tasks()`` yields the same components registered with Docket (the
+    underlying ``FunctionTool`` for a mounted tool, not a provider wrapper), so
+    matching by ``key`` recovers the component whose calling convention agrees
+    with the worker. Used when re-entering a task leg, where only the stored
+    compound key (not the original ``Tool`` object) is available.
+    """
+    for component in await server.get_tasks():
+        if component.key == component_key and isinstance(component, Tool):
+            return component
+    raise MCPError(
+        code=INTERNAL_ERROR,
+        message=f"No task-enabled component found for {component_key!r}.",
+    )
+
+
+async def enqueue_task_leg(
+    server: FastMCP,
+    docket: Docket,
+    component: Tool,
+    raw_arguments: dict[str, object],
+    leg_key: str,
+) -> None:
+    """Enqueue a fresh Docket execution (the next leg) for a re-entered task.
+
+    Re-coerces the stored wire arguments (each leg validates independently, as a
+    foreground retry would) and adds the component's registered callable — the
+    capture wrapper — under ``leg_key``. Waits for the execution to become
+    durable so a ``tasks/get`` immediately after ``tasks/update`` resolves.
+    """
+    coerced = coerce_task_arguments(
+        component, dict(raw_arguments), strict=_strict_input_validation()
+    )
+    await add_component_to_docket(
+        component, docket, coerced, fn_key=component.key, task_key=leg_key
+    )
+    await _await_durable_creation(docket, leg_key)
 
 
 async def _registered_task_component(context: Context, tool: Tool) -> Tool:

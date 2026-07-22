@@ -37,6 +37,7 @@ from fastmcp.tools.base import Tool
 from fastmcp.tools.function_tool import FunctionTool, _resolve_param_hints
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.types import get_cached_typeadapter
+from fastmcp_tasks.input_loop import reentrant_task_fn
 
 if TYPE_CHECKING:
     from docket import Docket
@@ -54,7 +55,11 @@ def register_component_with_docket(component: FastMCPComponent, docket: Docket) 
         return
 
     if isinstance(component, FunctionTool):
-        docket.register(component.fn, names=[component.key])
+        # Run the tool through the guard loop so a body that returns an
+        # InputRequiredResult drives the reentrant in-task input cycle. The
+        # wrapper is signature-preserving, so Docket's dependency injection is
+        # unchanged for a body that never asks for input.
+        docket.register(reentrant_task_fn(component.fn), names=[component.key])
     elif isinstance(component, Tool):
         docket.register(component.run, names=[component.key])
     elif isinstance(component, FunctionResource):

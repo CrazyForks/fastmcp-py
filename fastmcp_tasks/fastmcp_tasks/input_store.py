@@ -1,142 +1,260 @@
-"""In-task input store for SEP-2663 poll-based elicitation.
+"""Per-task Redis state for SEP-2663 end-and-reenter input gathering.
 
-When a background task calls ``ctx.elicit()`` it has no live request to carry the
-prompt. SEP-2663 handles this by polling: the worker parks an *input request*
-here, the task's ``tasks/get`` status flips to ``input_required`` with the
-outstanding requests, the client answers via ``tasks/update``, and the parked
-worker resumes.
+A background task gathers client input by *ending a leg* and re-entering, never
+by blocking a worker. When a `task=True` tool returns an `InputRequiredResult`,
+the leg's Docket execution completes and the worker is freed; the task's state
+lives here in Redis as `input_required`. When the client answers via
+`tasks/update`, a fresh Docket execution (the next leg) re-runs the tool with the
+accumulated state injected onto its `Context`. No worker ever waits for input.
 
-This is the reworked SEP-1686 elicitation module. The Redis request/response
-mechanics — a per-request hash the poll surface reads and a per-key list the
-worker blocks on with ``BLPOP`` — are preserved. What's gone is the *push
-envelope*: the old code sent a ``notifications/tasks/status`` through the
-distributed notification queue to wake the client. Under SEP-2663 the client
-discovers the outstanding request by polling ``tasks/get``, so no push is needed.
+This module owns the durable state each task carries between legs:
+
+- **args** — the original tool arguments, re-supplied to every leg.
+- **current_leg / leg** — the latest leg's Docket execution key and its number.
+- **request_state** — the opaque string a leg carried forward (SEP-2322).
+- **input_responses** — the typed answers the last `tasks/update` delivered,
+  translated to the tool's own request keys.
+- **input:requests / input:map** — the current leg's outstanding requests, keyed
+  by a server-minted surfaced key, plus the surfaced-key → tool-key mapping.
+
+Each surfaced request key is minted fresh with high-entropy suffix and never
+reused after its response is delivered (SEP-2663 L350): a task that asks twice,
+or a leg that requests several inputs at once, surfaces distinct, independently
+answerable keys, and the tool reads its *own* keys on the next leg via the
+translated `input_responses`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+import secrets
+from typing import TYPE_CHECKING, Any, cast
 
 import mcp_types
-from redis.exceptions import RedisError
 
-from fastmcp_tasks.context import get_task_context
 from fastmcp_tasks.keys import task_redis_prefix
 
 if TYPE_CHECKING:
     from docket import Docket
 
-    from fastmcp.server.context import Context
-
 logger = logging.getLogger(__name__)
 
-# How long a parked input request (and any delivered response) lives before
-# expiring. A task blocked on input holds a worker slot, so this doubles as the
-# maximum time a worker waits for the client to answer.
+# How long a task's input state (outstanding requests and delivered responses)
+# lives before expiring. With end-and-reenter no worker is held while a task is
+# input_required, so this bounds only how long durable input state survives, not
+# any worker slot.
 INPUT_TTL_SECONDS = 3600
 
+# Reconstruct a typed response from its stored `{"type": name, "data": dump}`
+# form so a re-entered leg reads a real `ElicitResult` (etc.) on
+# `ctx.input_responses`, matching the foreground guard contract.
+_RESULT_TYPE_BY_NAME: dict[str, type[mcp_types.Result]] = {
+    "ElicitResult": mcp_types.ElicitResult,
+    "CreateMessageResult": mcp_types.CreateMessageResult,
+    "CreateMessageResultWithTools": mcp_types.CreateMessageResultWithTools,
+    "ListRootsResult": mcp_types.ListRootsResult,
+}
 
-def _requests_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
-    """Redis hash of outstanding input requests, keyed by input key."""
-    return docket.key(f"{task_redis_prefix(task_scope)}:{task_id}:input:requests")
+# Map an outstanding request's wire method to the result type its answer
+# validates into. Elicitation is the supported in-task input; the others are
+# kept complete so a client that answers one is parsed rather than dropped.
+_RESULT_TYPE_BY_METHOD: dict[str, type[mcp_types.Result]] = {
+    "elicitation/create": mcp_types.ElicitResult,
+    "sampling/createMessage": mcp_types.CreateMessageResult,
+    "roots/list": mcp_types.ListRootsResult,
+}
 
 
-def _response_key(
-    docket: Docket, task_scope: str | None, task_id: str, input_key: str
+def result_type_for_method(method: str) -> type[mcp_types.Result]:
+    """The result type an outstanding request's answer validates into."""
+    return _RESULT_TYPE_BY_METHOD.get(method, mcp_types.ElicitResult)
+
+
+def _prefix(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return f"{task_redis_prefix(task_scope)}:{task_id}"
+
+
+def _args_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:args")
+
+
+def _current_leg_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:current_leg")
+
+
+def _leg_number_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:leg")
+
+
+def _request_state_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:request_state")
+
+
+def _input_responses_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:input_responses")
+
+
+def _requests_key(
+    docket: Docket, task_scope: str | None, task_id: str, leg: int
 ) -> str:
-    """Redis list the worker blocks on for a single input key's response."""
-    return docket.key(
-        f"{task_redis_prefix(task_scope)}:{task_id}:input:resp:{input_key}"
-    )
+    """Redis hash of a leg's outstanding input requests, keyed by surfaced key.
 
-
-def _elicitation_input_request(message: str, schema: dict[str, Any]) -> dict[str, Any]:
-    """Build the SEP-2663 ``InputRequest`` for an elicitation (an ElicitRequest)."""
-    return {
-        "method": "elicitation/create",
-        "params": {"message": message, "requestedSchema": schema},
-    }
-
-
-async def elicit_in_task(
-    context: Context, message: str, schema: dict[str, Any]
-) -> mcp_types.ElicitResult:
-    """Park an elicitation request and block until the client answers it.
-
-    Installed as core's in-task elicitation handler by ``TasksExtension``. Parks
-    an input request keyed by the task's own id (one outstanding elicitation per
-    task at a time — the polling model is inherently sequential), flips the
-    task's polled status to ``input_required``, and blocks on the response list.
-    Returns the client's ``ElicitResult``; on timeout or a missing task context,
-    returns a ``cancel`` action so the worker never hangs indefinitely.
+    Scoped by leg number so a re-entered leg's fresh requests never collide with
+    the answered leg's stale ones in the shared keyspace.
     """
-    task_context = get_task_context()
-    if task_context is None:
-        logger.warning("elicit_in_task called outside a task worker; cancelling")
-        return mcp_types.ElicitResult(action="cancel", content=None)
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:input:{leg}:requests")
 
-    docket = context.fastmcp._docket
-    if docket is None:
-        from fastmcp_tasks.dependencies import _current_docket
 
-        docket = _current_docket.get()
-    if docket is None:
-        return mcp_types.ElicitResult(action="cancel", content=None)
+def _map_key(docket: Docket, task_scope: str | None, task_id: str, leg: int) -> str:
+    """Redis hash mapping a leg's surfaced keys back to the tool's own keys."""
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:input:{leg}:map")
 
-    task_scope = task_context.task_scope
-    task_id = task_context.task_id
-    # One elicitation outstanding per task: key the request by the task id so the
-    # inputRequests map surfaced by tasks/get is stable and answerable.
-    input_key = task_id
 
-    requests_key = _requests_key(docket, task_scope, task_id)
-    response_key = _response_key(docket, task_scope, task_id, input_key)
-    request_payload = _elicitation_input_request(message, schema)
+def _mint_surfaced_key(task_id: str) -> str:
+    """Mint a unique surfaced key for one outstanding request (SEP-2663 L350).
 
+    Namespaced by the task id and suffixed with fresh entropy so no two
+    requests — across legs or within one leg — ever collide, and a key is never
+    reused after its response is delivered.
+    """
+    return f"{task_id}:{secrets.token_hex(8)}"
+
+
+def _decode(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Task arguments and leg pointer (written at create, advanced at tasks/update)
+# ---------------------------------------------------------------------------
+
+
+async def save_task_args(
+    docket: Docket,
+    task_scope: str | None,
+    task_id: str,
+    arguments: dict[str, Any],
+    ttl_seconds: int,
+) -> None:
+    """Store the original tool arguments, re-supplied to every leg."""
     async with docket.redis() as redis:
-        await redis.hset(requests_key, input_key, json.dumps(request_payload))
-        await redis.expire(requests_key, INPUT_TTL_SECONDS)
+        await redis.set(
+            _args_key(docket, task_scope, task_id),
+            json.dumps(arguments),
+            ex=ttl_seconds,
+        )
 
+
+async def load_task_args(
+    docket: Docket, task_scope: str | None, task_id: str
+) -> dict[str, Any]:
+    """Load the stored tool arguments for a task's next leg."""
+    async with docket.redis() as redis:
+        raw = await redis.get(_args_key(docket, task_scope, task_id))
+    decoded = _decode(raw)
+    if not decoded:
+        return {}
+    parsed = json.loads(decoded)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def save_current_leg(
+    docket: Docket,
+    task_scope: str | None,
+    task_id: str,
+    leg_key: str,
+    leg_number: int,
+    ttl_seconds: int,
+) -> None:
+    """Record the latest leg's Docket execution key and its number."""
+    async with docket.redis() as redis:
+        await redis.set(
+            _current_leg_key(docket, task_scope, task_id), leg_key, ex=ttl_seconds
+        )
+        await redis.set(
+            _leg_number_key(docket, task_scope, task_id),
+            str(leg_number),
+            ex=ttl_seconds,
+        )
+
+
+async def load_current_leg(
+    docket: Docket, task_scope: str | None, task_id: str
+) -> tuple[str | None, int]:
+    """Return the current leg's execution key and number (defaults to 1)."""
+    async with docket.redis() as redis:
+        leg_key = _decode(
+            await redis.get(_current_leg_key(docket, task_scope, task_id))
+        )
+        leg_raw = _decode(await redis.get(_leg_number_key(docket, task_scope, task_id)))
     try:
-        async with docket.redis() as redis:
-            result = await redis.blpop([response_key], timeout=INPUT_TTL_SECONDS)
-    except (RedisError, OSError) as exc:
-        logger.warning("BLPOP failed for task %s input; cancelling: %s", task_id, exc)
-        result = None
+        leg_number = int(leg_raw) if leg_raw else 1
+    except ValueError:
+        leg_number = 1
+    return leg_key, leg_number
+
+
+# ---------------------------------------------------------------------------
+# Outstanding requests (written by the capture wrapper, read by tasks/get)
+# ---------------------------------------------------------------------------
+
+
+async def store_outstanding(
+    docket: Docket,
+    task_scope: str | None,
+    task_id: str,
+    leg: int,
+    serialized_requests: dict[str, dict[str, Any]],
+    request_state: str | None,
+    ttl_seconds: int = INPUT_TTL_SECONDS,
+) -> None:
+    """Persist a leg's outstanding input requests plus its carried state.
+
+    ``serialized_requests`` maps the tool's own request keys to serialized
+    ``InputRequest`` payloads. Each is stored under a freshly minted surfaced
+    key, with the surfaced-key → tool-key mapping recorded alongside so
+    ``tasks/update`` can translate answers back. ``request_state`` is written
+    when the leg carried one and cleared otherwise, so it travels to the next
+    leg verbatim.
+    """
+    requests_key = _requests_key(docket, task_scope, task_id, leg)
+    map_key = _map_key(docket, task_scope, task_id, leg)
+    state_key = _request_state_key(docket, task_scope, task_id)
 
     async with docket.redis() as redis:
-        await redis.hdel(requests_key, input_key)
-        await redis.delete(response_key)
-
-    if not result:
-        return mcp_types.ElicitResult(action="cancel", content=None)
-
-    _key, raw = result
-    response = json.loads(raw)
-    return mcp_types.ElicitResult(
-        action=response.get("action", "accept"),
-        content=response.get("content"),
-    )
+        for tool_key, payload in serialized_requests.items():
+            surfaced = _mint_surfaced_key(task_id)
+            await redis.hset(requests_key, surfaced, json.dumps(payload))
+            await redis.hset(map_key, surfaced, tool_key)
+        await redis.expire(requests_key, ttl_seconds)
+        await redis.expire(map_key, ttl_seconds)
+        if request_state is not None:
+            await redis.set(state_key, request_state, ex=ttl_seconds)
+        else:
+            await redis.delete(state_key)
 
 
 async def read_outstanding_inputs(
-    docket: Docket, task_scope: str | None, task_id: str
+    docket: Docket, task_scope: str | None, task_id: str, leg: int
 ) -> dict[str, Any]:
-    """Return the task's outstanding input requests, keyed by input key.
+    """Return a leg's outstanding input requests, keyed by surfaced key.
 
-    Empty when the task is not waiting on input. Consumed by ``tasks/get`` to
+    Empty when the leg is not waiting on input. Consumed by ``tasks/get`` to
     build the ``input_required`` status and its ``inputRequests`` snapshot.
     """
-    requests_key = _requests_key(docket, task_scope, task_id)
     async with docket.redis() as redis:
-        raw = await redis.hgetall(requests_key)
+        raw = await redis.hgetall(_requests_key(docket, task_scope, task_id, leg))
     outstanding: dict[str, Any] = {}
     for key, value in raw.items():
-        key_str = key.decode() if isinstance(key, bytes) else key
-        value_str = value.decode() if isinstance(value, bytes) else value
+        key_str = _decode(key)
+        value_str = _decode(value)
+        if key_str is None or value_str is None:
+            continue
         try:
             outstanding[key_str] = json.loads(value_str)
         except json.JSONDecodeError:
@@ -144,26 +262,136 @@ async def read_outstanding_inputs(
     return outstanding
 
 
-async def deliver_input_responses(
+async def _read_outstanding_map(
+    docket: Docket, task_scope: str | None, task_id: str, leg: int
+) -> dict[str, str]:
+    """Return the surfaced-key → tool-key mapping for a leg."""
+    async with docket.redis() as redis:
+        raw = await redis.hgetall(_map_key(docket, task_scope, task_id, leg))
+    mapping: dict[str, str] = {}
+    for key, value in raw.items():
+        key_str = _decode(key)
+        value_str = _decode(value)
+        if key_str is None or value_str is None:
+            continue
+        mapping[key_str] = value_str
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Responses (written by tasks/update, read by the next leg's context factory)
+# ---------------------------------------------------------------------------
+
+
+async def translate_responses(
     docket: Docket,
     task_scope: str | None,
     task_id: str,
+    leg: int,
     responses: dict[str, Any],
-) -> None:
-    """Deliver ``tasks/update`` responses to the parked worker(s).
+) -> dict[str, mcp_types.Result] | None:
+    """Translate a ``tasks/update`` payload into typed, tool-keyed responses.
 
-    For each response whose key names an outstanding request, pushes the
-    response onto that key's list (waking the worker's ``BLPOP``) and removes the
-    request. Responses for unknown or already-satisfied keys are ignored, as the
-    spec requires.
+    ``responses`` is keyed by the surfaced keys the client received for ``leg``.
+    Unknown or already-satisfied keys are ignored (SEP-2663). Each recognized
+    answer is validated into the result type its request maps to and re-keyed to
+    the tool's own request key. Returns ``None`` when nothing matched, so the
+    caller can treat a stale or empty update as an idempotent no-op.
     """
-    requests_key = _requests_key(docket, task_scope, task_id)
+    outstanding = await read_outstanding_inputs(docket, task_scope, task_id, leg)
+    if not outstanding:
+        return None
+    mapping = await _read_outstanding_map(docket, task_scope, task_id, leg)
+
+    translated: dict[str, mcp_types.Result] = {}
+    for surfaced_key, raw in responses.items():
+        payload = outstanding.get(surfaced_key)
+        if payload is None:
+            continue
+        tool_key = mapping.get(surfaced_key)
+        if tool_key is None:
+            continue
+        method = payload.get("method", "elicitation/create")
+        result_type = result_type_for_method(method)
+        translated[tool_key] = result_type.model_validate(raw)
+
+    return translated or None
+
+
+async def store_input_responses(
+    docket: Docket,
+    task_scope: str | None,
+    task_id: str,
+    translated: dict[str, mcp_types.Result],
+    ttl_seconds: int = INPUT_TTL_SECONDS,
+) -> None:
+    """Store translated responses for the next leg to read via ``ctx``.
+
+    The responses are stored typed-but-serialized (``{"type", "data"}``) so the
+    next leg's context factory reconstructs real result objects keyed by the
+    tool's own request keys.
+    """
+    stored = {
+        tool_key: {
+            "type": type(result).__name__,
+            "data": result.model_dump(by_alias=True, mode="json"),
+        }
+        for tool_key, result in translated.items()
+    }
     async with docket.redis() as redis:
-        for input_key, response in responses.items():
-            outstanding = await redis.hget(requests_key, input_key)
-            if outstanding is None:
-                continue
-            response_key = _response_key(docket, task_scope, task_id, input_key)
-            await redis.rpush(response_key, json.dumps(response))
-            await redis.expire(response_key, INPUT_TTL_SECONDS)
-            await redis.hdel(requests_key, input_key)
+        await redis.set(
+            _input_responses_key(docket, task_scope, task_id),
+            json.dumps(stored),
+            ex=ttl_seconds,
+        )
+
+
+async def clear_outstanding(
+    docket: Docket, task_scope: str | None, task_id: str, leg: int
+) -> None:
+    """Drop a leg's outstanding requests and mapping once it has been answered.
+
+    The answered surfaced keys are never reused (a later leg mints its own), so
+    a duplicate ``tasks/update`` naming them finds nothing and is a no-op.
+    """
+    async with docket.redis() as redis:
+        await redis.delete(_requests_key(docket, task_scope, task_id, leg))
+        await redis.delete(_map_key(docket, task_scope, task_id, leg))
+
+
+async def load_pending_input(
+    docket: Docket, task_scope: str | None, task_id: str
+) -> tuple[str | None, mcp_types.InputResponses | None]:
+    """Load the per-leg state a re-entered leg reads via ``ctx``.
+
+    Returns ``(request_state, input_responses)``: the opaque state carried
+    forward and the typed answers keyed by the tool's own request keys. Both are
+    ``None`` on the first leg (nothing has been asked yet).
+    """
+    async with docket.redis() as redis:
+        state_raw = _decode(
+            await redis.get(_request_state_key(docket, task_scope, task_id))
+        )
+        responses_raw = _decode(
+            await redis.get(_input_responses_key(docket, task_scope, task_id))
+        )
+
+    responses: dict[str, mcp_types.Result] | None = None
+    if responses_raw:
+        parsed = json.loads(responses_raw)
+        if isinstance(parsed, dict):
+            responses = {}
+            for tool_key, entry in parsed.items():
+                if not isinstance(entry, dict):
+                    continue
+                result_type = _RESULT_TYPE_BY_NAME.get(entry.get("type", ""))
+                if result_type is None:
+                    continue
+                responses[tool_key] = result_type.model_validate(entry.get("data"))
+
+    # The reconstructed values are the concrete result types the tool asked for;
+    # `InputResponses` is that union keyed by request key. The `Result` element
+    # type erases that for the checker, so narrow at the return.
+    if responses is None:
+        return state_raw, None
+    return state_raw, cast("mcp_types.InputResponses", responses)

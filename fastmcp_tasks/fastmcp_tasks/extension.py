@@ -203,10 +203,10 @@ class TasksExtension(ServerExtension):
     async def lifespan(self) -> AsyncIterator[None]:
         """Start the Docket backend/worker and install the worker-side hooks.
 
-        Installs core's background-context factory and in-task elicitation
-        handler for the duration so a worker's ``ctx`` (progress, elicitation)
-        functions, then runs the Docket lifespan. The hooks are process-global
-        and refcounted: with several servers in one process (each its own
+        Installs core's background-context factory and worker-server resolver for
+        the duration so a worker's ``ctx`` (progress, server resolution) works,
+        then runs the Docket lifespan. The hooks are process-global and
+        refcounted: with several servers in one process (each its own
         runtime-tree root), the hooks stay installed until the last tasks
         extension shuts down, so one server's exit cannot strand another
         server's in-flight workers.
@@ -231,20 +231,17 @@ _active_worker_hook_holds: int = 0
 
 
 def _install_worker_hooks() -> None:
-    from fastmcp.server.context import set_task_elicitation_handler
     from fastmcp.server.dependencies import (
         set_background_context_factory,
         set_worker_server_resolver,
     )
     from fastmcp_tasks import wire_production
     from fastmcp_tasks.context import make_task_context, resolve_worker_server
-    from fastmcp_tasks.input_store import elicit_in_task
 
     global _active_worker_hook_holds
     _active_worker_hook_holds += 1
     set_background_context_factory(make_task_context)
     set_worker_server_resolver(resolve_worker_server)
-    set_task_elicitation_handler(elicit_in_task)
     # Enable server-side production of the claimed CreateTaskResult on tools/call
     # (the SDK ships only claim consumption). Refcounted independently but
     # installed/released in lockstep with the worker hooks.
@@ -252,7 +249,6 @@ def _install_worker_hooks() -> None:
 
 
 def _release_worker_hooks() -> None:
-    from fastmcp.server.context import set_task_elicitation_handler
     from fastmcp.server.dependencies import (
         set_background_context_factory,
         set_worker_server_resolver,
@@ -263,7 +259,6 @@ def _release_worker_hooks() -> None:
     _active_worker_hook_holds -= 1
     if _active_worker_hook_holds <= 0:
         _active_worker_hook_holds = 0
-        set_task_elicitation_handler(None)
         set_worker_server_resolver(None)
         set_background_context_factory(None)
     wire_production.uninstall()

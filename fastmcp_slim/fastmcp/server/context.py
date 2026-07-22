@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 import weakref
-from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -125,29 +125,17 @@ def _warn_sampling_deprecated() -> None:
 _current_context: ContextVar[Context | None] = ContextVar("context", default=None)
 
 
-#: Hook installed by the tasks extension (``fastmcp-tasks``) so ``ctx.elicit()``
-#: works inside a background-task worker, where there is no live request to
-#: carry the elicitation. Core ships no task engine; the extension registers a
-#: handler here at construction and ``Context._elicit_for_task`` delegates to it.
-#: ``None`` (the default) means no tasks extension is active, so in-task
-#: elicitation raises a clear install hint.
-_task_elicitation_handler: (
-    Callable[[Context, str, dict[str, Any]], Awaitable[mcp_types.ElicitResult]] | None
-) = None
-
-
-def set_task_elicitation_handler(
-    handler: Callable[[Context, str, dict[str, Any]], Awaitable[mcp_types.ElicitResult]]
-    | None,
-) -> None:
-    """Install (or clear) the in-task elicitation handler.
-
-    Called by the tasks extension so a worker's ``ctx.elicit()`` parks an input
-    request the client answers via ``tasks/update`` (SEP-2663 poll-based input).
-    Passing ``None`` restores the default "requires the tasks extension" error.
-    """
-    global _task_elicitation_handler
-    _task_elicitation_handler = handler
+#: Error raised when a tool calls ``ctx.elicit()`` inside a background task.
+#: Background tasks gather input with the guard/return pattern (return an
+#: ``InputRequiredResult``), which the end-and-reenter machinery drives across
+#: worker legs. Imperative elicitation would require blocking a worker on a
+#: client round-trip, which end-and-reenter deliberately does not do.
+_TASK_ELICIT_ERROR = (
+    "Imperative ctx.elicit() is not supported inside a background task. Gather "
+    "input with the guard pattern instead: return an InputRequiredResult from "
+    "the tool (with input_requests), and read ctx.input_responses / "
+    "ctx.request_state when the task re-runs after the client answers."
+)
 
 
 TransportType = Literal["stdio", "sse", "streamable-http"]
@@ -273,6 +261,14 @@ class Context:
         self._origin_request_id: str | None = origin_request_id
         # Request-scoped state for non-serializable values (serializable=False)
         self._request_state: dict[str, Any] = {}
+        # Multi-round-trip input carried in-task (SEP-2322 guard channel). A
+        # foreground round recovers `input_responses`/`request_state` from the
+        # wire request; a worker has no wire request, so the tasks extension's
+        # in-task loop sets these between rounds and the properties below fall
+        # back to them. The guard tool reads `ctx.input_responses` identically
+        # in both modes — only the transport differs (task store vs wire params).
+        self._task_input_responses: mcp_types.InputResponses | None = None
+        self._task_request_state: str | None = None
 
     @property
     def is_background_task(self) -> bool:
@@ -441,9 +437,14 @@ class Context:
         keys match the `input_requests` map the tool minted; each value is the
         client's result for that request (an `ElicitResult`, `CreateMessageResult`,
         or `ListRootsResult`).
+
+        In a background task there is no wire request, so this falls back to the
+        responses the in-task guard loop delivered (see the tasks extension).
         """
         params = self._input_response_params()
-        return params.input_responses if params else None
+        if params is not None and params.input_responses is not None:
+            return params.input_responses
+        return self._task_input_responses
 
     @property
     def request_state(self) -> str | None:
@@ -455,9 +456,14 @@ class Context:
         before the tool runs, so tampering is rejected before this is read).
         `None` on the initial round. Use it to carry a small amount of computed
         state across rounds without re-deriving it.
+
+        In a background task there is no wire request, so this falls back to the
+        state the in-task guard loop re-injected (see the tasks extension).
         """
         params = self._input_response_params()
-        return params.request_state if params else None
+        if params is not None and params.request_state is not None:
+            return params.request_state
+        return self._task_request_state
 
     @property
     def lifespan_context(self) -> dict[str, Any]:
@@ -1349,9 +1355,10 @@ class Context:
                 ``value`` field. Same scope rules as ``response_title``.
 
         Note:
-            This method works transparently in both request and background task
-            contexts. In background task mode (SEP-1686), it will set the task
-            status to "input_required" and wait for the client to provide input.
+            Imperative elicitation is not available inside a background task
+            (calling it there raises a ``ToolError``). A task gathers input with
+            the guard pattern: return an ``InputRequiredResult`` and read
+            ``ctx.input_responses`` / ``ctx.request_state`` when the task re-runs.
         """
         if response_type is None and fastmcp.settings.deprecation_warnings:
             warnings.warn(
@@ -1371,24 +1378,22 @@ class Context:
         )
 
         if self.is_background_task:
-            # Background task mode: use task-aware elicitation
-            result = await self._elicit_for_task(
-                message=message,
-                schema=config.schema,
-            )
-        else:
-            # Foreground push path: server-initiated elicitation needs a
-            # back-channel, which the 2026-07-28 era removed (SEP-2577). Raise a
-            # clear era-aware error before hitting the wire instead of the SDK's
-            # opaque "Method not found". Handshake-era behavior is unchanged.
-            if self._is_modern_protocol():
-                raise ToolError(_ELICIT_MODERN_ERROR)
-            # Standard request mode: use session.elicit directly
-            result = await self.session.elicit(
-                message=message,
-                requested_schema=config.schema,
-                related_request_id=self.request_id,
-            )
+            # Background tasks gather input with the guard/return pattern, not
+            # imperative elicitation — the worker never blocks on a client
+            # round-trip. Fail fast with the guidance to use InputRequiredResult.
+            raise ToolError(_TASK_ELICIT_ERROR)
+        # Foreground push path: server-initiated elicitation needs a back-channel,
+        # which the 2026-07-28 era removed (SEP-2577). Raise a clear era-aware
+        # error before hitting the wire instead of the SDK's opaque "Method not
+        # found". Handshake-era behavior is unchanged.
+        if self._is_modern_protocol():
+            raise ToolError(_ELICIT_MODERN_ERROR)
+        # Standard request mode: use session.elicit directly
+        result = await self.session.elicit(
+            message=message,
+            requested_schema=config.schema,
+            related_request_id=self.request_id,
+        )
 
         if result.action == "accept":
             return handle_elicit_accept(config, result.content)
@@ -1398,48 +1403,6 @@ class Context:
             return CancelledElicitation()
         else:
             raise ValueError(f"Unexpected elicitation action: {result.action}")
-
-    async def _elicit_for_task(
-        self,
-        message: str,
-        schema: dict[str, Any],
-    ) -> mcp_types.ElicitResult:
-        """Send an elicitation request from a background task (SEP-1686).
-
-        This method handles elicitation when running in a Docket worker context,
-        where there's no active MCP request. It:
-        1. Sets the task status to "input_required"
-        2. Sends the elicitation request with task metadata
-        3. Waits for the client to provide input via tasks/sendInput
-        4. Returns the result and resumes task execution
-
-        Args:
-            message: The message to display to the user
-            schema: The JSON schema for the expected response
-
-        Returns:
-            ElicitResult with the user's response
-
-        Raises:
-            RuntimeError: If not running in a background task context
-        """
-        if not self.is_background_task:
-            raise RuntimeError(
-                "_elicit_for_task called but not in a background task context"
-            )
-
-        # In-task elicitation is provided by the tasks extension (SEP-2663)
-        # from the `fastmcp-tasks` package, which installs the handler below.
-        # Core ships no task engine, so without the extension this raises a
-        # clear install hint rather than reaching a wire the worker lacks.
-        handler = _task_elicitation_handler
-        if handler is None:
-            raise RuntimeError(
-                "In-task elicitation requires the tasks extension. Install "
-                "'fastmcp[tasks]' and register the tasks extension via "
-                "mcp.add_extension(...)."
-            )
-        return await handler(self, message, schema)
 
     def _make_state_key(self, key: str) -> str:
         """Create session-prefixed key for state storage."""

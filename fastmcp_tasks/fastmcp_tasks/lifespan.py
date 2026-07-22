@@ -94,6 +94,9 @@ async def docket_lifespan(
                     try:
                         yield
                     finally:
+                        # End-and-reenter never parks a worker on input, so a
+                        # task waiting for input holds no worker slot: cancelling
+                        # run_forever drains promptly regardless of task state.
                         worker_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await worker_task

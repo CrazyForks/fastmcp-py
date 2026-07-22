@@ -31,21 +31,16 @@ from mcp_types import (
     Implementation,
     InitializeRequestParams,
 )
-from pydantic import BaseModel
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.context import Context
 from fastmcp.server.dependencies import get_access_token
-from fastmcp.server.elicitation import (
-    AcceptedElicitation,
-    DeclinedElicitation,
-)
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
     running_task_server,
     submit_task,
-    update_task,
     wait_for_task,
 )
 
@@ -295,11 +290,17 @@ class TestContextClientExtensionBackgroundTask:
 
 
 class TestContextElicitBackgroundTask:
-    """Tests for Context.elicit() in background task mode."""
+    """Tests for Context.elicit() in background task mode.
 
-    async def test_elicit_raises_when_no_task_engine(self):
-        """elicit() fails fast when in a background task but no tasks extension
-        is installed to answer the request."""
+    Imperative elicitation is not supported inside a background task: the worker
+    never blocks on a client round-trip. A task gathers input with the guard
+    pattern (return an ``InputRequiredResult``), so ``ctx.elicit()`` in a task
+    fails fast with guidance rather than parking a worker.
+    """
+
+    async def test_elicit_raises_with_guard_guidance(self):
+        """elicit() inside a background task raises a ToolError pointing to the
+        guard/return pattern (InputRequiredResult)."""
         mcp = FastMCP("test")
         ctx = Context(mcp, task_id="test-task-123")
 
@@ -308,7 +309,7 @@ class TestContextElicitBackgroundTask:
 
         ctx._session = cast(ServerSession, MockSession())
 
-        with pytest.raises(RuntimeError, match="tasks extension"):
+        with pytest.raises(ToolError, match="InputRequiredResult"):
             await ctx.elicit("Need input", str)
 
 
@@ -391,99 +392,24 @@ class TestBackgroundTaskIntegration:
             "session_unavailable": True,
         }
 
-    async def test_elicit_accept_flow(self):
-        """E2E: tool elicits input, client accepts via tasks/update (poll)."""
-        mcp = FastMCP("elicit-accept-test")
+    async def test_imperative_elicit_fails_with_guard_guidance(self):
+        """A task=True tool that calls ctx.elicit() fails with the guard-pattern
+        error rather than parking a worker on a client round-trip."""
+        mcp = FastMCP("elicit-forbidden")
         mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def ask_name(ctx: Context) -> str:
             result = await ctx.elicit("What is your name?", str)
-            if isinstance(result, AcceptedElicitation):
-                return f"Hello, {result.data}!"
-            return "No name provided"
+            return str(result)
 
         async with running_task_server(mcp):
             created = await submit_task(mcp, "ask_name", {})
-            parked = await wait_for_task(
-                mcp, created.task_id, target_states=frozenset({"input_required"})
-            )
-            assert parked.input_requests is not None
-            key = next(iter(parked.input_requests))
-            await update_task(
-                mcp,
-                created.task_id,
-                {key: {"action": "accept", "content": {"value": "Bob"}}},
-            )
             final = await wait_for_task(mcp, created.task_id)
 
-        assert final.status == "completed"
-        assert final.result is not None
-        assert final.result["structuredContent"] == {"result": "Hello, Bob!"}
-
-    async def test_elicit_decline_flow(self):
-        """E2E: tool elicits input, client declines via tasks/update (poll)."""
-        mcp = FastMCP("elicit-decline-test")
-        mcp.add_extension(TasksExtension())
-
-        @mcp.tool(task=True)
-        async def optional_input(ctx: Context) -> str:
-            result = await ctx.elicit("Want to provide a name?", str)
-            if isinstance(result, DeclinedElicitation):
-                return "User declined"
-            if isinstance(result, AcceptedElicitation):
-                return f"Got: {result.data}"
-            return "Cancelled"
-
-        async with running_task_server(mcp):
-            created = await submit_task(mcp, "optional_input", {})
-            parked = await wait_for_task(
-                mcp, created.task_id, target_states=frozenset({"input_required"})
-            )
-            assert parked.input_requests is not None
-            key = next(iter(parked.input_requests))
-            await update_task(mcp, created.task_id, {key: {"action": "decline"}})
-            final = await wait_for_task(mcp, created.task_id)
-
-        assert final.status == "completed"
-        assert final.result is not None
-        assert final.result["structuredContent"] == {"result": "User declined"}
-
-    async def test_elicit_with_pydantic_model(self):
-        """E2E: tool elicits structured Pydantic input via tasks/update (poll)."""
-
-        class UserInfo(BaseModel):
-            name: str
-            age: int
-
-        mcp = FastMCP("elicit-pydantic-test")
-        mcp.add_extension(TasksExtension())
-
-        @mcp.tool(task=True)
-        async def get_user_info(ctx: Context) -> str:
-            result = await ctx.elicit("Provide user info", UserInfo)
-            if isinstance(result, AcceptedElicitation):
-                assert isinstance(result.data, UserInfo)
-                return f"{result.data.name} is {result.data.age}"
-            return "No info"
-
-        async with running_task_server(mcp):
-            created = await submit_task(mcp, "get_user_info", {})
-            parked = await wait_for_task(
-                mcp, created.task_id, target_states=frozenset({"input_required"})
-            )
-            assert parked.input_requests is not None
-            key = next(iter(parked.input_requests))
-            await update_task(
-                mcp,
-                created.task_id,
-                {key: {"action": "accept", "content": {"name": "Alice", "age": 30}}},
-            )
-            final = await wait_for_task(mcp, created.task_id)
-
-        assert final.status == "completed"
-        assert final.result is not None
-        assert final.result["structuredContent"] == {"result": "Alice is 30"}
+        assert final.status == "failed"
+        assert final.error is not None
+        assert "InputRequiredResult" in final.error["message"]
 
 
 class TestAccessTokenInBackgroundTasks:

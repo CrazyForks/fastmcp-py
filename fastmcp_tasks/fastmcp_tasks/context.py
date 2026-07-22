@@ -16,7 +16,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from fastmcp_tasks.keys import parse_task_key, task_redis_prefix
+from fastmcp_tasks.keys import (
+    leg_number_from_key,
+    parse_task_key,
+    task_redis_prefix,
+)
 
 try:
     from docket import TaskKey
@@ -107,6 +111,26 @@ def get_task_context() -> TaskContextInfo | None:
         return None
     except (ValueError, KeyError):
         return None
+
+
+def get_task_leg_number() -> int:
+    """Return the current leg number of the running task (1 outside a re-entry).
+
+    Each re-entry after client input runs as a fresh Docket execution under a
+    per-leg key; the capture wrapper reads this to scope a leg's outstanding
+    input requests so successive legs never collide in Redis.
+    """
+    from fastmcp_tasks.dependencies import is_docket_available
+
+    if not is_docket_available():
+        return 1
+
+    from docket.dependencies import current_execution
+
+    try:
+        return leg_number_from_key(current_execution.get().key)
+    except LookupError:
+        return 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +412,11 @@ async def make_task_context() -> Context | None:
     id; the server prefers the one registered at submission time so mounted
     tasks resolve to the child server. No live session is attached — SEP-2663
     input and status are polled, so the worker needs no back-channel.
+
+    For a re-entered leg (after the client answered a guard ask), the accumulated
+    per-leg state is loaded and injected so the tool reads ``ctx.input_responses``
+    / ``ctx.request_state`` identically to the foreground guard contract. Leg 1
+    loads nothing (both ``None``).
     """
     from fastmcp.server.context import Context
     from fastmcp.server.dependencies import get_server
@@ -407,4 +436,19 @@ async def make_task_context() -> Context | None:
         origin_request_id=origin_request_id,
     )
     await ctx.__aenter__()
+
+    docket = server._docket
+    if docket is None:
+        from fastmcp_tasks.dependencies import _current_docket
+
+        docket = _current_docket.get()
+    if docket is not None:
+        from fastmcp_tasks.input_store import load_pending_input
+
+        request_state, input_responses = await load_pending_input(
+            docket, task_info.task_scope, task_info.task_id
+        )
+        ctx._task_request_state = request_state
+        ctx._task_input_responses = input_responses
+
     return ctx

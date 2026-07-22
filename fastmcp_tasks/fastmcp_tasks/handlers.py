@@ -33,8 +33,21 @@ from fastmcp.tools.base import InputRequiredToolResult, Tool
 from fastmcp.utilities.tasks import DEFAULT_POLL_INTERVAL_MS
 from fastmcp.utilities.versions import VersionSpec
 from fastmcp_tasks.context import get_task_scope
-from fastmcp_tasks.input_store import deliver_input_responses, read_outstanding_inputs
-from fastmcp_tasks.keys import parse_task_key, task_redis_prefix
+from fastmcp_tasks.creation import enqueue_task_leg, registered_component_for_key
+from fastmcp_tasks.input_store import (
+    clear_outstanding,
+    load_current_leg,
+    load_task_args,
+    read_outstanding_inputs,
+    save_current_leg,
+    store_input_responses,
+    translate_responses,
+)
+from fastmcp_tasks.keys import (
+    leg_execution_key,
+    parse_task_key,
+    task_redis_prefix,
+)
 from fastmcp_tasks.models import (
     CancelTaskResult,
     GetTaskResult,
@@ -56,10 +69,6 @@ DOCKET_TO_MCP_STATE: dict[ExecutionState, str] = {
     ExecutionState.FAILED: "failed",
     ExecutionState.CANCELLED: "cancelled",
 }
-
-_WORKING_STATES = frozenset(
-    {ExecutionState.SCHEDULED, ExecutionState.QUEUED, ExecutionState.RUNNING}
-)
 
 
 def _task_not_found(task_id: str) -> MCPError:
@@ -96,12 +105,14 @@ def _ttl_ms(docket: Docket) -> int:
 
 async def _lookup_task(
     docket: Docket, task_scope: str | None, task_id: str
-) -> tuple[Any, str, str | None, int]:
-    """Resolve a task's execution and stored metadata within the caller's scope.
+) -> tuple[Any, str, int, str | None, int]:
+    """Resolve a task's current-leg execution and metadata within the scope.
 
-    Returns ``(execution, task_key, created_at, poll_interval_ms)``. Raises the
-    shared "not found" error when the scope-prefixed metadata is absent or the
-    execution has expired.
+    Returns ``(execution, base_task_key, leg_number, created_at,
+    poll_interval_ms)``. The execution is the *current leg* (the latest Docket
+    execution), which for a re-entered task differs from the base task key.
+    Raises the shared "not found" error when the scope-prefixed metadata is
+    absent or the current leg's execution has expired.
     """
     prefix = task_redis_prefix(task_scope)
     meta_key = docket.key(f"{prefix}:{task_id}")
@@ -115,11 +126,13 @@ async def _lookup_task(
         values = await redis.mget(meta_key, created_at_key, poll_key)  # ty: ignore[too-many-positional-arguments]
     task_key_bytes, created_at_bytes, poll_bytes = values
 
-    task_key = task_key_bytes.decode("utf-8") if task_key_bytes else None
-    if not task_key:
+    base_task_key = task_key_bytes.decode("utf-8") if task_key_bytes else None
+    if not base_task_key:
         raise _task_not_found(task_id)
 
-    execution = await docket.get_execution(task_key)
+    current_leg_key, leg_number = await load_current_leg(docket, task_scope, task_id)
+    execution_key = current_leg_key or base_task_key
+    execution = await docket.get_execution(execution_key)
     if not execution:
         raise _task_not_found(task_id)
 
@@ -132,7 +145,7 @@ async def _lookup_task(
     except (ValueError, UnicodeDecodeError):
         poll_interval_ms = DEFAULT_POLL_INTERVAL_MS
 
-    return execution, task_key, created_at, poll_interval_ms
+    return execution, base_task_key, leg_number, created_at, poll_interval_ms
 
 
 async def _resolve_tool(server: FastMCP, task_key: str) -> Tool:
@@ -160,17 +173,21 @@ async def _resolve_tool(server: FastMCP, task_key: str) -> Tool:
 def _inline_result(tool: Tool, raw_value: Any) -> dict[str, Any]:
     """Convert a completed task's raw return into an inlined CallToolResult dict.
 
-    A guard tool that returned an ``InputRequiredResult`` from inside a task is
-    rejected: multi-round-trip guards need a live request to answer the prompt
-    and cannot complete as a task.
+    A completed task should never carry an ``InputRequiredResult``: a function
+    tool's guard returns are captured by the end-and-reenter wrapper (see
+    ``input_loop.py``), which records the leg's outstanding requests and ends the
+    leg (returning ``None``), so ``tasks/get`` reports ``input_required`` rather
+    than inlining. Reaching here with a guard result means a component type the
+    wrapper does not wrap (e.g. a base ``Tool``) returned one, which the task
+    path cannot drive — a safety net, not an expected path.
     """
     if isinstance(raw_value, mcp_types.InputRequiredResult | InputRequiredToolResult):
         raise MCPError(
             code=mcp_types.INTERNAL_ERROR,
             message=(
-                f"Tool {tool.name!r} requested input while running as a background "
-                "task. Input-required (multi-round-trip) tools need a live request "
-                "to answer the prompt and cannot run as tasks."
+                f"Tool {tool.name!r} returned an input-required result as a task, "
+                "but its component type is not driven by the in-task guard loop. "
+                "Guard-pattern tasks are supported for function tools."
             ),
         )
     mcp_result = tool.convert_result(raw_value).to_mcp_result()
@@ -193,9 +210,13 @@ async def tasks_get(server: FastMCP, task_id: str) -> GetTaskResult:
         raise _task_not_found(task_id)
 
     task_scope = get_task_scope()
-    execution, task_key, created_at, poll_interval_ms = await _lookup_task(
-        docket, task_scope, task_id
-    )
+    (
+        execution,
+        base_task_key,
+        leg_number,
+        created_at,
+        poll_interval_ms,
+    ) = await _lookup_task(docket, task_scope, task_id)
     await execution.sync()
 
     created_at_iso = _normalize_iso_timestamp(created_at)
@@ -218,16 +239,17 @@ async def tasks_get(server: FastMCP, task_id: str) -> GetTaskResult:
             **payload,
         )
 
-    # An outstanding input request outranks the Docket "running" state: the task
-    # is parked in the worker waiting for tasks/update, so it is input_required.
-    if execution.state in _WORKING_STATES:
-        outstanding = await read_outstanding_inputs(docket, task_scope, task_id)
+    if execution.state == ExecutionState.COMPLETED:
+        # A guard leg ends its Docket execution and records outstanding input
+        # requests to Redis: a completed leg with outstanding requests is the
+        # task waiting for tasks/update (input_required), not a finished task.
+        outstanding = await read_outstanding_inputs(
+            docket, task_scope, task_id, leg_number
+        )
         if outstanding:
             return build("input_required", input_requests=outstanding)
-
-    if execution.state == ExecutionState.COMPLETED:
         raw_value = await execution.get_result(timeout=timedelta(seconds=0))
-        tool = await _resolve_tool(server, task_key)
+        tool = await _resolve_tool(server, base_task_key)
         return build("completed", result=_inline_result(tool, raw_value))
 
     if execution.state == ExecutionState.FAILED:
@@ -257,26 +279,66 @@ async def tasks_get(server: FastMCP, task_id: str) -> GetTaskResult:
 async def tasks_update(
     server: FastMCP, task_id: str, input_responses: dict[str, Any]
 ) -> UpdateTaskResult:
-    """Handle ``tasks/update``: deliver input responses to the parked worker."""
+    """Handle ``tasks/update``: answer a guard leg and re-enter the task.
+
+    The responses are keyed by the surfaced keys ``tasks/get`` reported. Unknown
+    or already-satisfied keys are ignored (SEP-2663). When at least one answer
+    matches the current leg's outstanding requests, they are translated to the
+    tool's own keys, stored for the next leg, and a fresh Docket execution (the
+    next leg) is enqueued with the task's arguments. The worker is never blocked;
+    re-entry is the whole mechanism. A stale or empty update is an idempotent
+    no-op.
+    """
     docket = server._docket
     if docket is None:
         raise _task_not_found(task_id)
 
     task_scope = get_task_scope()
     # Resolve within scope so a cross-scope update is a "not found", not a no-op.
-    await _lookup_task(docket, task_scope, task_id)
-    await deliver_input_responses(docket, task_scope, task_id, input_responses)
+    _execution, base_task_key, leg_number, _created_at, _poll = await _lookup_task(
+        docket, task_scope, task_id
+    )
+
+    translated = await translate_responses(
+        docket, task_scope, task_id, leg_number, input_responses
+    )
+    if translated is None:
+        # Nothing matched the current leg's outstanding requests: the leg was
+        # already answered, or the keys are unknown. Idempotent no-op.
+        return UpdateTaskResult()
+
+    # Store the answers for the next leg to read, then enqueue that leg. Ordering
+    # matters: the answers must be in Redis before the next leg's worker context
+    # loads them, and current_leg must not advance to an execution that is not
+    # yet durable — so enqueue (with its durable wait) precedes the pointer swap.
+    await store_input_responses(docket, task_scope, task_id, translated)
+
+    component = await registered_component_for_key(
+        server, parse_task_key(base_task_key)["component_identifier"]
+    )
+    raw_arguments = await load_task_args(docket, task_scope, task_id)
+    next_leg = leg_number + 1
+    next_leg_key = leg_execution_key(base_task_key, next_leg)
+
+    await enqueue_task_leg(server, docket, component, raw_arguments, next_leg_key)
+    ttl_seconds = int(docket.execution_ttl.total_seconds())
+    await save_current_leg(
+        docket, task_scope, task_id, next_leg_key, next_leg, ttl_seconds
+    )
+    # The answered leg's surfaced keys are now superseded; drop them so they are
+    # never reused (SEP-2663 L350).
+    await clear_outstanding(docket, task_scope, task_id, leg_number)
     return UpdateTaskResult()
 
 
 async def tasks_cancel(server: FastMCP, task_id: str) -> CancelTaskResult:
-    """Handle ``tasks/cancel``: cooperatively cancel the task, empty ack."""
+    """Handle ``tasks/cancel``: cooperatively cancel the current leg, empty ack."""
     docket = server._docket
     if docket is None:
         raise _task_not_found(task_id)
 
     task_scope = get_task_scope()
-    execution, _task_key, _created_at, _poll = await _lookup_task(
+    execution, _base_task_key, _leg, _created_at, _poll = await _lookup_task(
         docket, task_scope, task_id
     )
     await docket.cancel(execution.key)

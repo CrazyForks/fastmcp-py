@@ -26,7 +26,6 @@ from mcp.shared.exceptions import MCPError
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.exceptions import ToolError
-from fastmcp.server import context as core_context
 from fastmcp.server.dependencies import bind_request_context
 from fastmcp.tools.base import ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID, TaskConfig
@@ -356,6 +355,8 @@ async def test_worker_hooks_survive_sibling_server_shutdown():
     each running a TasksExtension refcount them, so the hooks clear only when
     the last extension lifespan exits.
     """
+    from fastmcp.server import dependencies as core_dependencies
+
     server_a = _tasks_server()
     server_b = _tasks_server()
 
@@ -363,8 +364,8 @@ async def test_worker_hooks_survive_sibling_server_shutdown():
         await stack_b.enter_async_context(server_b._lifespan_manager())
         async with AsyncExitStack() as stack_a:
             await stack_a.enter_async_context(server_a._lifespan_manager())
-            assert core_context._task_elicitation_handler is not None
+            assert core_dependencies._background_context_factory is not None
         # Server A has shut down; server B's workers still need the hooks.
-        assert core_context._task_elicitation_handler is not None
+        assert core_dependencies._background_context_factory is not None
     # The last extension exited; hooks are cleared.
-    assert core_context._task_elicitation_handler is None
+    assert core_dependencies._background_context_factory is None

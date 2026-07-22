@@ -1170,7 +1170,9 @@ class TestTaskExecution:
         if hasattr(Docket, "_memory_server"):
             delattr(Docket, "_memory_server")
 
-    async def test_guard_result_from_task_is_rejected(self, reset_docket_memory_server):
+    async def test_guard_result_from_task_parks_for_input(
+        self, reset_docket_memory_server
+    ):
         mcp = FastMCP("guard-task")
         mcp.add_extension(TasksExtension())
 
@@ -1182,14 +1184,20 @@ class TestTaskExecution:
                 request_state=None,
             )
 
-        # A guard's `InputRequiredResult` only makes sense against a live
-        # request. Submitting `book_flight` as a background task and then
-        # reading it back must reject the guard result: `tasks/get` raises when
-        # it tries to inline the completed task's InputRequiredResult.
+        # A function-tool guard is driven as a task by the in-task reentrant
+        # loop: submitting `book_flight` parks its input request on the poll
+        # surface (`input_required`), where a client answers it via
+        # `tasks/update`. The full round-trip lives in
+        # tests/tasks/server/test_guard_reentrant.py.
         async with running_task_server(mcp):
             created = await submit_task(mcp, "book_flight", {})
-            with pytest.raises(MCPError, match="background task"):
-                await wait_for_task(mcp, created.task_id)
+            parked = await wait_for_task(
+                mcp,
+                created.task_id,
+                target_states=frozenset({"input_required"}),
+            )
+            assert parked.status == "input_required"
+            assert parked.input_requests
 
 
 class TestHttpTransport:

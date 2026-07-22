@@ -37,6 +37,44 @@ _AUTH_TAG = "auth"
 _ANON_TAG = "anon"
 _VALID_TAGS = (_AUTH_TAG, _ANON_TAG)
 
+# Delimiter separating the stable base task key from a per-leg suffix. A single
+# background task runs as a sequence of Docket executions (legs): the first leg
+# uses the base key, and each re-entry (after the client answers input) enqueues
+# a fresh execution under `{base}{_LEG_DELIMITER}{n}`. The base key encodes every
+# segment with `quote(safe="")`, which percent-encodes `#` to `%23`, so a literal
+# `#` never appears inside the base key and is an unambiguous leg boundary. All
+# task-identity parsing strips the leg suffix, so the scope/task-id/component a
+# leg resolves to are identical across every leg of the same task.
+_LEG_DELIMITER = "#"
+
+
+def leg_execution_key(base_task_key: str, leg: int) -> str:
+    """Build the Docket execution key for a given leg of a task.
+
+    Leg 1 uses the bare base key (so existing single-leg behavior is unchanged);
+    later legs append `#leg{n}` so each re-entry is a distinct Docket execution
+    while still parsing back to the same task scope, id, and component.
+    """
+    if leg <= 1:
+        return base_task_key
+    return f"{base_task_key}{_LEG_DELIMITER}leg{leg}"
+
+
+def base_task_key(execution_key: str) -> str:
+    """Strip any per-leg suffix, returning the stable base task key."""
+    return execution_key.split(_LEG_DELIMITER, 1)[0]
+
+
+def leg_number_from_key(execution_key: str) -> int:
+    """Return the leg number a Docket execution key encodes (leg 1 = base key)."""
+    _base, sep, suffix = execution_key.partition(_LEG_DELIMITER)
+    if not sep:
+        return 1
+    try:
+        return int(suffix.removeprefix("leg"))
+    except ValueError:
+        return 1
+
 
 def build_task_key(
     task_scope: str | None,
@@ -97,6 +135,9 @@ def parse_task_key(task_key: str) -> TaskKeyParts:
         >>> parse_task_key("anon:task456:tool:my_tool")
         `{'task_scope': None, 'client_task_id': 'task456', 'task_type': 'tool', 'component_identifier': 'my_tool'}`
     """
+    # A per-leg execution key (`{base}#leg{n}`) parses to the same identity as
+    # its base: every leg of a task shares one scope, id, and component.
+    task_key = base_task_key(task_key)
     tag, _, rest = task_key.partition(":")
     if tag not in _VALID_TAGS or not rest:
         raise ValueError(
