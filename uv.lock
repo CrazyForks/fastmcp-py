@@ -10,7 +10,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-07-07T19:26:14.279827Z"
+exclude-newer = "2026-07-15T00:39:08.277536Z"
 exclude-newer-span = "P1W"
 
 [options.exclude-newer-package]
@@ -26,6 +26,7 @@ members = [
     "fastmcp",
     "fastmcp-remote",
     "fastmcp-slim",
+    "fastmcp-tasks",
 ]
 
 [[package]]
@@ -864,7 +865,7 @@ openai = [
     { name = "fastmcp-slim", extra = ["openai"] },
 ]
 tasks = [
-    { name = "fastmcp-slim", extra = ["tasks"] },
+    { name = "fastmcp-tasks" },
 ]
 
 [package.dev-dependencies]
@@ -908,7 +909,7 @@ requires-dist = [
     { name = "fastmcp-slim", extras = ["code-mode"], marker = "extra == 'code-mode'", editable = "fastmcp_slim" },
     { name = "fastmcp-slim", extras = ["gemini"], marker = "extra == 'gemini'", editable = "fastmcp_slim" },
     { name = "fastmcp-slim", extras = ["openai"], marker = "extra == 'openai'", editable = "fastmcp_slim" },
-    { name = "fastmcp-slim", extras = ["tasks"], marker = "extra == 'tasks'", editable = "fastmcp_slim" },
+    { name = "fastmcp-tasks", marker = "extra == 'tasks'", editable = "fastmcp_tasks" },
 ]
 provides-extras = ["anthropic", "apps", "azure", "code-mode", "gemini", "openai", "tasks"]
 
@@ -1025,9 +1026,6 @@ server = [
     { name = "watchfiles" },
     { name = "websockets" },
 ]
-tasks = [
-    { name = "pydocket" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -1065,7 +1063,6 @@ requires-dist = [
     { name = "pydantic", extras = ["email"], specifier = ">=2.12.0" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = "==0.0.17" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
-    { name = "pydocket", marker = "extra == 'tasks'", specifier = ">=0.20.0" },
     { name = "pyjwt", marker = "extra == 'azure'", specifier = ">=2.12.0" },
     { name = "pyperclip", marker = "extra == 'server'", specifier = ">=1.9.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
@@ -1081,7 +1078,21 @@ requires-dist = [
     { name = "watchfiles", marker = "extra == 'server'", specifier = ">=1.0.0" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=15.0.1" },
 ]
-provides-extras = ["anthropic", "apps", "azure", "client", "code-mode", "gemini", "mcp", "openai", "server", "tasks"]
+provides-extras = ["anthropic", "apps", "azure", "client", "code-mode", "gemini", "mcp", "openai", "server"]
+
+[[package]]
+name = "fastmcp-tasks"
+source = { editable = "fastmcp_tasks" }
+dependencies = [
+    { name = "fastmcp-slim", extra = ["server"] },
+    { name = "pydocket" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastmcp-slim", extras = ["server"], editable = "fastmcp_slim" },
+    { name = "pydocket", specifier = ">=0.20.0" },
+]
 
 [[package]]
 name = "google-auth"
