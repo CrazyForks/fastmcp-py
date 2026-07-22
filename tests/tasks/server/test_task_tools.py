@@ -1,60 +1,77 @@
-"""
-Tests for server-side tool task behavior.
+"""Server-side tool task behavior for SEP-2663 tasks.
 
-Tests tool-specific task handling, parallel to test_task_prompts.py
-and test_task_resources.py.
+Covers task=True/False decoration, argument coercion parity between the
+synchronous and task-submission paths (including the strict-validation flag),
+immediate task metadata on submission, background execution with status polling,
+and the rule that a forbidden (task=False) tool runs synchronously even when the
+caller opts into tasks. Driven in-process via the task helpers because there is
+no client task-submission API until Phase 4.
 """
+
+from __future__ import annotations
 
 import asyncio
 import functools
 
-import mcp_types
 import pytest
-from fastmcp_tasks.client import ToolTask
+from fastmcp_tasks.models import CreateTaskResult
 from pydantic import BaseModel
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-from fastmcp.client.messages import MessageHandler
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError
 from fastmcp.tools.function_tool import _resolve_param_hints
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    _opted_in_request,
+    auth_scope,
+    call_tool_without_optin,
+    get_task,
+    run_task,
+    running_task_server,
+    submit_task,
+    wait_for_task,
 )
-
-
-@pytest.fixture
-async def tool_server():
-    """Create a FastMCP server with task-enabled tools."""
-    mcp = FastMCP("tool-task-server")
-
-    @mcp.tool(task=True)
-    async def simple_tool(message: str) -> str:
-        """A simple tool for testing."""
-        return f"Processed: {message}"
-
-    @mcp.tool(task=False)
-    async def sync_only_tool(message: str) -> str:
-        """Tool with task=False."""
-        return f"Sync: {message}"
-
-    return mcp
 
 
 class _Item(BaseModel):
     value: str
 
 
-async def test_task_tool_validates_model_arguments():
-    """Model-typed args are coerced to model instances for task calls (#4349).
+async def _opted_in_call(server: FastMCP, name: str, arguments: dict | None = None):
+    """Run a `tools/call` WITH the tasks opt-in bound (used to prove sync paths)."""
+    with auth_scope(None), _opted_in_request(name, arguments or {}, None):
+        return await server.call_tool(name, arguments or {})
 
-    The synchronous path validates arguments through the function's
-    TypeAdapter, so a parameter typed as a Pydantic model arrives as a model
-    instance. The task path must coerce the same way rather than passing the
-    raw dict through to the function.
+
+def _tool_server() -> FastMCP:
+    mcp = FastMCP("tool-task-server")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def simple_tool(message: str) -> str:
+        return f"Processed: {message}"
+
+    @mcp.tool(task=False)
+    async def sync_only_tool(message: str) -> str:
+        return f"Sync: {message}"
+
+    return mcp
+
+
+# ---------------------------------------------------------------------------
+# Argument coercion parity
+# ---------------------------------------------------------------------------
+
+
+async def test_task_tool_coerces_model_arguments():
+    """Model-typed args are coerced to model instances on the task path (#4349).
+
+    The synchronous path validates arguments through the function's TypeAdapter,
+    so a parameter typed as a Pydantic model arrives as a model instance. The
+    task path must coerce identically rather than passing the raw dict through.
     """
     mcp = FastMCP("tool-task-validation-server")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def inspect_items(item: _Item, items: list[_Item]) -> dict[str, str]:
@@ -62,102 +79,65 @@ async def test_task_tool_validates_model_arguments():
 
     arguments = {"item": {"value": "a"}, "items": [{"value": "b"}]}
     expected = {"item": "_Item", "element": "_Item"}
+    async with running_task_server(mcp):
+        sync_result = await call_tool_without_optin(mcp, "inspect_items", arguments)
+        final = await run_task(mcp, "inspect_items", arguments)
 
-    async with Client(mcp, mode="legacy") as client:
-        sync_result = await client.call_tool("inspect_items", arguments)
-        task = await client.call_tool("inspect_items", arguments, task=True)
-        task_result = await task.result()
-
-    assert sync_result.data == expected
-    assert task_result.data == expected
+    assert sync_result.structured_content == expected
+    assert final.result["structuredContent"] == expected
 
 
-async def test_task_tool_invalid_arguments_fail_before_task_state():
-    """Invalid task arguments are rejected before any task state is created.
+async def test_task_arguments_are_coerced_like_sync_path():
+    """A string-for-int arg coerces on the task path exactly as on the sync path."""
+    mcp = FastMCP("coerce-task-server")
+    mcp.add_extension(TasksExtension())
 
-    Coercion runs up front in submit_to_docket, so a validation failure surfaces
-    before the task's Redis metadata and initial "working" status notification
-    are written. Otherwise an invalid input would orphan a task the client had
-    already observed via that notification.
-    """
+    @mcp.tool(task=True)
+    async def square(n: int) -> int:
+        return n * n
 
-    class _Recorder(MessageHandler):
-        def __init__(self):
-            super().__init__()
-            self.methods: list[str] = []
-
-        async def on_notification(self, message: mcp_types.ServerNotification) -> None:
-            self.methods.append(message.method)
-
-    server = FastMCP("tool-task-invalid-args-server")
-
-    @server.tool(task=True)
-    async def needs_item(item: _Item) -> str:
-        return item.value
-
-    recorder = _Recorder()
-    async with Client(server, mode="legacy", message_handler=recorder) as client:
-        # `item` is missing its required `value` field.
-        task = await client.call_tool("needs_item", {"item": {}}, task=True)
-        assert task.returned_immediately
-        with pytest.raises(ToolError):
-            await task.result()
-
-    assert "notifications/tasks/status" not in recorder.methods
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "square", {"n": "1"})
+    assert final.status == "completed"
+    assert final.result["structuredContent"] == {"result": 1}
 
 
 async def test_task_submission_honors_strict_input_validation():
-    """Strict input validation applies to task submissions, not just sync calls.
+    """Strict input validation rejects lax coercion on the task path too.
 
-    With ``strict_input_validation=True``, a lax coercion like ``{"n": "1"}``
-    for an ``int`` parameter is rejected on the synchronous path. The task
-    submission path must reject it identically rather than silently coercing
-    and queueing it — otherwise ``task=True`` would bypass the strict flag.
+    With ``strict_input_validation=True`` a lax coercion like ``{"n": "1"}`` for
+    an ``int`` parameter is rejected on the synchronous path. Task submission must
+    reject it identically rather than silently coercing and queueing it.
     """
+    mcp = FastMCP("strict-task-server", strict_input_validation=True)
+    mcp.add_extension(TasksExtension())
 
-    class _Recorder(MessageHandler):
-        def __init__(self):
-            super().__init__()
-            self.methods: list[str] = []
-
-        async def on_notification(self, message: mcp_types.ServerNotification) -> None:
-            self.methods.append(message.method)
-
-    server = FastMCP("strict-task-server", strict_input_validation=True)
-
-    @server.tool(task=True)
+    @mcp.tool(task=True)
     async def square(n: int) -> int:
         return n * n
 
-    recorder = _Recorder()
-    async with Client(server, mode="legacy", message_handler=recorder) as client:
+    async with running_task_server(mcp):
         # Sync path rejects the string-for-int coercion under strict validation.
-        with pytest.raises(ToolError):
-            await client.call_tool("square", {"n": "1"})
-
-        # Task path must reject it too, before any task state is created — so no
-        # status notification is emitted for the orphaned submission.
-        task = await client.call_tool("square", {"n": "1"}, task=True)
-        assert task.returned_immediately
-        with pytest.raises(ToolError):
-            await task.result()
-
-    assert "notifications/tasks/status" not in recorder.methods
+        with pytest.raises(ValidationError):
+            await call_tool_without_optin(mcp, "square", {"n": "1"})
+        # Task submission must reject it too, before any task state is created.
+        with pytest.raises(ValidationError):
+            await submit_task(mcp, "square", {"n": "1"})
 
 
-async def test_task_submission_valid_argument_under_strict_validation():
+async def test_valid_argument_submits_under_strict_validation():
     """A well-typed argument still submits fine when strict validation is on."""
-    server = FastMCP("strict-task-valid-server", strict_input_validation=True)
+    mcp = FastMCP("strict-task-valid-server", strict_input_validation=True)
+    mcp.add_extension(TasksExtension())
 
-    @server.tool(task=True)
+    @mcp.tool(task=True)
     async def square(n: int) -> int:
         return n * n
 
-    async with Client(server, mode="legacy") as client:
-        task = await client.call_tool("square", {"n": 4}, task=True)
-        assert not task.returned_immediately
-        result = await task.result()
-        assert result.data == 16
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "square", {"n": 4})
+    assert final.status == "completed"
+    assert final.result["structuredContent"] == {"result": 16}
 
 
 def test_resolve_param_hints_handles_partials():
@@ -176,72 +156,59 @@ def test_resolve_param_hints_handles_partials():
     assert hints["items"] == list[_Item]
 
 
-async def test_synchronous_tool_call_unchanged(tool_server):
-    """Tools without task metadata execute synchronously as before."""
-    async with Client(tool_server, mode="legacy") as client:
-        # Regular call without task metadata
-        result = await client.call_tool("simple_tool", {"message": "hello"})
-
-        # Should execute immediately and return result
-        assert "Processed: hello" in str(result)
+# ---------------------------------------------------------------------------
+# Decoration and execution
+# ---------------------------------------------------------------------------
 
 
-async def test_tool_with_task_metadata_returns_immediately(tool_server):
-    """Tools with task metadata return immediately with ToolTask object."""
-    async with Client(tool_server, mode="legacy") as client:
-        # Call with task metadata
-        task = await client.call_tool("simple_tool", {"message": "test"}, task=True)
-        assert task
-        assert not task.returned_immediately
-
-        assert isinstance(task, ToolTask)
-        assert isinstance(task.task_id, str)
-        assert len(task.task_id) > 0
+async def test_synchronous_tool_call_without_opt_in():
+    """A tool called without a tasks opt-in executes synchronously as before."""
+    mcp = _tool_server()
+    async with running_task_server(mcp):
+        result = await call_tool_without_optin(mcp, "simple_tool", {"message": "hello"})
+        assert not isinstance(result, CreateTaskResult)
+        assert result.structured_content == {"result": "Processed: hello"}
 
 
-async def test_tool_task_executes_in_background(tool_server):
-    """Tool task is submitted to Docket and executes in background."""
-    execution_started = asyncio.Event()
-    execution_completed = asyncio.Event()
+async def test_tool_task_returns_metadata_immediately():
+    """Submitting a task returns task metadata with a server-generated id."""
+    mcp = _tool_server()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "simple_tool", {"message": "test"})
+        assert isinstance(created, CreateTaskResult)
+        assert isinstance(created.task_id, str)
+        assert created.task_id
+        assert created.status == "working"
 
-    @tool_server.tool(task=True)
-    async def coordinated_tool() -> str:
-        """Tool with coordination points."""
-        execution_started.set()
-        await execution_completed.wait()
+
+async def test_tool_task_executes_in_background():
+    """A submitted task runs in the background and can be polled to completion."""
+    mcp = FastMCP("bg-server")
+    mcp.add_extension(TasksExtension())
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    @mcp.tool(task=True)
+    async def coordinated() -> str:
+        started.set()
+        await finish.wait()
         return "completed"
 
-    async with Client(tool_server, mode="legacy") as client:
-        task = await client.call_tool("coordinated_tool", task=True)
-        assert task
-        assert not task.returned_immediately
-
-        # Wait for execution to start
-        await asyncio.wait_for(execution_started.wait(), timeout=2.0)
-
-        # Task should still be working
-        status = await task.status()
-        assert status.status in ["working"]
-
-        # Signal completion
-        execution_completed.set()
-        await task.wait(timeout=2.0)
-
-        result = await task.result()
-        assert result.data == "completed"
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "coordinated", {})
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        working = await get_task(mcp, created.task_id)
+        assert working.status == "working"
+        finish.set()
+        final = await wait_for_task(mcp, created.task_id)
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "completed"}
 
 
-async def test_forbidden_mode_tool_rejects_task_calls(tool_server):
-    """Tools with task=False (mode=forbidden) reject task-augmented calls."""
-    async with Client(tool_server, mode="legacy") as client:
-        # Calling with task=True when task=False should return error
-        task = await client.call_tool(
-            "sync_only_tool", {"message": "test"}, task=True, raise_on_error=False
-        )
-        assert task
-        assert task.returned_immediately
-
-        result = await task.result()
-        # New behavior: mode="forbidden" returns an error
-        assert result.is_error
-        assert "does not support task-augmented execution" in str(result)
+async def test_forbidden_tool_runs_sync_even_with_opt_in():
+    """A task=False tool runs synchronously even when the caller opts into tasks."""
+    mcp = _tool_server()
+    async with running_task_server(mcp):
+        result = await _opted_in_call(mcp, "sync_only_tool", {"message": "test"})
+        assert not isinstance(result, CreateTaskResult)
+        assert result.structured_content == {"result": "Sync: test"}

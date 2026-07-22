@@ -654,7 +654,15 @@ class FastMCP(
         can reach it), its method bindings are wired onto the low-level server,
         and it is recorded for capability advertisement, interception, and
         lifespan entry. Registering two extensions with the same identifier is
-        an error.
+        an error, as is registering after the server's lifespan has started —
+        the extension's lifespan could no longer run, leaving it silently
+        half-active.
+
+        Extensions are served by the server they are registered on. A mounted
+        child's extensions do not propagate to the root: the root serves the
+        wire, so only root-registered extensions advertise capabilities and
+        answer methods (matching the lifespan, which also defers to the root).
+        Register extensions on the server you run.
         """
         from fastmcp.server.extensions import (
             build_method_handler,
@@ -668,6 +676,12 @@ class FastMCP(
             raise ValueError(
                 f"An extension with identifier {extension.identifier!r} is "
                 "already registered."
+            )
+        if self._lifespan_result_set:
+            raise RuntimeError(
+                f"Cannot register extension {extension.identifier!r}: the "
+                "server's lifespan has already started, so the extension's "
+                "lifespan would never run. Register extensions before serving."
             )
 
         extension._bind(self)

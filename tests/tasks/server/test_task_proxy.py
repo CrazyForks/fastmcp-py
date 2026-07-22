@@ -1,37 +1,54 @@
 """
-Tests for MCP SEP-1686 task protocol behavior through proxy servers.
+Tests for SEP-2663 task behavior through proxy servers.
 
-Proxy servers explicitly forbid task-augmented execution. All proxy components
-(tools, prompts, resources) have task_config.mode="forbidden".
-
-Clients connecting through proxies can:
-- Execute tools/prompts/resources normally (sync execution)
-- NOT use task-augmented execution (task=True fails gracefully for tools,
-  raises MCPError for prompts/resources)
+SEP-2663 tasks are tools-only. Proxy servers force every proxied tool to
+`task_config.mode="forbidden"`, so a tool that is `task=True` on the backend
+runs *synchronously* through the proxy and is never tasked — even when the
+client opts the tasks extension in for the request.
 """
 
 import pytest
-from mcp.shared.exceptions import MCPError
-from mcp_types import TextContent, TextResourceContents
+from docket import Docket
+from fastmcp_tasks.models import CreateTaskResult
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.client.transports import FastMCPTransport
 from fastmcp.server import create_proxy
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp.tools.base import ToolResult
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    _opted_in_request,
+    auth_scope,
+    running_task_server,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_docket_memory_server():
+    """Force a fresh memory:// Docket server bound to each test's event loop."""
+    if hasattr(Docket, "_memory_server"):
+        delattr(Docket, "_memory_server")
+    yield
+    if hasattr(Docket, "_memory_server"):
+        delattr(Docket, "_memory_server")
+
+
+async def call_tool_with_optin(server: FastMCP, name: str, arguments: dict):
+    """Run a `tools/call` with the tasks opt-in bound into the request context."""
+    with auth_scope(None), _opted_in_request(name, arguments, None):
+        return await server.call_tool(name, arguments)
 
 
 @pytest.fixture
 def backend_server() -> FastMCP:
-    """Create a backend server with task-enabled components.
+    """A backend server with a task-enabled tool.
 
-    The backend has tasks enabled, but the proxy should NOT forward
-    task execution - it should treat all components as forbidden.
+    The backend has tasks enabled, but the proxy must NOT forward task
+    execution — it treats every proxied tool as forbidden.
     """
     mcp = FastMCP("backend-server")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def add_numbers(a: int, b: int) -> int:
@@ -43,154 +60,57 @@ def backend_server() -> FastMCP:
         """Tool that only supports synchronous execution."""
         return f"sync: {message}"
 
-    @mcp.prompt(task=True)
-    async def greeting_prompt(name: str) -> str:
-        """A prompt that can execute as a task."""
-        return f"Hello, {name}! Welcome to the system."
-
-    @mcp.resource("data://info.txt", task=True)
-    async def info_resource() -> str:
-        """A resource that can be read as a task."""
-        return "Important information from the backend"
-
-    @mcp.resource("data://user/{user_id}.json", task=True)
-    async def user_resource(user_id: str) -> str:
-        """A resource template that can execute as a task."""
-        return f'{{"id": "{user_id}", "name": "User {user_id}"}}'
-
     return mcp
 
 
 @pytest.fixture
 def proxy_server(backend_server: FastMCP) -> FastMCP:
-    """Create a proxy server that forwards to the backend."""
-    return create_proxy(FastMCPTransport(backend_server))
+    """A proxy server that forwards to the backend, with tasks advertised."""
+    proxy = create_proxy(FastMCPTransport(backend_server))
+    proxy.add_extension(TasksExtension())
+    return proxy
 
 
 class TestProxyToolsSyncExecution:
-    """Test that tools work normally through proxy (sync execution)."""
+    """Tools work normally through the proxy (synchronous execution)."""
 
     async def test_tool_sync_execution_works(self, proxy_server: FastMCP):
-        """Tool called without task=True works through proxy."""
-        async with Client(proxy_server, mode="legacy") as client:
+        """A tool called without opting in works through the proxy."""
+        async with Client(proxy_server) as client:
             result = await client.call_tool("add_numbers", {"a": 5, "b": 3})
             assert "8" in str(result)
 
     async def test_sync_only_tool_works(self, proxy_server: FastMCP):
-        """Sync-only tool works through proxy."""
-        async with Client(proxy_server, mode="legacy") as client:
+        """A sync-only tool works through the proxy."""
+        async with Client(proxy_server) as client:
             result = await client.call_tool("sync_only_tool", {"message": "test"})
             assert "sync: test" in str(result)
 
 
 class TestProxyToolsTaskForbidden:
-    """Test that tools with task=True are forbidden through proxy."""
+    """A proxied tool never tasks, even when the client opts in."""
 
-    async def test_tool_task_returns_error_immediately(self, proxy_server: FastMCP):
-        """Tool called with task=True through proxy returns error immediately."""
-        async with Client(proxy_server, mode="legacy") as client:
-            task = await client.call_tool(
-                "add_numbers", {"a": 5, "b": 3}, task=True, raise_on_error=False
-            )
-
-            # Should return immediately (forbidden behavior)
-            assert task.returned_immediately
-
-            # Result should be an error
-            result = await task.result()
-            assert result.is_error
-
-    async def test_sync_only_tool_task_returns_error_immediately(
+    async def test_task_enabled_tool_runs_sync_through_proxy(
         self, proxy_server: FastMCP
     ):
-        """Sync-only tool with task=True also returns error immediately."""
-        async with Client(proxy_server, mode="legacy") as client:
-            task = await client.call_tool(
-                "sync_only_tool",
-                {"message": "test"},
-                task=True,
-                raise_on_error=False,
+        """A backend `task=True` tool runs sync through the forbidden proxy."""
+        async with running_task_server(proxy_server):
+            result = await call_tool_with_optin(
+                proxy_server, "add_numbers", {"a": 5, "b": 3}
             )
 
-            assert task.returned_immediately
-            result = await task.result()
-            assert result.is_error
+            # The forbidden proxy tool declines to task even with the opt-in.
+            assert not isinstance(result, CreateTaskResult)
+            assert isinstance(result, ToolResult)
+            assert result.structured_content == {"result": 8}
 
+    async def test_sync_only_tool_runs_sync_through_proxy(self, proxy_server: FastMCP):
+        """A sync-only tool also runs sync through the proxy with the opt-in."""
+        async with running_task_server(proxy_server):
+            result = await call_tool_with_optin(
+                proxy_server, "sync_only_tool", {"message": "test"}
+            )
 
-class TestProxyPromptsSyncExecution:
-    """Test that prompts work normally through proxy (sync execution)."""
-
-    async def test_prompt_sync_execution_works(self, proxy_server: FastMCP):
-        """Prompt called without task=True works through proxy."""
-        async with Client(proxy_server, mode="legacy") as client:
-            result = await client.get_prompt("greeting_prompt", {"name": "Alice"})
-            assert isinstance(result.messages[0].content, TextContent)
-            assert "Hello, Alice!" in result.messages[0].content.text
-
-
-class TestProxyPromptsTaskForbidden:
-    """Test that prompts with task=True are forbidden through proxy."""
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_prompt_task_raises_mcp_error(self, proxy_server: FastMCP):
-        """Prompt called with task=True through proxy raises MCPError."""
-        async with Client(proxy_server, mode="legacy") as client:
-            with pytest.raises(MCPError) as exc_info:
-                await client.get_prompt("greeting_prompt", {"name": "Alice"}, task=True)
-
-            assert "does not support task-augmented execution" in str(exc_info.value)
-
-
-class TestProxyResourcesSyncExecution:
-    """Test that resources work normally through proxy (sync execution)."""
-
-    async def test_resource_sync_execution_works(self, proxy_server: FastMCP):
-        """Resource read without task=True works through proxy."""
-        async with Client(proxy_server, mode="legacy") as client:
-            result = await client.read_resource("data://info.txt")
-            assert isinstance(result[0], TextResourceContents)
-            assert "Important information from the backend" in result[0].text
-
-    async def test_resource_template_sync_execution_works(self, proxy_server: FastMCP):
-        """Resource template without task=True works through proxy."""
-        async with Client(proxy_server, mode="legacy") as client:
-            result = await client.read_resource("data://user/42.json")
-            assert isinstance(result[0], TextResourceContents)
-            assert '"id": "42"' in result[0].text
-
-
-class TestProxyResourcesTaskForbidden:
-    """Test that resources with task=True are forbidden through proxy."""
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_resource_task_raises_mcp_error(self, proxy_server: FastMCP):
-        """Resource read with task=True through proxy raises MCPError."""
-        async with Client(proxy_server, mode="legacy") as client:
-            with pytest.raises(MCPError) as exc_info:
-                await client.read_resource("data://info.txt", task=True)
-
-            assert "does not support task-augmented execution" in str(exc_info.value)
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_resource_template_task_raises_mcp_error(self, proxy_server: FastMCP):
-        """Resource template with task=True through proxy raises MCPError."""
-        async with Client(proxy_server, mode="legacy") as client:
-            with pytest.raises(MCPError) as exc_info:
-                await client.read_resource("data://user/42.json", task=True)
-
-            assert "does not support task-augmented execution" in str(exc_info.value)
+            assert not isinstance(result, CreateTaskResult)
+            assert isinstance(result, ToolResult)
+            assert result.structured_content == {"result": "sync: test"}

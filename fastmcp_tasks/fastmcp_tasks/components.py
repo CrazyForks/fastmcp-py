@@ -3,8 +3,8 @@
 During the SEP-1686 -> SEP-2663 migration the ``register_with_docket`` /
 ``add_to_docket`` / ``coerce_task_arguments`` methods were removed from the core
 ``FastMCPComponent`` classes (Tool, Resource, ResourceTemplate, Prompt). Their
-bodies are preserved here verbatim as type-dispatched functions so Phase 3 can
-wire them into ``TasksExtension`` without reconstructing the calling conventions.
+bodies live here as type-dispatched functions that ``TasksExtension`` wires into
+the Docket engine, preserving each type's calling convention.
 
 The functions dispatch on the concrete component type because each type splats
 its arguments differently into the Docket-registered callable:
@@ -15,9 +15,9 @@ its arguments differently into the Docket-registered callable:
 - Base ``Tool``/``Resource``/``ResourceTemplate``/``Prompt`` register their
   ``run``/``read``/``render`` entry point and pass arguments positionally.
 
-Only tools carry a task-capable ``task_config`` after the migration (SEP-2663 is
-tools-only); the resource/prompt/template branches are retained for engine
-completeness and Phase 3's decision, not because core still declares them.
+Only tools carry a task-capable ``task_config`` (SEP-2663 is tools-only); the
+resource/prompt/template branches are retained for engine completeness, not
+because core still declares them.
 """
 
 from __future__ import annotations

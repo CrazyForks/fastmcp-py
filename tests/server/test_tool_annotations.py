@@ -1,11 +1,11 @@
 from typing import Any
 
-import pytest
 from mcp_types import Tool as MCPTool
 from mcp_types import ToolAnnotations, ToolExecution
 
 from fastmcp import Client, FastMCP
 from fastmcp.tools.base import Tool
+from fastmcp_tasks import TasksExtension
 from tests.conftest import make_server_request_context
 
 
@@ -221,25 +221,25 @@ async def test_tool_functionality_with_annotations():
         assert result.data == {"name": "test_item", "value": 42}
 
 
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_task_execution_auto_populated_for_task_enabled_tool():
     """Test that execution.task_support is automatically set when tool has task=True."""
     mcp = FastMCP("Test Server")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def background_tool(data: str) -> str:
         """A tool that runs in background."""
         return f"Processed: {data}"
 
-    # `execution.task_support` (SEP-1686) is advertised in the handshake-era
-    # tool listing only; the modern listing omits it.
-    async with Client(mcp, mode="legacy") as client:
-        tools_result = await client.list_tools()
-        assert len(tools_result) == 1
-        assert tools_result[0].name == "background_tool"
-        assert isinstance(tools_result[0], MCPTool)
-        assert isinstance(tools_result[0].execution, ToolExecution)
-        assert tools_result[0].execution.task_support == "optional"
+    # The rendered tool descriptor auto-populates `execution.task_support` from
+    # the tool's task config. (The modern wire drops the SEP-1686 `execution`
+    # field, so this is asserted on the server-side render.)
+    tool = await mcp.get_tool("background_tool")
+    assert tool is not None
+    mcp_tool = tool.to_mcp_tool()
+    assert isinstance(mcp_tool, MCPTool)
+    assert isinstance(mcp_tool.execution, ToolExecution)
+    assert mcp_tool.execution.task_support == "optional"
 
 
 async def test_task_execution_omitted_for_task_disabled_tool():

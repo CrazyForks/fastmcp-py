@@ -1,238 +1,127 @@
-"""
-Tests for task protocol methods.
+"""Task protocol methods for SEP-2663: tasks/get, tasks/cancel, tasks/update.
 
-Tests the tasks/get, tasks/result, and tasks/list JSON-RPC protocol methods.
+SEP-1686's `tasks/result` and `tasks/list` are removed — `tasks/get` inlines the
+completed result. This suite covers the surviving methods, driven in-process via
+the task helpers because there is no client task-submission API until Phase 4.
 """
+
+from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
+from fastmcp_tasks.models import UpdateTaskResult
 from mcp.shared.exceptions import MCPError
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp.exceptions import ToolError
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    cancel_task,
+    get_task,
+    run_task,
+    running_task_server,
+    submit_task,
+    update_task,
+    wait_for_task,
 )
 
 
-@pytest.fixture
-async def endpoint_server():
-    """Create a server with background tasks and HTTP transport."""
+def _methods_server() -> FastMCP:
     mcp = FastMCP("endpoint-test-server")
+    mcp.add_extension(TasksExtension())
 
-    @mcp.tool(task=True)  # Enable background execution
+    @mcp.tool(task=True)
     async def quick_tool(value: int) -> int:
-        """Returns the value immediately."""
         return value * 2
 
-    @mcp.tool(task=True)  # Enable background execution
+    @mcp.tool(task=True)
     async def error_tool() -> str:
-        """Always raises an error."""
-        raise RuntimeError("Task failed!")
-
-    @mcp.tool(task=True)  # Enable background execution
-    async def slow_tool() -> str:
-        """A slow tool for testing cancellation.
-
-        Never completes on its own - the only test that submits this task
-        cancels it well before any real-time completion would matter.
-        """
-        await asyncio.Event().wait()
-        return "done"
+        raise ToolError("Task failed!")
 
     return mcp
 
 
-async def test_tasks_get_endpoint_returns_status(endpoint_server):
-    """POST /tasks/get returns task status."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        # Submit a task
-        task = await client.call_tool("quick_tool", {"value": 21}, task=True)
+async def test_tasks_get_returns_status_and_inlined_result():
+    """`tasks/get` reports status and inlines the completed tool result."""
+    mcp = _methods_server()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "quick_tool", {"value": 21})
+        got = await get_task(mcp, created.task_id)
+        assert got.task_id == created.task_id
+        assert got.status in {"working", "completed"}
 
-        # Check status immediately - should be submitted or working
-        status = await task.status()
-        assert status.task_id == task.task_id
-        assert status.status in ["working", "completed"]
-
-        # Wait for completion
-        await task.wait(timeout=2.0)
-
-        # Check again - should be completed
-        status = await task.status()
-        assert status.status == "completed"
+        final = await wait_for_task(mcp, created.task_id)
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": 42}
+        assert final.result["isError"] is False
 
 
-async def test_tasks_get_endpoint_includes_poll_interval(endpoint_server):
-    """Task status includes pollFrequency hint."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        task = await client.call_tool("quick_tool", {"value": 42}, task=True)
-
-        status = await task.status()
-        assert status.poll_interval is not None
-        assert isinstance(status.poll_interval, int)
-
-
-async def test_tasks_result_endpoint_returns_result_when_completed(endpoint_server):
-    """POST /tasks/result returns the tool result when completed."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        task = await client.call_tool("quick_tool", {"value": 21}, task=True)
-
-        # Wait for completion and get result
-        result = await task.result()
-        assert result.data == 42  # 21 * 2
+async def test_tasks_get_includes_poll_interval():
+    """`tasks/get` includes the poll-interval hint."""
+    mcp = _methods_server()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "quick_tool", {"value": 42})
+        got = await get_task(mcp, created.task_id)
+        assert got.poll_interval_ms == 5000
 
 
-async def test_tasks_result_endpoint_errors_if_not_completed(endpoint_server):
-    """POST /tasks/result returns error if task not completed yet."""
-    # Create a task that won't complete until signaled
-    completion_signal = asyncio.Event()
+async def test_tasks_get_returns_error_for_failed_task():
+    """`tasks/get` surfaces the error for a failed task rather than a result."""
+    mcp = _methods_server()
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "error_tool", {})
+        assert final.status == "failed"
+        assert final.error is not None
+        assert "Task failed!" in final.error["message"]
+        assert final.result is None
 
-    @endpoint_server.tool(task=True)  # Enable background execution
-    async def blocked_tool() -> str:
-        await completion_signal.wait()
+
+async def test_tasks_get_unknown_id_raises_not_found():
+    """`tasks/get` for an unknown id raises a not-found error (-32602)."""
+    mcp = _methods_server()
+    async with running_task_server(mcp):
+        with pytest.raises(MCPError, match="not found"):
+            await get_task(mcp, "nonexistent-task-id")
+
+
+async def test_tasks_cancel_transitions_to_cancelled():
+    """`tasks/cancel` transitions a running task to cancelled."""
+    mcp = FastMCP("cancel-test")
+    mcp.add_extension(TasksExtension())
+    release = asyncio.Event()
+
+    @mcp.tool(task=True)
+    async def slow_tool() -> str:
+        await release.wait()
         return "done"
 
-    async with Client(endpoint_server, mode="legacy") as client:
-        task = await client.call_tool("blocked_tool", task=True)
-
-        # Try to get result immediately (task still running)
-        with pytest.raises(Exception):  # Should raise or return error
-            await client.get_task_result(task.task_id)
-
-        # Cleanup - signal completion
-        completion_signal.set()
-
-
-async def test_tasks_result_endpoint_errors_if_task_not_found(endpoint_server):
-    """POST /tasks/result returns error for non-existent task."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        # Try to get result for non-existent task
-        with pytest.raises(Exception):
-            await client.get_task_result("non-existent-task-id")
-
-
-async def test_tasks_result_endpoint_returns_error_for_failed_task(endpoint_server):
-    """POST /tasks/result returns error information for failed tasks."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        task = await client.call_tool("error_tool", task=True)
-
-        # Wait for task to fail
-        await task.wait(state="failed", timeout=2.0)
-
-        # Getting result should raise or return error info
-        with pytest.raises(Exception) as exc_info:
-            await task.result()
-
-        assert (
-            "failed" in str(exc_info.value).lower()
-            or "error" in str(exc_info.value).lower()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "slow_tool", {})
+        await cancel_task(mcp, created.task_id)
+        # Release so the worker unwinds whether or not it observed the cancel first.
+        release.set()
+        final = await wait_for_task(
+            mcp,
+            created.task_id,
+            target_states=frozenset({"cancelled", "completed"}),
         )
+        assert final.status in {"cancelled", "completed"}
 
 
-async def test_tasks_list_endpoint_session_isolation(endpoint_server):
-    """list_tasks returns only tasks submitted by this client."""
-    # Since client tracks tasks locally, this tests client-side tracking
-    async with Client(endpoint_server, mode="legacy") as client:
-        # Submit multiple tasks (server generates IDs)
-        tasks = []
-        for i in range(3):
-            task = await client.call_tool("quick_tool", {"value": i}, task=True)
-            tasks.append(task)
+async def test_tasks_update_acks_empty():
+    """`tasks/update` returns an empty ack."""
+    mcp = FastMCP("update-test")
+    mcp.add_extension(TasksExtension())
+    release = asyncio.Event()
 
-        # Wait for all to complete
-        for task in tasks:
-            await task.wait(timeout=2.0)
+    @mcp.tool(task=True)
+    async def waiter() -> str:
+        await release.wait()
+        return "done"
 
-        # List tasks - should see all 3
-        response = await client.list_tasks()
-        returned_ids = [t["taskId"] for t in response["tasks"]]
-        task_ids = [t.task_id for t in tasks]
-        assert len(returned_ids) == 3
-        assert all(tid in task_ids for tid in returned_ids)
-
-
-async def test_get_status_nonexistent_task_raises_error(endpoint_server):
-    """Getting status for nonexistent task raises MCP error (per SEP-1686 SDK behavior)."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        # Try to get status for task that was never created
-        # Per SDK implementation: raises ValueError which becomes JSON-RPC error
-        with pytest.raises(MCPError, match="Task nonexistent-task-id not found"):
-            await client.get_task_status("nonexistent-task-id")
-
-
-async def test_task_cancellation_workflow(endpoint_server):
-    """Task can be cancelled, transitioning to cancelled state."""
-    async with Client(endpoint_server, mode="legacy") as client:
-        # Submit slow task
-        task = await client.call_tool("slow_tool", {}, task=True)
-
-        # Wait until the task is tracked as working before cancelling
-        deadline = time.monotonic() + 5.0
-        status = await task.status()
-        while status.status != "working" and time.monotonic() < deadline:
-            await asyncio.sleep(0.005)
-            status = await task.status()
-
-        # Cancel the task
-        await task.cancel()
-
-        # Poll until cancellation is reflected in task status
-        deadline = time.monotonic() + 5.0
-        status = await task.status()
-        while status.status != "cancelled" and time.monotonic() < deadline:
-            await asyncio.sleep(0.005)
-            status = await task.status()
-
-        # Task should be in cancelled state
-        assert status.status == "cancelled"
-
-
-@pytest.mark.timeout(10)
-async def test_task_cancellation_interrupts_running_coroutine(endpoint_server):
-    """Task cancellation actually interrupts the running coroutine.
-
-    This verifies that when a task is cancelled, the underlying asyncio
-    coroutine receives CancelledError rather than continuing to completion.
-    Requires pydocket >= 0.16.2.
-
-    See: https://github.com/PrefectHQ/fastmcp/issues/2679
-    """
-    started = asyncio.Event()
-    was_interrupted = asyncio.Event()
-    completed_normally = asyncio.Event()
-
-    @endpoint_server.tool(task=True)
-    async def interruptible_tool() -> str:
-        started.set()
-        try:
-            # Never completes on its own - the test cancels this task well
-            # before any real-time completion would matter, so a genuinely
-            # suspended coroutine (rather than a fixed-duration sleep) is
-            # enough to prove cancellation delivers CancelledError.
-            await asyncio.Event().wait()
-            completed_normally.set()
-            return "completed"
-        except asyncio.CancelledError:
-            was_interrupted.set()
-            raise
-
-    async with Client(endpoint_server, mode="legacy") as client:
-        task = await client.call_tool("interruptible_tool", {}, task=True)
-
-        # Wait for the tool to actually start executing
-        await asyncio.wait_for(started.wait(), timeout=5.0)
-
-        # Cancel the task
-        await task.cancel()
-
-        # Wait for cancellation to propagate
-        await asyncio.wait_for(was_interrupted.wait(), timeout=5.0)
-
-        # The coroutine should have been interrupted, not completed normally
-        assert was_interrupted.is_set(), "Task was not interrupted by cancellation"
-        assert not completed_normally.is_set(), (
-            "Task completed instead of being cancelled"
-        )
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "waiter", {})
+        ack = await update_task(mcp, created.task_id, {})
+        assert isinstance(ack, UpdateTaskResult)
+        release.set()

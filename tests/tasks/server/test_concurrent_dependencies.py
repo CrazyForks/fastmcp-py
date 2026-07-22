@@ -8,37 +8,40 @@ Regression tests for:
 
 import asyncio
 
-import pytest
-
 from fastmcp import FastMCP
-from fastmcp.client import Client
 from fastmcp.server.context import Context
 from fastmcp.server.dependencies import (
     Progress,
     get_access_token,
     get_http_headers,
 )
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    call_tool_without_optin,
+    running_task_server,
+    submit_task,
+    wait_for_task,
 )
 
 
 async def test_concurrent_foreground_tools_with_context():
-    """Multiple concurrent tool calls sharing the same CurrentContext() default
+    """Multiple concurrent tool calls sharing the same Context() default
     should not raise ValueError from ContextVar token resets (#3654)."""
     mcp = FastMCP("test")
     results: list[str] = []
 
-    @mcp.tool()
+    @mcp.tool
     async def slow_tool(name: str, ctx: Context) -> str:
         await asyncio.sleep(0.01)
         results.append(name)
         return f"done:{name}"
 
-    async with Client(mcp, mode="legacy") as client:
-        tasks = [client.call_tool("slow_tool", {"name": f"task-{i}"}) for i in range(4)]
-        outcomes = await asyncio.gather(*tasks)
+    outcomes = await asyncio.gather(
+        *[
+            call_tool_without_optin(mcp, "slow_tool", {"name": f"task-{i}"})
+            for i in range(4)
+        ]
+    )
 
     assert len(outcomes) == 4
     for outcome in outcomes:
@@ -50,7 +53,7 @@ async def test_concurrent_foreground_tools_with_progress():
     should not raise AssertionError from _impl being None (#3656)."""
     mcp = FastMCP("test")
 
-    @mcp.tool()
+    @mcp.tool
     async def variable_tool(
         name: str, delay: float, progress: Progress = Progress()
     ) -> str:
@@ -62,14 +65,14 @@ async def test_concurrent_foreground_tools_with_progress():
         await progress.increment()
         return f"done:{name}"
 
-    async with Client(mcp, mode="legacy") as client:
-        tasks = [
-            client.call_tool(
-                "variable_tool", {"name": f"t-{i}", "delay": 0.01 * (i + 1)}
+    outcomes = await asyncio.gather(
+        *[
+            call_tool_without_optin(
+                mcp, "variable_tool", {"name": f"t-{i}", "delay": 0.01 * (i + 1)}
             )
             for i in range(4)
         ]
-        outcomes = await asyncio.gather(*tasks)
+    )
 
     assert len(outcomes) == 4
     for outcome in outcomes:
@@ -77,31 +80,33 @@ async def test_concurrent_foreground_tools_with_progress():
 
 
 async def test_concurrent_background_tasks_with_context():
-    """Multiple concurrent background tasks sharing _CurrentContext() should
+    """Multiple concurrent background tasks sharing Context() should
     not raise ValueError from ContextVar token resets (#3654)."""
     mcp = FastMCP("test")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def bg_tool(name: str, ctx: Context) -> str:
         await asyncio.sleep(0.01)
         return f"bg:{name}"
 
-    async with Client(mcp, mode="legacy") as client:
-        task_handles = [
-            await client.call_tool("bg_tool", {"name": f"bg-{i}"}, task=True)
-            for i in range(4)
+    async with running_task_server(mcp):
+        created = [
+            await submit_task(mcp, "bg_tool", {"name": f"bg-{i}"}) for i in range(4)
         ]
-        results = await asyncio.gather(*[t.result() for t in task_handles])
+        finals = await asyncio.gather(*[wait_for_task(mcp, c.task_id) for c in created])
 
-    assert len(results) == 4
-    for result in results:
-        assert result.content[0].text.startswith("bg:")
+    assert len(finals) == 4
+    for final in finals:
+        assert final.status == "completed"
+        assert final.result["structuredContent"]["result"].startswith("bg:")
 
 
 async def test_concurrent_background_tasks_with_progress():
     """Multiple concurrent background tasks sharing Progress() should
     not raise AssertionError from _impl being None (#3656)."""
     mcp = FastMCP("test")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def bg_progress_tool(
@@ -115,63 +120,62 @@ async def test_concurrent_background_tasks_with_progress():
         await progress.increment()
         return f"bg:{name}"
 
-    async with Client(mcp, mode="legacy") as client:
-        task_handles = [
-            await client.call_tool(
+    async with running_task_server(mcp):
+        created = [
+            await submit_task(
+                mcp,
                 "bg_progress_tool",
                 {"name": f"bg-{i}", "delay": 0.01 * (i + 1)},
-                task=True,
             )
             for i in range(4)
         ]
-        results = await asyncio.gather(*[t.result() for t in task_handles])
+        finals = await asyncio.gather(*[wait_for_task(mcp, c.task_id) for c in created])
 
-    assert len(results) == 4
-    for result in results:
-        assert result.content[0].text.startswith("bg:")
+    assert len(finals) == 4
+    for final in finals:
+        assert final.status == "completed"
+        assert final.result["structuredContent"]["result"].startswith("bg:")
 
 
 async def test_dependency_aenter_returns_fresh_instances():
-    """Verify that Dependency.__aenter__ returns independent per-invocation
-    objects, not the shared default."""
+    """Dependency.__aenter__ returns independent per-invocation objects,
+    not the shared default."""
     mcp = FastMCP("test")
 
     instances: list[Context] = []
 
-    @mcp.tool()
+    @mcp.tool
     async def capture_context(ctx: Context) -> str:
         instances.append(ctx)
         return "ok"
 
-    async with Client(mcp, mode="legacy") as client:
-        await asyncio.gather(
-            client.call_tool("capture_context", {}),
-            client.call_tool("capture_context", {}),
-        )
+    await asyncio.gather(
+        call_tool_without_optin(mcp, "capture_context", {}),
+        call_tool_without_optin(mcp, "capture_context", {}),
+    )
 
     assert len(instances) == 2
     assert instances[0] is not instances[1]
 
 
 async def test_progress_aenter_returns_fresh_instances():
-    """Verify that Progress.__aenter__ returns independent per-invocation
-    objects, not the shared default."""
+    """Progress.__aenter__ returns independent per-invocation objects,
+    not the shared default."""
     progress_instances: list[Progress] = []
 
     mcp = FastMCP("test")
 
-    @mcp.tool()
+    @mcp.tool
     async def capture_progress(progress: Progress = Progress()) -> str:
         progress_instances.append(progress)
         await progress.set_total(1)
         await progress.increment()
         return "ok"
 
-    async with Client(mcp, mode="legacy") as client:
-        await asyncio.gather(
-            client.call_tool("capture_progress", {}),
-            client.call_tool("capture_progress", {}),
-        )
+    await asyncio.gather(
+        call_tool_without_optin(mcp, "capture_progress", {}),
+        call_tool_without_optin(mcp, "capture_progress", {}),
+    )
 
     assert len(progress_instances) == 2
     assert progress_instances[0] is not progress_instances[1]
@@ -179,29 +183,32 @@ async def test_progress_aenter_returns_fresh_instances():
 
 
 async def test_sync_context_functions_work_in_background_without_deps():
-    """Sync functions like get_http_request() should work in background tasks
-    even when the tool declares no Context or CurrentRequest dependency.
+    """Sync helpers like get_http_headers() work in a background task even when
+    the tool declares no Context or CurrentRequest dependency.
 
-    This exercises the sync Redis fallback path (_get_task_snapshot_sync →
-    _load_snapshot_sync_redis) which must work with both memory:// (fakeredis)
-    and real Redis backends.
+    This exercises the sync snapshot fallback path which must work with the
+    memory:// (fakeredis) backend.
     """
     mcp = FastMCP("test")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def bare_sync_access() -> dict[str, str]:
         headers = get_http_headers()
         return {"has_headers": str(bool(headers))}
 
-    async with Client(mcp, mode="legacy") as client:
-        task = await client.call_tool("bare_sync_access", {}, task=True)
-        result = await task.result()
-        assert result.data == {"has_headers": "False"}
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "bare_sync_access", {})
+        final = await wait_for_task(mcp, created.task_id)
+
+    assert final.status == "completed"
+    assert final.result["structuredContent"] == {"has_headers": "False"}
 
 
 async def test_sync_context_functions_work_in_background_with_context():
-    """Sync functions work via ContextVar when _CurrentContext loads the snapshot."""
+    """Sync helpers work via ContextVar when Context loads the snapshot."""
     mcp = FastMCP("test")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def context_sync_access(ctx: Context) -> dict[str, str]:
@@ -213,7 +220,9 @@ async def test_sync_context_functions_work_in_background_with_context():
             "is_background": str(ctx.is_background_task),
         }
 
-    async with Client(mcp, mode="legacy") as client:
-        task = await client.call_tool("context_sync_access", {}, task=True)
-        result = await task.result()
-        assert result.data["is_background"] == "True"
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "context_sync_access", {})
+        final = await wait_for_task(mcp, created.task_id)
+
+    assert final.status == "completed"
+    assert final.result["structuredContent"]["is_background"] == "True"

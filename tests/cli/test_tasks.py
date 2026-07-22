@@ -1,31 +1,30 @@
 """Tests for the fastmcp tasks CLI."""
 
 import pytest
+from fastmcp_tasks.settings import docket_settings
 from fastmcp_tasks.worker_cli import check_distributed_backend, tasks_app
-
-from fastmcp.utilities.tests import temporary_settings
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
-)
 
 
 class TestCheckDistributedBackend:
     """Test the distributed backend checker function."""
 
-    def test_succeeds_with_redis_url(self):
+    def test_succeeds_with_redis_url(self, monkeypatch: pytest.MonkeyPatch):
         """Test that it succeeds with Redis URL."""
-        with temporary_settings(docket__url="redis://localhost:6379/0"):
+        # Docket settings moved to `fastmcp_tasks.settings.DocketSettings`
+        # (env prefix `FASTMCP_DOCKET_`), so patch the settings object directly.
+        monkeypatch.setattr(docket_settings, "url", "redis://localhost:6379/0")
+        check_distributed_backend()
+
+    def test_exits_with_helpful_error_for_memory_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test that it exits with helpful error for memory:// URLs."""
+        monkeypatch.setattr(docket_settings, "url", "memory://test-123")
+        with pytest.raises(SystemExit) as exc_info:
             check_distributed_backend()
 
-    def test_exits_with_helpful_error_for_memory_url(self):
-        """Test that it exits with helpful error for memory:// URLs."""
-        with temporary_settings(docket__url="memory://test-123"):
-            with pytest.raises(SystemExit) as exc_info:
-                check_distributed_backend()
-
-            assert isinstance(exc_info.value, SystemExit)
-            assert exc_info.value.code == 1
+        assert isinstance(exc_info.value, SystemExit)
+        assert exc_info.value.code == 1
 
 
 class TestWorkerCommand:

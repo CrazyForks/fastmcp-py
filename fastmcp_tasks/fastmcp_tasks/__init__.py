@@ -2,9 +2,11 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from fastmcp_tasks.extension import TasksExtension
+
 try:
     __version__ = version("fastmcp-tasks")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-__all__ = ["__version__"]
+__all__ = ["TasksExtension", "__version__"]

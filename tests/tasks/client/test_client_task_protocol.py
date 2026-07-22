@@ -11,9 +11,7 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
-)
+pytestmark = pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
 
 
 async def test_end_to_end_task_flow():

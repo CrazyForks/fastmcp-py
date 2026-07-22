@@ -4,7 +4,7 @@ Moved out of ``fastmcp.server.dependencies`` during the SEP-1686 -> SEP-2663
 migration. These helpers are all docket-touching: the ``require_docket``
 install-hint, the docket/worker ContextVars, and the ``CurrentDocket`` /
 ``CurrentWorker`` dependencies. Everything here is wire-agnostic engine plumbing
-that Phase 3 rewires into ``TasksExtension``.
+that ``TasksExtension`` drives.
 
 The generic ``is_docket_available`` probe stays in ``fastmcp.server.dependencies``
 (core's ``Context``/``Progress`` still use it) and is re-exported here for the

@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib.metadata
 import inspect
 import weakref
-from collections.abc import AsyncGenerator, Callable, Generator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -164,6 +164,47 @@ __all__ = [
 _current_server: ContextVar[weakref.ref[FastMCP] | None] = ContextVar(
     "server", default=None
 )
+
+
+#: Hook installed by the tasks extension (``fastmcp-tasks``) so a ``ctx: Context``
+#: parameter resolves inside a background-task worker, where there is no
+#: foreground request context. Core ships no task engine; the extension
+#: registers a factory here that builds and enters a worker ``Context`` (reading
+#: the task snapshot restored by the worker). ``_CurrentContext`` falls back to
+#: it when no foreground context is active. ``None`` means no tasks extension,
+#: so worker context injection is unavailable and the usual "no active context"
+#: error applies.
+_background_context_factory: Callable[[], Awaitable[Context | None]] | None = None
+
+
+def set_background_context_factory(
+    factory: Callable[[], Awaitable[Context | None]] | None,
+) -> None:
+    """Install (or clear) the background-task ``Context`` factory.
+
+    The factory returns an already-entered ``Context`` (so ``_current_context``
+    is set for cleanup) when called inside a worker, or ``None`` when there is
+    no task context. Passing ``None`` restores core's no-worker-fallback
+    behavior.
+    """
+    global _background_context_factory
+    _background_context_factory = factory
+
+
+#: Hook installed by the tasks extension so ``get_server()`` (and thus
+#: ``CurrentFastMCP()``) resolves to the server a mounted task's tool lives on
+#: rather than the root that started the worker (#3571). Returns that server
+#: inside a worker, or ``None`` outside one. Core has no task engine, so this is
+#: ``None`` unless the extension is active.
+_worker_server_resolver: Callable[[], FastMCP | None] | None = None
+
+
+def set_worker_server_resolver(
+    resolver: Callable[[], FastMCP | None] | None,
+) -> None:
+    """Install (or clear) the worker-server resolver used by ``get_server()``."""
+    global _worker_server_resolver
+    _worker_server_resolver = resolver
 
 
 # --- Docket availability check ---
@@ -360,12 +401,22 @@ def get_context() -> Context:
 def get_server() -> FastMCP:
     """Get the current FastMCP server instance directly.
 
+    In a background-task worker the tasks extension's resolver is consulted
+    first, so a mounted-child task resolves to the child server rather than the
+    root that started the worker (#3571).
+
     Returns:
         The active FastMCP server
 
     Raises:
         RuntimeError: If no server in context
     """
+    resolver = _worker_server_resolver
+    if resolver is not None:
+        worker_server = resolver()
+        if worker_server is not None:
+            return worker_server
+
     server_ref = _current_server.get()
     if server_ref is None:
         raise RuntimeError("No FastMCP server instance in context")
@@ -738,9 +789,20 @@ class _CurrentContext(Dependency["Context"]):
         if context is not None:
             return context
 
+        # In a background-task worker there is no foreground context; the tasks
+        # extension installs a factory that builds and enters a worker Context
+        # from the restored task snapshot. Core has no task engine of its own,
+        # so this is None unless the extension is active.
+        factory = _background_context_factory
+        if factory is not None:
+            background = await factory()
+            if background is not None:
+                return background
+
         raise RuntimeError(
             "No active context found. This can happen if:\n"
             "  - Called outside an MCP request handler\n"
+            "  - Called in a background task before the context was established\n"
             "Check `context.request_context` for None before accessing."
         )
 

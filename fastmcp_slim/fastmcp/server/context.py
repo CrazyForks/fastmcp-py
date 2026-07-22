@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 import weakref
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -123,6 +123,32 @@ def _warn_sampling_deprecated() -> None:
 
 
 _current_context: ContextVar[Context | None] = ContextVar("context", default=None)
+
+
+#: Hook installed by the tasks extension (``fastmcp-tasks``) so ``ctx.elicit()``
+#: works inside a background-task worker, where there is no live request to
+#: carry the elicitation. Core ships no task engine; the extension registers a
+#: handler here at construction and ``Context._elicit_for_task`` delegates to it.
+#: ``None`` (the default) means no tasks extension is active, so in-task
+#: elicitation raises a clear install hint.
+_task_elicitation_handler: (
+    Callable[[Context, str, dict[str, Any]], Awaitable[mcp_types.ElicitResult]] | None
+) = None
+
+
+def set_task_elicitation_handler(
+    handler: Callable[[Context, str, dict[str, Any]], Awaitable[mcp_types.ElicitResult]]
+    | None,
+) -> None:
+    """Install (or clear) the in-task elicitation handler.
+
+    Called by the tasks extension so a worker's ``ctx.elicit()`` parks an input
+    request the client answers via ``tasks/update`` (SEP-2663 poll-based input).
+    Passing ``None`` restores the default "requires the tasks extension" error.
+    """
+    global _task_elicitation_handler
+    _task_elicitation_handler = handler
+
 
 TransportType = Literal["stdio", "sse", "streamable-http"]
 _current_transport: ContextVar[TransportType | None] = ContextVar(
@@ -362,6 +388,25 @@ class Context:
         ```
         """
         return fastmcp_request_ctx.get()
+
+    def client_extension_settings(self, identifier: str) -> dict[str, Any] | None:
+        """This request's per-request opt-in settings for an MCP extension.
+
+        SEP-2133 extensions negotiate per request: the client repeats its
+        extension capabilities in each request's ``_meta`` under
+        ``io.modelcontextprotocol/clientCapabilities`` → ``extensions`` →
+        ``identifier``. Returns the declared settings dict (possibly empty) when
+        the extension was opted in for this request, or ``None`` when it was
+        not (or there is no active request). This bridges an extension's
+        ``tools/call`` interceptor — which receives a FastMCP ``Context`` — to
+        the request's declared client capabilities.
+        """
+        rc = self.request_context
+        if rc is None:
+            return None
+        from fastmcp.server.extensions import _extract_client_extension_settings
+
+        return _extract_client_extension_settings(rc.meta, identifier)
 
     def _input_response_params(
         self,
@@ -1384,13 +1429,17 @@ class Context:
             )
 
         # In-task elicitation is provided by the tasks extension (SEP-2663)
-        # from the `fastmcp-tasks` package. Core no longer ships the SEP-1686
-        # push relay this used to call.
-        raise RuntimeError(
-            "In-task elicitation requires the tasks extension. Install "
-            "'fastmcp[tasks]' and register the tasks extension via "
-            "mcp.add_extension(...)."
-        )
+        # from the `fastmcp-tasks` package, which installs the handler below.
+        # Core ships no task engine, so without the extension this raises a
+        # clear install hint rather than reaching a wire the worker lacks.
+        handler = _task_elicitation_handler
+        if handler is None:
+            raise RuntimeError(
+                "In-task elicitation requires the tasks extension. Install "
+                "'fastmcp[tasks]' and register the tasks extension via "
+                "mcp.add_extension(...)."
+            )
+        return await handler(self, message, schema)
 
     def _make_state_key(self, key: str) -> str:
         """Create session-prefixed key for state storage."""

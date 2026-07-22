@@ -155,10 +155,9 @@ exclude = [
     "examples/providers/sqlite",        # needs aiosqlite
     "examples/memory.py",               # needs asyncpg, numpy, pydantic_ai, pgvector
     "examples/get_file.py",             # needs aiohttp
-    # Dormant SEP-1686 task tests: skipped at runtime pending the Phase 3
-    # TasksExtension (SEP-2663). They reference task APIs that are removed from
-    # core and return in the fastmcp-tasks extension, so they don't type-check
-    # against core until then. Drop this exclusion when Phase 3 lands.
+    # The moved task tests pass at runtime but carry ty diagnostics (mostly
+    # None-narrowing on optional result fields); a follow-up commit fixes them
+    # and removes this exclusion.
     "tests/tasks",
 ]
 

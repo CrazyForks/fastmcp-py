@@ -20,6 +20,7 @@ from mcp_types import (
     SetLevelRequestParams,
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from pydantic import BaseModel
 
 from fastmcp.exceptions import (
     DisabledError,
@@ -29,7 +30,7 @@ from fastmcp.exceptions import (
 )
 from fastmcp.server.completions import CompletionValues, normalize_completion
 from fastmcp.server.dependencies import bind_request_context, extract_version_spec
-from fastmcp.tools.base import InputRequiredToolResult
+from fastmcp.tools.base import InputRequiredToolResult, ToolResult
 from fastmcp.utilities.async_utils import (
     call_sync_fn_in_threadpool,
     is_coroutine_function,
@@ -216,7 +217,7 @@ class MCPOperationsMixin:
         self: FastMCP,
         ctx: ServerRequestContext,
         params: CallToolRequestParams,
-    ) -> mcp_types.CallToolResult | mcp_types.InputRequiredResult:
+    ) -> mcp_types.CallToolResult | mcp_types.InputRequiredResult | BaseModel:
         """Handle MCP 'tools/call' requests.
 
         A guard tool (SEP-2322 multi-round-trip) requests client input by
@@ -262,6 +263,14 @@ class MCPOperationsMixin:
                     content=[mcp_types.TextContent(type="text", text=str(e))],
                     is_error=True,
                 )
+
+            if not isinstance(result, ToolResult):
+                # An extension's tools/call interceptor produced a non-ToolResult
+                # wire result — the tasks extension's CreateTaskResult when it ran
+                # the call as a task. Core does not interpret extension result
+                # shapes; hand it straight to the runner, which serializes it for
+                # the negotiated protocol version.
+                return result
 
             if isinstance(result, InputRequiredToolResult):
                 # A guard tool requested client input (SEP-2322). The

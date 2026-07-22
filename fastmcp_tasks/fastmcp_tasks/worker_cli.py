@@ -105,3 +105,9 @@ def worker(
     except KeyboardInterrupt:
         console.print("\n[yellow]Worker stopped[/yellow]")
         sys.exit(0)
+
+
+if __name__ == "__main__":
+    # Enables `python -m fastmcp_tasks.worker_cli worker <server>` for running an
+    # out-of-process worker now that core dropped the `fastmcp tasks` subcommand.
+    tasks_app()

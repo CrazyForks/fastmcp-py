@@ -22,6 +22,7 @@ from typing import Annotated
 
 import mcp_types
 import pytest
+from docket import Docket
 from mcp.client._input_required import InputRequiredRoundsExceededError
 from mcp.server.request_state import RequestStateSecurity
 from mcp.shared.exceptions import MCPError
@@ -37,6 +38,8 @@ from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
 from fastmcp.server.middleware.middleware import Middleware
 from fastmcp.tools.base import InputRequiredToolResult, ToolResult
 from fastmcp.utilities.tests import run_server_async
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import running_task_server, submit_task, wait_for_task
 
 
 def _elicit(key: str, message: str, field: str) -> ElicitRequest:
@@ -1158,9 +1161,18 @@ class TestTaskExecution:
     background task has no such request, so returning a guard result from a task
     is rejected with a clear error rather than silently yielding empty content."""
 
-    @pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
-    async def test_guard_result_from_task_is_rejected(self):
+    @pytest.fixture
+    def reset_docket_memory_server(self):
+        """Force a fresh memory:// Docket server bound to this test's loop."""
+        if hasattr(Docket, "_memory_server"):
+            delattr(Docket, "_memory_server")
+        yield
+        if hasattr(Docket, "_memory_server"):
+            delattr(Docket, "_memory_server")
+
+    async def test_guard_result_from_task_is_rejected(self, reset_docket_memory_server):
         mcp = FastMCP("guard-task")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def book_flight(ctx: Context) -> str | InputRequiredResult:
@@ -1170,13 +1182,14 @@ class TestTaskExecution:
                 request_state=None,
             )
 
-        # Client-side background-task submission (`task=True`) is the handshake-era
-        # SEP-1686 model; in 2026-07-28 tasks moved to a separate extension, so pin
-        # the era the "reject a guard's input-required from within a task" rule lives in.
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("book_flight", {}, task=True)
+        # A guard's `InputRequiredResult` only makes sense against a live
+        # request. Submitting `book_flight` as a background task and then
+        # reading it back must reject the guard result: `tasks/get` raises when
+        # it tries to inline the completed task's InputRequiredResult.
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "book_flight", {})
             with pytest.raises(MCPError, match="background task"):
-                await task.result()
+                await wait_for_task(mcp, created.task_id)
 
 
 class TestHttpTransport:

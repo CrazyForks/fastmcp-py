@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from docket import Docket
     from mcp.server.session import ServerSession
 
+    from fastmcp.server.context import Context
     from fastmcp.server.server import FastMCP
 
 _logger = logging.getLogger(__name__)
@@ -362,3 +363,48 @@ def get_task_server(task_id: str) -> FastMCP | None:
     if server is None:
         _task_server_map.pop(task_id, None)
     return server
+
+
+def resolve_worker_server() -> FastMCP | None:
+    """Return the server owning the current task's tool, or None outside a task.
+
+    Installed as core's worker-server resolver by ``TasksExtension`` so
+    ``get_server()``/``CurrentFastMCP()`` inside a worker resolve to the (child)
+    server the task was submitted against, not the root that runs the worker.
+    """
+    task_info = get_task_context()
+    if task_info is None:
+        return None
+    return get_task_server(task_info.task_id)
+
+
+async def make_task_context() -> Context | None:
+    """Build and enter a worker ``Context`` for the current background task.
+
+    Installed as core's background-context factory by ``TasksExtension`` so a
+    ``ctx: Context`` parameter resolves inside a Docket worker. Returns ``None``
+    when not running in a task (so core falls through to its usual error). The
+    snapshot restored by ``restore_task_snapshot`` supplies the origin request
+    id; the server prefers the one registered at submission time so mounted
+    tasks resolve to the child server. No live session is attached — SEP-2663
+    input and status are polled, so the worker needs no back-channel.
+    """
+    from fastmcp.server.context import Context
+    from fastmcp.server.dependencies import get_server
+
+    task_info = get_task_context()
+    if task_info is None:
+        return None
+
+    server = get_task_server(task_info.task_id) or get_server()
+    snapshot = _recall_snapshot(task_info.task_id)
+    origin_request_id = snapshot.origin_request_id if snapshot else None
+
+    ctx = Context(
+        fastmcp=server,
+        session=None,
+        task_id=task_info.task_id,
+        origin_request_id=origin_request_id,
+    )
+    await ctx.__aenter__()
+    return ctx

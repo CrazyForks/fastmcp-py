@@ -1,85 +1,53 @@
-"""
-Tests for SEP-1686 protocol-level task handling.
+"""Protocol-level task behavior for SEP-2663 tasks.
 
-Generic protocol tests that use tools as test fixtures.
-Tests metadata, notifications, and error handling at the protocol level.
+Generic protocol behaviors driven in-process via the task helpers: a submitted
+task carries a server-generated id and a TTL, and a task whose tool raises
+surfaces its error rather than a result.
 """
 
-import pytest
+from __future__ import annotations
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp.exceptions import ToolError
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    run_task,
+    running_task_server,
+    submit_task,
 )
 
 
-@pytest.fixture
-async def task_enabled_server():
-    """Create a FastMCP server with task-enabled tools."""
+def _task_server() -> FastMCP:
     mcp = FastMCP("task-test-server")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def simple_tool(message: str) -> str:
-        """A simple tool for testing."""
         return f"Processed: {message}"
 
     @mcp.tool(task=True)
     async def failing_tool() -> str:
-        """A tool that always fails."""
-        raise ValueError("This tool always fails")
+        raise ToolError("This tool always fails")
 
     return mcp
 
 
-async def test_task_metadata_includes_task_id_and_ttl(task_enabled_server):
-    """Task metadata properly includes server-generated taskId and ttl."""
-    async with Client(task_enabled_server, mode="legacy") as client:
-        # Submit with specific ttl (server generates task ID)
-        task = await client.call_tool(
-            "simple_tool",
-            {"message": "test"},
-            task=True,
-            ttl=30000,
-        )
-        assert task
-        assert not task.returned_immediately
-
-        # Server should have generated a task ID
-        assert task.task_id is not None
-        assert isinstance(task.task_id, str)
+async def test_task_metadata_includes_task_id_and_ttl():
+    """A submitted task carries a server-generated id and a positive TTL."""
+    mcp = _task_server()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "simple_tool", {"message": "test"})
+        assert isinstance(created.task_id, str)
+        assert created.task_id
+        assert created.ttl_ms is not None and created.ttl_ms > 0
 
 
-async def test_task_notification_sent_after_submission(task_enabled_server):
-    """Server sends an initial task status notification after submission."""
-
-    @task_enabled_server.tool(task=True)
-    async def background_tool(message: str) -> str:
-        return f"Processed: {message}"
-
-    async with Client(task_enabled_server, mode="legacy") as client:
-        task = await client.call_tool("background_tool", {"message": "test"}, task=True)
-        assert task
-        assert not task.returned_immediately
-
-        # Verify we can query the task
-        status = await task.status()
-        assert status.task_id == task.task_id
-
-
-async def test_failed_task_stores_error(task_enabled_server):
-    """Failed tasks store the error in results."""
-
-    @task_enabled_server.tool(task=True)
-    async def failing_task_tool() -> str:
-        raise ValueError("This tool always fails")
-
-    async with Client(task_enabled_server, mode="legacy") as client:
-        task = await client.call_tool("failing_task_tool", task=True)
-        assert task
-        assert not task.returned_immediately
-
-        # Wait for task to fail
-        status = await task.wait(state="failed", timeout=2.0)
-        assert status.status == "failed"
+async def test_failed_task_stores_error():
+    """A task whose tool raises reaches `failed` and stores the error."""
+    mcp = _task_server()
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "failing_tool", {})
+        assert final.status == "failed"
+        assert final.error is not None
+        assert "This tool always fails" in final.error["message"]
+        assert final.result is None

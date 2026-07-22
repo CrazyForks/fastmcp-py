@@ -472,6 +472,19 @@ async def test_duplicate_identifier_rejected():
         mcp.add_extension(Ext())
 
 
+async def test_registration_after_lifespan_start_rejected():
+    """Registering once the server is serving would skip the extension's
+    lifespan, leaving it silently half-active — so it raises instead."""
+
+    class Ext(ServerExtension):
+        identifier = EXT_ID
+
+    mcp = FastMCP("t")
+    async with Client(mcp, mode="auto"):
+        with pytest.raises(RuntimeError, match="lifespan has already started"):
+            mcp.add_extension(Ext())
+
+
 def test_spec_method_name_rejected():
     async def handler(ctx: Any, params: Any) -> None:
         return None

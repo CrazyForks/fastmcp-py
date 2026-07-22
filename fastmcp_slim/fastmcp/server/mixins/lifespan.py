@@ -118,6 +118,13 @@ class LifespanMixin:
         """
         from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 
+        # A mounted child defers to the root, which owns the extension and whose
+        # aggregated get_tasks() already covers this child's task tools — the
+        # same root-deferral the extension lifespan uses. Validating here would
+        # fail a child that legitimately relies on the root's registration.
+        if _lifespan_root_active.get():
+            return
+
         if TASKS_EXTENSION_ID in self._extensions:
             return
 

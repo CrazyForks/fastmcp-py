@@ -2,8 +2,8 @@
 
 Moved out of ``fastmcp.settings`` during the SEP-1686 -> SEP-2663 migration.
 The ``FASTMCP_DOCKET_*`` environment prefix is unchanged so existing
-deployments keep working. Phase 3 wires this configuration into
-``TasksExtension``.
+deployments keep working. ``TasksExtension`` reads this configuration (its
+constructor overrides the env defaults).
 """
 
 from __future__ import annotations

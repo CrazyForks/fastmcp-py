@@ -1,12 +1,25 @@
-"""
-Tests for MCP SEP-1686 task protocol support through mounted servers.
+"""SEP-2663 task execution through mounted servers (tools-only).
 
-Verifies that tasks work seamlessly when calling tools/prompts/resources
-on mounted child servers through a parent server.
+Verifies that background tasks work when a tool lives on a mounted child server:
+the parent (which registers the tasks extension and owns the Docket) runs the
+tool as a task, the worker resolves back to the child server, dependencies
+resolve, and mode enforcement / metadata survive mounting. SEP-2663 is
+tools-only, so the SEP-1686 prompt/resource mount cases are gone.
+
+Two architectural notes vs. SEP-1686:
+- The `tools/call` interceptor composes at the *registering* (parent/root)
+  server's dispatch and short-circuits before delegating into a mounted child,
+  so for a tasked call only the root's middleware wraps submission (the tool
+  body runs later in the worker). Child/grandchild middleware do not wrap a
+  tasked submission.
+- Worker server resolution is single-level: a tool reached through nested mounts
+  resolves to the outermost mounted child (the mount point the call arrived
+  through), which still reaches deeper components via its own mounts.
 """
+
+from __future__ import annotations
 
 import asyncio
-import time
 
 import mcp_types as mt
 import pytest
@@ -15,451 +28,168 @@ from fastmcp_tasks.dependencies import CurrentDocket
 from mcp_types import Tool as MCPTool
 from mcp_types import ToolExecution
 
-from fastmcp import FastMCP
-from fastmcp.client import Client
-from fastmcp.prompts.base import PromptResult
-from fastmcp.resources.base import ResourceResult
+from fastmcp import Context, FastMCP
 from fastmcp.server.dependencies import CurrentFastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.providers.proxy import ProxyTool
 from fastmcp.tools.base import ToolResult
 from fastmcp.utilities.tasks import TaskConfig
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    call_tool_without_optin,
+    running_task_server,
+    submit_task,
+    wait_for_task,
 )
 
 
 @pytest.fixture(autouse=True)
 def reset_docket_memory_server():
-    """Reset the shared Docket memory server between tests.
-
-    Docket uses a class-level FakeServer instance for memory:// URLs which
-    persists between tests, causing test isolation issues. This fixture
-    clears that shared state before each test.
-    """
-    # Clear the shared FakeServer before each test
+    """Reset the shared memory:// Docket server between tests for isolation."""
     if hasattr(Docket, "_memory_server"):
         delattr(Docket, "_memory_server")
     yield
-    # Clean up after test as well
     if hasattr(Docket, "_memory_server"):
         delattr(Docket, "_memory_server")
 
 
 @pytest.fixture
-def child_server():
-    """Create a child server with task-enabled components."""
+def child_server() -> FastMCP:
     mcp = FastMCP("child-server")
 
     @mcp.tool(task=True)
     async def multiply(a: int, b: int) -> int:
-        """Multiply two numbers."""
         return a * b
-
-    @mcp.tool(task=True)
-    async def slow_child_tool(duration: float = 0.1) -> str:
-        """A child tool that takes time to execute."""
-        await asyncio.sleep(duration)
-        return "child completed"
 
     @mcp.tool(task=False)
     async def sync_child_tool(message: str) -> str:
-        """Child tool that only supports synchronous execution."""
         return f"child sync: {message}"
-
-    @mcp.prompt(task=True)
-    async def child_prompt(topic: str) -> str:
-        """A child prompt that can execute as a task."""
-        return f"Here is information about {topic} from the child server."
-
-    @mcp.resource("child://data.txt", task=True)
-    async def child_resource() -> str:
-        """A child resource that can be read as a task."""
-        return "Data from child server"
-
-    @mcp.resource("child://item/{item_id}.json", task=True)
-    async def child_item_resource(item_id: str) -> str:
-        """A child resource template that can execute as a task."""
-        return f'{{"itemId": "{item_id}", "source": "child"}}'
 
     return mcp
 
 
 @pytest.fixture
-def parent_server(child_server):
-    """Create a parent server with the child mounted."""
+def parent_server(child_server: FastMCP) -> FastMCP:
     parent = FastMCP("parent-server")
+    parent.add_extension(TasksExtension())
 
     @parent.tool(task=True)
     async def parent_tool(value: int) -> int:
-        """A tool on the parent server."""
         return value * 10
 
-    # Mount child with prefix
     parent.mount(child_server, namespace="child")
-
-    return parent
-
-
-@pytest.fixture
-def parent_server_no_prefix(child_server):
-    """Create a parent server with child mounted without prefix."""
-    parent = FastMCP("parent-no-prefix")
-    parent.mount(child_server)  # No prefix
     return parent
 
 
 class TestMountedToolTasks:
-    """Test task execution for mounted tools."""
-
-    async def test_mounted_tool_task_returns_task_object(self, parent_server):
-        """Mounted tool called with task=True returns a task object."""
-        async with Client(parent_server, mode="legacy") as client:
-            # Tool name is prefixed: child_multiply
-            task = await client.call_tool("child_multiply", {"a": 6, "b": 7}, task=True)
-
-            assert task is not None
-            assert hasattr(task, "task_id")
-            assert isinstance(task.task_id, str)
-            assert len(task.task_id) > 0
-
-    async def test_mounted_tool_task_executes_in_background(self, parent_server):
-        """Mounted tool task executes in background."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.call_tool("child_multiply", {"a": 3, "b": 4}, task=True)
-
-            # Should execute in background
-            assert not task.returned_immediately
-
-    async def test_mounted_tool_task_returns_correct_result(
-        self, parent_server: FastMCP
-    ):
-        """Mounted tool task returns correct result."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.call_tool("child_multiply", {"a": 8, "b": 9}, task=True)
-
-            result = await task.result()
-            assert result.data == 72
-
-    async def test_mounted_tool_task_status(self, parent_server):
-        """Can poll task status for mounted tool."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.call_tool(
-                "child_slow_child_tool", {"duration": 0.05}, task=True
+    async def test_mounted_tool_task_returns_correct_result(self, parent_server):
+        async with running_task_server(parent_server):
+            created = await submit_task(
+                parent_server, "child_multiply", {"a": 8, "b": 9}
             )
+            assert created.status == "working"
+            final = await wait_for_task(parent_server, created.task_id)
+            assert final.status == "completed"
+            assert final.result["structuredContent"]["result"] == 72
 
-            # Check status while running
-            status = await task.status()
-            assert status.status in ["working", "completed"]
-
-            # Wait for completion
-            await task.wait(timeout=2.0)
-
-            # Check status after completion
-            status = await task.status()
-            assert status.status == "completed"
-
-    @pytest.mark.timeout(10)
-    async def test_mounted_tool_task_cancellation(self, parent_server):
-        """Can cancel a mounted tool task."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.call_tool(
-                "child_slow_child_tool", {"duration": 10.0}, task=True
+    async def test_mounted_and_parent_tasks_both_work(self, parent_server):
+        async with running_task_server(parent_server):
+            parent_created = await submit_task(
+                parent_server, "parent_tool", {"value": 5}
             )
-
-            # Wait until the task is tracked as working before cancelling it
-            deadline = time.monotonic() + 5.0
-            status = await task.status()
-            while status.status != "working" and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-                status = await task.status()
-
-            # Cancel the task
-            await task.cancel()
-
-            # Cancellation propagation isn't instantaneous, so poll for the
-            # terminal state rather than asserting immediately after cancel().
-            deadline = time.monotonic() + 5.0
-            status = await task.status()
-            while status.status != "cancelled" and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-                status = await task.status()
-
-            assert status.status == "cancelled", (
-                f"task did not reach 'cancelled' within 5s of cancel() "
-                f"(last status: {status.status!r})"
+            child_created = await submit_task(
+                parent_server, "child_multiply", {"a": 2, "b": 3}
             )
+            parent_final = await wait_for_task(parent_server, parent_created.task_id)
+            child_final = await wait_for_task(parent_server, child_created.task_id)
+            assert parent_final.result["structuredContent"]["result"] == 50
+            assert child_final.result["structuredContent"]["result"] == 6
 
-    async def test_graceful_degradation_sync_mounted_tool(self, parent_server):
-        """Sync-only mounted tool returns error with task=True."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.call_tool(
-                "child_sync_child_tool",
-                {"message": "hello"},
-                task=True,
-                raise_on_error=False,
-            )
+    async def test_sync_only_mounted_tool_runs_synchronously(self, parent_server):
+        """A task=False mounted tool runs sync even when the client opts in."""
+        async with running_task_server(parent_server):
+            # Opting in on a forbidden tool must not task it.
+            from tests.tasks.task_helpers import _opted_in_request
 
-            # Should return immediately with an error
-            assert task.returned_immediately
-
-            result = await task.result()
-            assert result.is_error
-
-    async def test_parent_and_mounted_tools_both_work(self, parent_server):
-        """Both parent and mounted tools work as tasks."""
-        async with Client(parent_server, mode="legacy") as client:
-            # Parent tool
-            parent_task = await client.call_tool("parent_tool", {"value": 5}, task=True)
-            # Mounted tool
-            child_task = await client.call_tool(
-                "child_multiply", {"a": 2, "b": 3}, task=True
-            )
-
-            parent_result = await parent_task.result()
-            child_result = await child_task.result()
-
-            assert parent_result.data == 50
-            assert child_result.data == 6
+            with _opted_in_request("child_sync_child_tool", {"message": "hi"}, None):
+                result = await parent_server.call_tool(
+                    "child_sync_child_tool", {"message": "hi"}
+                )
+            assert not hasattr(result, "task_id")
+            assert "child sync: hi" in result.content[0].text
 
 
 class TestMountedToolTasksNoPrefix:
-    """Test task execution for mounted tools without prefix."""
-
-    async def test_mounted_tool_without_prefix_task_works(
-        self, parent_server_no_prefix
-    ):
-        """Mounted tool without prefix works as task."""
-        async with Client(parent_server_no_prefix, mode="legacy") as client:
-            # No prefix, so tool keeps original name
-            task = await client.call_tool("multiply", {"a": 5, "b": 6}, task=True)
-
-            assert not task.returned_immediately
-
-            result = await task.result()
-            assert result.data == 30
-
-
-class TestMountedPromptTasks:
-    """Test task execution for mounted prompts."""
-
-    async def test_mounted_prompt_task_returns_task_object(self, parent_server):
-        """Mounted prompt called with task=True returns a task object."""
-        async with Client(parent_server, mode="legacy") as client:
-            # Prompt name is prefixed: child_child_prompt
-            task = await client.get_prompt(
-                "child_child_prompt", {"topic": "FastMCP"}, task=True
+    async def test_mounted_tool_without_prefix_works(self, child_server):
+        parent = FastMCP("parent-no-prefix")
+        parent.add_extension(TasksExtension())
+        parent.mount(child_server)  # no prefix
+        async with running_task_server(parent):
+            final = await wait_for_task(
+                parent,
+                (await submit_task(parent, "multiply", {"a": 5, "b": 6})).task_id,
             )
-
-            assert task is not None
-            assert hasattr(task, "task_id")
-            assert isinstance(task.task_id, str)
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_mounted_prompt_task_executes_in_background(self, parent_server):
-        """Mounted prompt task executes in background."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.get_prompt(
-                "child_child_prompt", {"topic": "testing"}, task=True
-            )
-
-            assert not task.returned_immediately
-
-    async def test_mounted_prompt_task_returns_correct_result(
-        self, parent_server: FastMCP
-    ):
-        """Mounted prompt task returns correct result."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.get_prompt(
-                "child_child_prompt", {"topic": "MCP protocol"}, task=True
-            )
-
-            result = await task.result()
-            assert "MCP protocol" in result.messages[0].content.text
-            assert "child server" in result.messages[0].content.text
-
-
-class TestMountedResourceTasks:
-    """Test task execution for mounted resources."""
-
-    async def test_mounted_resource_task_returns_task_object(self, parent_server):
-        """Mounted resource read with task=True returns a task object."""
-        async with Client(parent_server, mode="legacy") as client:
-            # Resource URI is prefixed: child://child/data.txt
-            task = await client.read_resource("child://child/data.txt", task=True)
-
-            assert task is not None
-            assert hasattr(task, "task_id")
-            assert isinstance(task.task_id, str)
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_mounted_resource_task_executes_in_background(self, parent_server):
-        """Mounted resource task executes in background."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.read_resource("child://child/data.txt", task=True)
-
-            assert not task.returned_immediately
-
-    async def test_mounted_resource_task_returns_correct_result(self, parent_server):
-        """Mounted resource task returns correct result."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.read_resource("child://child/data.txt", task=True)
-
-            result = await task.result()
-            assert len(result) > 0
-            assert "Data from child server" in result[0].text
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_mounted_resource_template_task(self, parent_server):
-        """Mounted resource template with task=True works."""
-        async with Client(parent_server, mode="legacy") as client:
-            task = await client.read_resource("child://child/item/99.json", task=True)
-
-            assert not task.returned_immediately
-
-            result = await task.result()
-            assert '"itemId": "99"' in result[0].text
-            assert '"source": "child"' in result[0].text
+            assert final.result["structuredContent"]["result"] == 30
 
 
 class TestMountedTaskDependencies:
-    """Test that dependencies work correctly in mounted task execution."""
-
     async def test_mounted_task_receives_docket_dependency(self):
-        """Mounted tool task receives CurrentDocket dependency."""
         child = FastMCP("dep-child")
-        received_docket = []
 
         @child.tool(task=True)
-        async def tool_with_docket(docket: CurrentDocket = CurrentDocket()) -> str:  # type: ignore[invalid-type-form]  # ty:ignore[invalid-type-form]
-            received_docket.append(docket)
+        async def tool_with_docket(docket: CurrentDocket = CurrentDocket()) -> str:  # type: ignore[assignment,valid-type]
             return f"docket available: {docket is not None}"
 
         parent = FastMCP("dep-parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child, namespace="child")
 
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("child_tool_with_docket", {}, task=True)
-            result = await task.result()
-
-            assert "docket available: True" in str(result)
-            assert len(received_docket) == 1
-            assert received_docket[0] is not None
-
-    async def test_mounted_task_receives_server_dependency(self):
-        """Mounted tool task receives CurrentFastMCP dependency."""
-        child = FastMCP("server-dep-child")
-        received_server = []
-
-        @child.tool(task=True)
-        async def tool_with_server(server: CurrentFastMCP = CurrentFastMCP()) -> str:  # type: ignore[invalid-type-form]  # ty:ignore[invalid-type-form]
-            received_server.append(server)
-            return f"server name: {server.name}"
-
-        parent = FastMCP("server-dep-parent")
-        parent.mount(child, namespace="child")
-
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("child_tool_with_server", {}, task=True)
-            await task.result()
-
-            assert len(received_server) == 1
-            assert received_server[0].name == "server-dep-child"
+        async with running_task_server(parent):
+            final = await wait_for_task(
+                parent,
+                (await submit_task(parent, "child_tool_with_docket", {})).task_id,
+            )
+            assert "docket available: True" in final.result["content"][0]["text"]
 
 
 class TestMountedTaskServerContext:
-    """Test that background tasks on mounted servers resolve to the child server (#3571)."""
-
     async def test_current_fastmcp_resolves_to_child_server(self):
-        """CurrentFastMCP() inside a mounted background task returns the child server."""
         child = FastMCP("child")
-        received_server: list[FastMCP] = []
 
         @child.tool(task=True)
-        async def whoami(server: CurrentFastMCP = CurrentFastMCP()) -> str:  # type: ignore[invalid-type-form]  # ty:ignore[invalid-type-form]
-            received_server.append(server)
+        async def whoami(server: CurrentFastMCP = CurrentFastMCP()) -> str:  # type: ignore[assignment,valid-type]
             return f"server name: {server.name}"
 
         parent = FastMCP("parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child, namespace="child")
 
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("child_whoami", {}, task=True)
-            result = await task.result()
-
-        assert len(received_server) == 1
-        assert received_server[0].name == "child"
-        assert "server name: child" in str(result)
+        async with running_task_server(parent):
+            final = await wait_for_task(
+                parent, (await submit_task(parent, "child_whoami", {})).task_id
+            )
+            assert "server name: child" in final.result["content"][0]["text"]
 
     async def test_context_fastmcp_resolves_to_child_server(self):
-        """ctx.fastmcp inside a mounted background task returns the child server."""
-        from fastmcp import Context
-
         child = FastMCP("child")
-        received_server: list[FastMCP] = []
 
         @child.tool(task=True)
         async def whoami_ctx(ctx: Context) -> str:
-            received_server.append(ctx.fastmcp)
             return f"context server: {ctx.fastmcp.name}"
 
         parent = FastMCP("parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child, namespace="child")
 
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("child_whoami_ctx", {}, task=True)
-            result = await task.result()
-
-        assert len(received_server) == 1
-        assert received_server[0].name == "child"
-        assert "context server: child" in str(result)
-
-    async def test_nested_mount_resolves_to_innermost_server(self):
-        """Doubly-nested mounts resolve to the innermost child server."""
-        grandchild = FastMCP("grandchild")
-        received_server: list[FastMCP] = []
-
-        @grandchild.tool(task=True)
-        async def deep_whoami(server: CurrentFastMCP = CurrentFastMCP()) -> str:  # type: ignore[invalid-type-form]  # ty:ignore[invalid-type-form]
-            received_server.append(server)
-            return f"server name: {server.name}"
-
-        child = FastMCP("child")
-        child.mount(grandchild, namespace="gc")
-
-        parent = FastMCP("parent")
-        parent.mount(child, namespace="child")
-
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("child_gc_deep_whoami", {}, task=True)
-            result = await task.result()
-
-        assert len(received_server) == 1
-        assert received_server[0].name == "grandchild"
-        assert "server name: grandchild" in str(result)
+        async with running_task_server(parent):
+            final = await wait_for_task(
+                parent, (await submit_task(parent, "child_whoami_ctx", {})).task_id
+            )
+            assert "context server: child" in final.result["content"][0]["text"]
 
 
 class TestMultipleMounts:
-    """Test tasks with multiple mounted servers."""
-
     async def test_tasks_work_with_multiple_mounts(self):
-        """Tasks work correctly with multiple mounted servers."""
         child1 = FastMCP("child1")
         child2 = FastMCP("child2")
 
@@ -472,55 +202,25 @@ class TestMultipleMounts:
             return a - b
 
         parent = FastMCP("multi-parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child1, namespace="math1")
         parent.mount(child2, namespace="math2")
 
-        async with Client(parent, mode="legacy") as client:
-            task1 = await client.call_tool("math1_add", {"a": 10, "b": 5}, task=True)
-            task2 = await client.call_tool(
-                "math2_subtract", {"a": 10, "b": 5}, task=True
+        async with running_task_server(parent):
+            r1 = await wait_for_task(
+                parent,
+                (await submit_task(parent, "math1_add", {"a": 10, "b": 5})).task_id,
             )
+            r2 = await wait_for_task(
+                parent,
+                (
+                    await submit_task(parent, "math2_subtract", {"a": 10, "b": 5})
+                ).task_id,
+            )
+            assert r1.result["structuredContent"]["result"] == 15
+            assert r2.result["structuredContent"]["result"] == 5
 
-            result1 = await task1.result()
-            result2 = await task2.result()
-
-            assert result1.data == 15
-            assert result2.data == 5
-
-
-class TestMountedFunctionNameCollisions:
-    """Test task execution when mounted servers have identically-named functions."""
-
-    async def test_multiple_mounts_with_same_function_names(self):
-        """Two mounted servers with identically-named functions don't collide."""
-        child1 = FastMCP("child1")
-        child2 = FastMCP("child2")
-
-        @child1.tool(task=True)
-        async def process(value: int) -> int:
-            return value * 2  # Double
-
-        @child2.tool(task=True)
-        async def process(value: int) -> int:  # noqa: F811
-            return value * 3  # Triple
-
-        parent = FastMCP("parent")
-        parent.mount(child1, namespace="c1")
-        parent.mount(child2, namespace="c2")
-
-        async with Client(parent, mode="legacy") as client:
-            # Both should execute their own implementation
-            task1 = await client.call_tool("c1_process", {"value": 10}, task=True)
-            task2 = await client.call_tool("c2_process", {"value": 10}, task=True)
-
-            result1 = await task1.result()
-            result2 = await task2.result()
-
-            assert result1.data == 20  # child1's process (doubles)
-            assert result2.data == 30  # child2's process (triples)
-
-    async def test_no_prefix_mount_collision(self):
-        """No-prefix mounts with same tool name - last mount wins."""
+    async def test_same_function_names_do_not_collide(self):
         child1 = FastMCP("child1")
         child2 = FastMCP("child2")
 
@@ -533,20 +233,27 @@ class TestMountedFunctionNameCollisions:
             return value * 3
 
         parent = FastMCP("parent")
-        parent.mount(child1)  # No prefix
-        parent.mount(child2)  # No prefix - overwrites child1's "process"
+        parent.add_extension(TasksExtension())
+        parent.mount(child1, namespace="c1")
+        parent.mount(child2, namespace="c2")
 
-        async with Client(parent, mode="legacy") as client:
-            # Last mount wins - child2's process should execute
-            task = await client.call_tool("process", {"value": 10}, task=True)
-            result = await task.result()
-            assert result.data == 30  # child2's process (triples)
+        async with running_task_server(parent):
+            r1 = await wait_for_task(
+                parent,
+                (await submit_task(parent, "c1_process", {"value": 10})).task_id,
+            )
+            r2 = await wait_for_task(
+                parent,
+                (await submit_task(parent, "c2_process", {"value": 10})).task_id,
+            )
+            assert r1.result["structuredContent"]["result"] == 20
+            assert r2.result["structuredContent"]["result"] == 30
 
     async def test_nested_mount_prefix_accumulation(self):
-        """Nested mounts accumulate prefixes correctly for tasks."""
         grandchild = FastMCP("gc")
         child = FastMCP("child")
         parent = FastMCP("parent")
+        parent.add_extension(TasksExtension())
 
         @grandchild.tool(task=True)
         async def deep_tool() -> str:
@@ -555,42 +262,16 @@ class TestMountedFunctionNameCollisions:
         child.mount(grandchild, namespace="gc")
         parent.mount(child, namespace="child")
 
-        async with Client(parent, mode="legacy") as client:
-            # Tool should be accessible and execute correctly
-            task = await client.call_tool("child_gc_deep_tool", {}, task=True)
-            result = await task.result()
-            assert result.data == "deep"
-
-
-class TestMountedTaskList:
-    """Test task listing with mounted servers."""
-
-    async def test_list_tasks_includes_mounted_tasks(self, parent_server):
-        """Task list includes tasks from mounted server tools."""
-        async with Client(parent_server, mode="legacy") as client:
-            # Create tasks on both parent and mounted tools
-            parent_task = await client.call_tool("parent_tool", {"value": 1}, task=True)
-            child_task = await client.call_tool(
-                "child_multiply", {"a": 2, "b": 2}, task=True
+        async with running_task_server(parent):
+            final = await wait_for_task(
+                parent,
+                (await submit_task(parent, "child_gc_deep_tool", {})).task_id,
             )
-
-            # Wait for completion
-            await parent_task.wait(timeout=2.0)
-            await child_task.wait(timeout=2.0)
-
-            # List all tasks - returns dict with "tasks" key
-            tasks_response = await client.list_tasks()
-
-            task_ids = [t["taskId"] for t in tasks_response["tasks"]]
-            assert parent_task.task_id in task_ids
-            assert child_task.task_id in task_ids
+            assert final.result["structuredContent"]["result"] == "deep"
 
 
 class TestMountedTaskMetadata:
-    """Test task metadata exposure for mounted tools."""
-
     async def test_mounted_tool_list_preserves_task_support_metadata(self):
-        """Mounted tools should preserve execution.task_support in tools/list."""
         child = FastMCP("child")
 
         @child.tool(task=True)
@@ -600,129 +281,96 @@ class TestMountedTaskMetadata:
         parent = FastMCP("parent")
         parent.mount(child)
 
-        child_tools = await child.list_tools()
-        parent_tools = await parent.list_tools()
+        child_tool = next(t for t in await child.list_tools() if t.name == "foo")
+        parent_tool = next(t for t in await parent.list_tools() if t.name == "foo")
 
-        child_tool = next(t for t in child_tools if t.name == "foo")
-        parent_tool = next(t for t in parent_tools if t.name == "foo")
-
-        child_mcp_tool = child_tool.to_mcp_tool(name=child_tool.name)
-        parent_mcp_tool = parent_tool.to_mcp_tool(name=parent_tool.name)
-
-        assert child_mcp_tool.execution is not None
-        assert parent_mcp_tool.execution is not None
-        assert child_mcp_tool.execution.task_support == "optional"
-        assert parent_mcp_tool.execution.task_support == "optional"
+        child_mcp = child_tool.to_mcp_tool(name=child_tool.name)
+        parent_mcp = parent_tool.to_mcp_tool(name=parent_tool.name)
+        assert child_mcp.execution.task_support == "optional"
+        assert parent_mcp.execution.task_support == "optional"
 
     async def test_proxy_tool_preserves_execution_metadata(self):
-        """ProxyTool.from_mcp_tool should propagate execution.task_support (#3569)."""
         mcp_tool = MCPTool(
             name="remote_task_tool",
             description="A remote tool that supports tasks",
             input_schema={"type": "object", "properties": {}},
             execution=ToolExecution(task_support="optional"),
         )
-
-        proxy = ProxyTool.from_mcp_tool(lambda: None, mcp_tool)  # ty: ignore[invalid-argument-type]
+        proxy = ProxyTool.from_mcp_tool(lambda: None, mcp_tool)  # type: ignore[arg-type]
         result = proxy.to_mcp_tool(name=proxy.name)
-
         assert result.execution is not None
         assert result.execution.task_support == "optional"
 
 
 class TestMountedTaskConfigModes:
-    """Test TaskConfig mode enforcement for mounted tools."""
-
     @pytest.fixture
-    def child_with_modes(self):
-        """Create a child server with tools in all three TaskConfig modes."""
-        mcp = FastMCP("child-modes", tasks=False)
+    def parent_with_modes(self) -> FastMCP:
+        child = FastMCP("child-modes")
 
-        @mcp.tool(task=TaskConfig(mode="optional"))
+        @child.tool(task=TaskConfig(mode="optional"))
         async def optional_tool() -> str:
-            """Tool that supports both sync and task execution."""
             return "optional result"
 
-        @mcp.tool(task=TaskConfig(mode="required"))
+        @child.tool(task=TaskConfig(mode="required"))
         async def required_tool() -> str:
-            """Tool that requires task execution."""
             return "required result"
 
-        @mcp.tool(task=TaskConfig(mode="forbidden"))
+        @child.tool(task=TaskConfig(mode="forbidden"))
         async def forbidden_tool() -> str:
-            """Tool that forbids task execution."""
             return "forbidden result"
 
-        return mcp
-
-    @pytest.fixture
-    def parent_with_modes(self, child_with_modes):
-        """Create a parent server with the child mounted."""
         parent = FastMCP("parent-modes")
-        parent.mount(child_with_modes, namespace="child")
+        parent.add_extension(TasksExtension())
+        parent.mount(child, namespace="child")
         return parent
 
     async def test_optional_mode_sync_through_mount(self, parent_with_modes):
-        """Optional mode tool works without task through mount."""
-        async with Client(parent_with_modes, mode="legacy") as client:
-            result = await client.call_tool("child_optional_tool", {})
-            assert "optional result" in str(result)
+        async with running_task_server(parent_with_modes):
+            result = await call_tool_without_optin(
+                parent_with_modes, "child_optional_tool", {}
+            )
+            assert "optional result" in result.content[0].text
 
     async def test_optional_mode_task_through_mount(self, parent_with_modes):
-        """Optional mode tool works with task through mount."""
-        async with Client(parent_with_modes, mode="legacy") as client:
-            task = await client.call_tool("child_optional_tool", {}, task=True)
-            assert task is not None
-            result = await task.result()
-            assert result.data == "optional result"
+        async with running_task_server(parent_with_modes):
+            final = await wait_for_task(
+                parent_with_modes,
+                (
+                    await submit_task(parent_with_modes, "child_optional_tool", {})
+                ).task_id,
+            )
+            assert final.result["structuredContent"]["result"] == "optional result"
 
     async def test_required_mode_with_task_through_mount(self, parent_with_modes):
-        """Required mode tool succeeds with task through mount."""
-        async with Client(parent_with_modes, mode="legacy") as client:
-            task = await client.call_tool("child_required_tool", {}, task=True)
-            assert task is not None
-            result = await task.result()
-            assert result.data == "required result"
+        async with running_task_server(parent_with_modes):
+            final = await wait_for_task(
+                parent_with_modes,
+                (
+                    await submit_task(parent_with_modes, "child_required_tool", {})
+                ).task_id,
+            )
+            assert final.result["structuredContent"]["result"] == "required result"
 
     async def test_required_mode_without_task_through_mount(self, parent_with_modes):
-        """Required mode tool errors without task through mount."""
-        from fastmcp.exceptions import ToolError
+        from fastmcp_tasks.models import MISSING_REQUIRED_CLIENT_CAPABILITY
+        from mcp.shared.exceptions import MCPError
 
-        async with Client(parent_with_modes, mode="legacy") as client:
-            with pytest.raises(ToolError) as exc_info:
-                await client.call_tool("child_required_tool", {})
-
-            assert "requires task-augmented execution" in str(exc_info.value)
+        async with running_task_server(parent_with_modes):
+            with pytest.raises(MCPError) as exc_info:
+                await call_tool_without_optin(
+                    parent_with_modes, "child_required_tool", {}
+                )
+            assert exc_info.value.error.code == MISSING_REQUIRED_CLIENT_CAPABILITY
 
     async def test_forbidden_mode_sync_through_mount(self, parent_with_modes):
-        """Forbidden mode tool works without task through mount."""
-        async with Client(parent_with_modes, mode="legacy") as client:
-            result = await client.call_tool("child_forbidden_tool", {})
-            assert "forbidden result" in str(result)
-
-    async def test_forbidden_mode_with_task_through_mount(self, parent_with_modes):
-        """Forbidden mode tool degrades gracefully with task through mount."""
-        async with Client(parent_with_modes, mode="legacy") as client:
-            task = await client.call_tool(
-                "child_forbidden_tool", {}, task=True, raise_on_error=False
+        async with running_task_server(parent_with_modes):
+            result = await call_tool_without_optin(
+                parent_with_modes, "child_forbidden_tool", {}
             )
-
-            # Should return immediately (graceful degradation)
-            assert task.returned_immediately
-
-            result = await task.result()
-            # Result is available but may indicate error or sync execution
-            assert result is not None
-
-
-# -----------------------------------------------------------------------------
-# Middleware classes for tracing tests
-# -----------------------------------------------------------------------------
+            assert "forbidden result" in result.content[0].text
 
 
 class ToolTracingMiddleware(Middleware):
-    """Middleware that traces tool calls."""
-
     def __init__(self, name: str, calls: list[str]):
         super().__init__()
         self._name = name
@@ -739,54 +387,15 @@ class ToolTracingMiddleware(Middleware):
         return result
 
 
-class ResourceTracingMiddleware(Middleware):
-    """Middleware that traces resource reads."""
-
-    def __init__(self, name: str, calls: list[str]):
-        super().__init__()
-        self._name = name
-        self._calls = calls
-
-    async def on_read_resource(
-        self,
-        context: MiddlewareContext[mt.ReadResourceRequestParams],
-        call_next: CallNext[mt.ReadResourceRequestParams, ResourceResult],
-    ) -> ResourceResult:
-        self._calls.append(f"{self._name}:before")
-        result = await call_next(context)
-        self._calls.append(f"{self._name}:after")
-        return result
-
-
-class PromptTracingMiddleware(Middleware):
-    """Middleware that traces prompt gets."""
-
-    def __init__(self, name: str, calls: list[str]):
-        super().__init__()
-        self._name = name
-        self._calls = calls
-
-    async def on_get_prompt(
-        self,
-        context: MiddlewareContext[mt.GetPromptRequestParams],
-        call_next: CallNext[mt.GetPromptRequestParams, PromptResult],
-    ) -> PromptResult:
-        self._calls.append(f"{self._name}:before")
-        result = await call_next(context)
-        self._calls.append(f"{self._name}:after")
-        return result
-
-
 class TestMiddlewareWithMountedTasks:
-    """Test that middleware runs at all levels when executing background tasks.
+    async def test_root_middleware_wraps_task_submission(self):
+        """For a tasked call, the root's middleware wraps submission.
 
-    For background tasks, middleware runs during task submission (wrapping the MCP
-    request handling that queues to Docket). The actual function execution happens
-    later in the Docket worker, after the middleware chain completes.
-    """
-
-    async def test_tool_middleware_runs_with_background_task(self):
-        """Middleware runs at parent, child, and grandchild levels for tool tasks."""
+        The interceptor composes at the registering (parent) server and
+        short-circuits before delegating into the mounted child, so child
+        middleware does not wrap a tasked submission; the tool body runs later
+        in the worker.
+        """
         calls: list[str] = []
 
         grandchild = FastMCP("Grandchild")
@@ -797,347 +406,53 @@ class TestMiddlewareWithMountedTasks:
             return x * 2
 
         grandchild.add_middleware(ToolTracingMiddleware("grandchild", calls))
-
         child = FastMCP("Child")
         child.mount(grandchild, namespace="gc")
         child.add_middleware(ToolTracingMiddleware("child", calls))
-
         parent = FastMCP("Parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child, namespace="c")
         parent.add_middleware(ToolTracingMiddleware("parent", calls))
 
-        async with Client(parent, mode="legacy") as client:
-            task = await client.call_tool("c_gc_compute", {"x": 5}, task=True)
-            result = await task.result()
-            assert result.data == 10
+        async with running_task_server(parent):
+            created = await submit_task(parent, "c_gc_compute", {"x": 5})
+            final = await wait_for_task(parent, created.task_id)
+            assert final.result["structuredContent"]["result"] == 10
 
-        # Middleware runs during task submission (before/after queuing to Docket)
-        # Function executes later in Docket worker
-        assert calls == [
-            "parent:before",
-            "child:before",
-            "grandchild:before",
-            "grandchild:after",
-            "child:after",
-            "parent:after",
-            "grandchild:tool",  # Executes in Docket after middleware completes
-        ]
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_resource_middleware_runs_with_background_task(self):
-        """Middleware runs at parent, child, and grandchild levels for resource tasks."""
-        calls: list[str] = []
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.resource("data://value", task=True)
-        async def get_data() -> str:
-            calls.append("grandchild:resource")
-            return "result"
-
-        grandchild.add_middleware(ResourceTracingMiddleware("grandchild", calls))
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-        child.add_middleware(ResourceTracingMiddleware("child", calls))
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-        parent.add_middleware(ResourceTracingMiddleware("parent", calls))
-
-        async with Client(parent, mode="legacy") as client:
-            task = await client.read_resource("data://c/gc/value", task=True)
-            result = await task.result()
-            assert result[0].text == "result"
-
-        # Middleware runs during task submission, function in Docket
-        assert calls == [
-            "parent:before",
-            "child:before",
-            "grandchild:before",
-            "grandchild:after",
-            "child:after",
-            "parent:after",
-            "grandchild:resource",
-        ]
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_prompt_middleware_runs_with_background_task(self):
-        """Middleware runs at parent, child, and grandchild levels for prompt tasks."""
-        calls: list[str] = []
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.prompt(task=True)
-        async def greet(name: str) -> str:
-            calls.append("grandchild:prompt")
-            return f"Hello, {name}!"
-
-        grandchild.add_middleware(PromptTracingMiddleware("grandchild", calls))
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-        child.add_middleware(PromptTracingMiddleware("child", calls))
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-        parent.add_middleware(PromptTracingMiddleware("parent", calls))
-
-        async with Client(parent, mode="legacy") as client:
-            task = await client.get_prompt("c_gc_greet", {"name": "World"}, task=True)
-            result = await task.result()
-            assert result.messages[0].content.text == "Hello, World!"
-
-        # Middleware runs during task submission, function in Docket
-        assert calls == [
-            "parent:before",
-            "child:before",
-            "grandchild:before",
-            "grandchild:after",
-            "child:after",
-            "parent:after",
-            "grandchild:prompt",
-        ]
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_resource_template_middleware_runs_with_background_task(self):
-        """Middleware runs at all levels for resource template tasks."""
-        calls: list[str] = []
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.resource("item://{id}", task=True)
-        async def get_item(id: str) -> str:
-            calls.append("grandchild:template")
-            return f"item-{id}"
-
-        grandchild.add_middleware(ResourceTracingMiddleware("grandchild", calls))
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-        child.add_middleware(ResourceTracingMiddleware("child", calls))
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-        parent.add_middleware(ResourceTracingMiddleware("parent", calls))
-
-        async with Client(parent, mode="legacy") as client:
-            task = await client.read_resource("item://c/gc/42", task=True)
-            result = await task.result()
-            assert result[0].text == "item-42"
-
-        # Middleware runs during task submission, function in Docket
-        assert calls == [
-            "parent:before",
-            "child:before",
-            "grandchild:before",
-            "grandchild:after",
-            "child:after",
-            "parent:after",
-            "grandchild:template",
-        ]
+        assert calls == ["parent:before", "parent:after", "grandchild:tool"]
 
 
-class TestMountedTasksWithTaskMetaParameter:
-    """Test mounted components called directly with task_meta parameter.
+class TestMountedDocketOwnership:
+    async def test_mounted_child_does_not_own_docket(self, parent_server, child_server):
+        """The parent owns the Docket; the mounted child does not."""
+        async with running_task_server(parent_server):
+            assert parent_server.docket is not None
+            assert child_server.docket is None
 
-    These tests verify the programmatic API where server.call_tool() or
-    server.read_resource() is called with an explicit task_meta parameter,
-    as opposed to using the Client with task=True.
 
-    Direct server calls require a running server context, so we use an outer
-    tool that makes the direct call internally.
-    """
-
-    async def test_mounted_tool_with_task_meta_creates_task(self):
-        """Mounted tool called with task_meta returns CreateTaskResult."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        child = FastMCP("Child")
+class TestSlowMountedTaskCancellation:
+    async def test_cancel_mounted_task(self):
+        child = FastMCP("child")
+        release = asyncio.Event()
 
         @child.tool(task=True)
-        async def add(a: int, b: int) -> int:
-            return a + b
+        async def slow() -> str:
+            await release.wait()
+            return "done"
 
-        parent = FastMCP("Parent")
+        parent = FastMCP("parent")
+        parent.add_extension(TasksExtension())
         parent.mount(child, namespace="child")
 
-        @parent.tool
-        async def outer() -> str:
-            # Direct call with task_meta from within server context
-            result = await parent.call_tool(
-                "child_add", {"a": 2, "b": 3}, task_meta=TaskMeta(ttl=300)
+        from tests.tasks.task_helpers import cancel_task
+
+        async with running_task_server(parent):
+            created = await submit_task(parent, "child_slow", {})
+            await cancel_task(parent, created.task_id)
+            release.set()
+            final = await wait_for_task(
+                parent,
+                created.task_id,
+                target_states=frozenset({"cancelled", "completed"}),
             )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_mounted_resource_with_task_meta_creates_task(self):
-        """Mounted resource called with task_meta returns CreateTaskResult."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        child = FastMCP("Child")
-
-        @child.resource("data://info", task=True)
-        async def get_info() -> str:
-            return "child info"
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="child")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.read_resource(
-                "data://child/info", task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_mounted_template_with_task_meta_creates_task(self):
-        """Mounted resource template with task_meta returns CreateTaskResult."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        child = FastMCP("Child")
-
-        @child.resource("item://{id}", task=True)
-        async def get_item(id: str) -> str:
-            return f"item-{id}"
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="child")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.read_resource(
-                "item://child/42", task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_deeply_nested_tool_with_task_meta(self):
-        """Three-level nested tool works with task_meta."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.tool(task=True)
-        async def compute(n: int) -> int:
-            return n * 3
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.call_tool(
-                "c_gc_compute", {"n": 7}, task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_deeply_nested_template_with_task_meta(self):
-        """Three-level nested template works with task_meta."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.resource("doc://{name}", task=True)
-        async def get_doc(name: str) -> str:
-            return f"doc: {name}"
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.read_resource(
-                "doc://c/gc/readme", task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_mounted_prompt_with_task_meta_creates_task(self):
-        """Mounted prompt called with task_meta returns CreateTaskResult."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        child = FastMCP("Child")
-
-        @child.prompt(task=True)
-        async def greet(name: str) -> str:
-            return f"Hello, {name}!"
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="child")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.render_prompt(
-                "child_greet", {"name": "World"}, task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
-
-    async def test_deeply_nested_prompt_with_task_meta(self):
-        """Three-level nested prompt works with task_meta."""
-        from fastmcp.server.tasks.config import TaskMeta
-
-        grandchild = FastMCP("Grandchild")
-
-        @grandchild.prompt(task=True)
-        async def describe(topic: str) -> str:
-            return f"Information about {topic}"
-
-        child = FastMCP("Child")
-        child.mount(grandchild, namespace="gc")
-
-        parent = FastMCP("Parent")
-        parent.mount(child, namespace="c")
-
-        @parent.tool
-        async def outer() -> str:
-            result = await parent.render_prompt(
-                "c_gc_describe", {"topic": "FastMCP"}, task_meta=TaskMeta(ttl=300)
-            )
-            return f"task:{result.task.task_id}"
-
-        async with Client(parent, mode="legacy") as client:
-            result = await client.call_tool("outer", {})
-            assert "task:" in str(result)
+            assert final.status in {"cancelled", "completed"}

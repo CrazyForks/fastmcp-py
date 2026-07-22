@@ -10,9 +10,7 @@ from opentelemetry.trace import SpanKind
 
 from fastmcp import Client, FastMCP
 
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
-)
+pytestmark = pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
 
 
 def assert_propagating_client_span(

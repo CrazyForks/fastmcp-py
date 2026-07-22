@@ -886,7 +886,7 @@ async def test_client_list_dict_return_type():
         assert result.data == [{"city": "NYC", "temp": 72}, {"city": "LA", "temp": 85}]
 
 
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
+@pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
 def test_client_new_resets_mutable_task_state(fastmcp_server):
     """Client.new() should not share mutable task tracking structures."""
     client = Client(transport=FastMCPTransport(fastmcp_server))
@@ -903,7 +903,7 @@ def test_client_new_resets_mutable_task_state(fastmcp_server):
     assert clone._submitted_task_ids is not client._submitted_task_ids  # ty: ignore
 
 
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
+@pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
 def test_client_new_rebinds_default_task_notification_handler(fastmcp_server):
     """Client.new() should bind the default task handler to the cloned client."""
     client = Client(transport=FastMCPTransport(fastmcp_server))

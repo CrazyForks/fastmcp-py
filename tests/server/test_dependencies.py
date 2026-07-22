@@ -3,15 +3,27 @@
 from contextlib import asynccontextmanager, contextmanager
 
 import pytest
+from docket import Docket
 from mcp_types import TextContent, TextResourceContents
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.dependencies import CurrentContext, Depends, Shared
 from fastmcp.server.context import Context
+from fastmcp_tasks import TasksExtension
 from tests.conftest import make_server_request_context
 
 HUZZAH = "huzzah!"
+
+
+@pytest.fixture
+def reset_docket_memory_server():
+    """Force a fresh memory:// Docket server bound to this test's event loop."""
+    if hasattr(Docket, "_memory_server"):
+        delattr(Docket, "_memory_server")
+    yield
+    if hasattr(Docket, "_memory_server"):
+        delattr(Docket, "_memory_server")
 
 
 class Connection:
@@ -1193,8 +1205,9 @@ class TestSharedDependencies:
             )
             assert call_count == 1
 
-    @pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
-    async def test_shared_resolves_on_task_capable_server(self):
+    async def test_shared_resolves_on_task_capable_server(
+        self, reset_docket_memory_server
+    ):
         """Shared() dependencies resolve on a normal request even when the server
         has task-enabled components.
 
@@ -1205,6 +1218,7 @@ class TestSharedDependencies:
         on ordinary (non-task) calls.
         """
         mcp = FastMCP("task-capable-server")
+        mcp.add_extension(TasksExtension())
 
         call_count = 0
 

@@ -1,7 +1,8 @@
-"""Tests for custom component subclasses with task support.
+"""Tests for custom Tool subclasses with task support.
 
-Verifies that custom Tool, Resource, and Prompt subclasses can use
-background task execution by setting task_config.
+Verifies that custom Tool subclasses can use background task execution by
+setting task_config. SEP-2663 is tools-only, so the removed resource/prompt
+subclass cases are gone.
 """
 
 import asyncio
@@ -9,15 +10,23 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from fastmcp_tasks.components import (
+    add_component_to_docket,
+    register_component_with_docket,
+)
+from fastmcp_tasks.models import CreateTaskResult
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
 from fastmcp.tools.base import Tool, ToolResult
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.tasks import TaskConfig
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    _opted_in_request,
+    auth_scope,
+    call_tool_without_optin,
+    run_task,
+    running_task_server,
 )
 
 
@@ -56,9 +65,10 @@ class CustomToolForbidden(Tool):
 
 
 @pytest.fixture
-def custom_tool_server():
-    """Create a server with custom tool subclasses."""
+def custom_tool_server() -> FastMCP:
+    """A server with custom tool subclasses."""
     mcp = FastMCP("custom-tool-server")
+    mcp.add_extension(TasksExtension())
     mcp.add_tool(CustomTool(name="custom_tool", description="A custom tool"))
     mcp.add_tool(
         CustomToolWithLogic(name="custom_logic", description="Custom tool with logic")
@@ -70,76 +80,67 @@ def custom_tool_server():
 
 
 async def test_custom_tool_sync_execution(custom_tool_server):
-    """Custom tool executes synchronously when no task metadata."""
-    async with Client(custom_tool_server, mode="legacy") as client:
-        result = await client.call_tool("custom_tool", {})
-        assert "Custom tool executed" in str(result)
+    """Custom tool executes synchronously without a tasks opt-in."""
+    async with running_task_server(custom_tool_server):
+        result = await call_tool_without_optin(custom_tool_server, "custom_tool", {})
+        assert "Custom tool executed" in result.content[0].text
 
 
 async def test_custom_tool_background_execution(custom_tool_server):
-    """Custom tool executes as background task when task=True."""
-    async with Client(custom_tool_server, mode="legacy") as client:
-        task = await client.call_tool("custom_tool", {}, task=True)
+    """Custom tool executes as a background task when opted in."""
+    async with running_task_server(custom_tool_server):
+        final = await run_task(custom_tool_server, "custom_tool", {})
 
-        assert task is not None
-        assert not task.returned_immediately
-        assert task.task_id is not None
-
-        # Wait for result
-        result = await task.result()
-        assert "Custom tool executed" in str(result)
+    assert final.status == "completed"
+    assert "Custom tool executed" in final.result["content"][0]["text"]
 
 
 async def test_custom_tool_with_arguments(custom_tool_server):
     """Custom tool receives arguments correctly in background execution."""
-    async with Client(custom_tool_server, mode="legacy") as client:
-        task = await client.call_tool("custom_logic", {"duration": 1}, task=True)
+    async with running_task_server(custom_tool_server):
+        final = await run_task(custom_tool_server, "custom_logic", {"duration": 1})
 
-        assert task is not None
-        result = await task.result()
-        assert "Completed after 1 units" in str(result)
+    assert final.status == "completed"
+    assert "Completed after 1 units" in final.result["content"][0]["text"]
 
 
 async def test_custom_tool_forbidden_sync_only(custom_tool_server):
-    """Custom tool with forbidden mode executes sync only."""
-    async with Client(custom_tool_server, mode="legacy") as client:
-        # Sync execution works
-        result = await client.call_tool("custom_forbidden", {})
-        assert "Sync only" in str(result)
+    """Custom tool with forbidden mode executes synchronously."""
+    async with running_task_server(custom_tool_server):
+        result = await call_tool_without_optin(
+            custom_tool_server, "custom_forbidden", {}
+        )
+        assert "Sync only" in result.content[0].text
 
 
 async def test_custom_tool_forbidden_rejects_task(custom_tool_server):
-    """Custom tool with forbidden mode returns error for task request."""
-    async with Client(custom_tool_server, mode="legacy") as client:
-        task = await client.call_tool("custom_forbidden", {}, task=True)
-
-        # Should return immediately with error
-        assert task.returned_immediately
+    """A forbidden tool runs synchronously even when the client opts in."""
+    async with running_task_server(custom_tool_server):
+        with auth_scope(None), _opted_in_request("custom_forbidden", {}, None):
+            result = await custom_tool_server.call_tool("custom_forbidden", {})
+        assert not isinstance(result, CreateTaskResult)
+        assert "Sync only" in result.content[0].text
 
 
 async def test_custom_tool_registers_with_docket():
-    """Verify custom tool's register_with_docket is called during server startup."""
-    from unittest.mock import MagicMock
-
+    """A task-capable custom tool registers its `run` entry point with Docket."""
     tool = CustomTool(name="test", description="test")
     mock_docket = MagicMock()
 
-    tool.register_with_docket(mock_docket)
+    register_component_with_docket(tool, mock_docket)
 
-    # Should register self.run with docket using prefixed key
     mock_docket.register.assert_called_once()
     call_args = mock_docket.register.call_args
     assert call_args[1]["names"] == ["tool:test@"]
 
 
 async def test_custom_tool_forbidden_does_not_register():
-    """Verify custom tool with forbidden mode doesn't register with docket."""
+    """A forbidden custom tool does not register with Docket."""
     tool = CustomToolForbidden(name="test", description="test")
     mock_docket = MagicMock()
 
-    tool.register_with_docket(mock_docket)
+    register_component_with_docket(tool, mock_docket)
 
-    # Should NOT register
     mock_docket.register.assert_not_called()
 
 
@@ -157,26 +158,24 @@ class TestFastMCPComponentDocketMethods:
         assert component.task_config.mode == "forbidden"
 
     def test_register_with_docket_is_noop(self):
-        """Base register_with_docket does nothing (subclasses override)."""
+        """Registering a forbidden base component is a no-op."""
         component = FastMCPComponent(name="test")
         mock_docket = MagicMock()
 
-        # Should not raise, just no-op
-        component.register_with_docket(mock_docket)
+        register_component_with_docket(component, mock_docket)
 
-        # Should not have called any docket methods
         mock_docket.register.assert_not_called()
 
     async def test_add_to_docket_raises_when_forbidden(self):
-        """Base add_to_docket raises RuntimeError when mode is 'forbidden'."""
+        """add_component_to_docket raises RuntimeError when mode is 'forbidden'."""
         component = FastMCPComponent(name="test")
         mock_docket = MagicMock()
 
         with pytest.raises(RuntimeError, match="task execution not supported"):
-            await component.add_to_docket(mock_docket)
+            await add_component_to_docket(component, mock_docket, None)
 
     async def test_add_to_docket_raises_not_implemented_when_allowed(self):
-        """Base add_to_docket raises NotImplementedError when not forbidden."""
+        """add_component_to_docket raises NotImplementedError for an unknown type."""
         component = FastMCPComponent(
             name="test", task_config=TaskConfig(mode="optional")
         )
@@ -185,4 +184,4 @@ class TestFastMCPComponentDocketMethods:
         with pytest.raises(
             NotImplementedError, match="does not implement add_to_docket"
         ):
-            await component.add_to_docket(mock_docket)
+            await add_component_to_docket(component, mock_docket, None)

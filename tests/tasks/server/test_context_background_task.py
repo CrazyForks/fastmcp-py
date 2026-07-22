@@ -1,63 +1,57 @@
-"""Tests for Context background task support (SEP-1686).
+"""Tests for Context background task support (SEP-2663 tasks).
 
-Tests Context API surface (unit) and background task elicitation (integration).
-Integration tests use Client(mcp, mode="legacy") with the real memory:// Docket backend —
-no mocking of Redis, Docket, or session internals.
+Covers the Context API surface in a background task (unit tests, no Redis
+needed) and end-to-end background-task behavior driven in-process through the
+shared task helpers: progress reporting, context wiring, access-token
+availability, and poll-based in-task elicitation.
+
+A SEP-2663 worker has no live session and no back-channel: ``ctx.session`` is
+unavailable, and elicitation is polled (the worker parks an input request that
+the client answers via ``tasks/update``).
 """
 
-import asyncio
+from __future__ import annotations
+
 import gc
-import json
 from contextlib import AsyncExitStack
-from datetime import datetime, timezone
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
-from fastmcp_tasks._legacy_wire.elicitation import handle_task_input
 from fastmcp_tasks.context import (
-    TaskContextInfo,
-    TaskContextSnapshot,
-    _remember_snapshot,
     _task_sessions,
-    get_task_scope,
     get_task_session,
     register_task_session,
-)
-from fastmcp_tasks.dependencies import CurrentDocket
-from fastmcp_tasks.keys import (
-    task_redis_prefix,
 )
 from mcp import ServerSession
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp_types import (
     ClientCapabilities,
-    CreateMessageResult,
     Implementation,
     InitializeRequestParams,
-    TextContent,
 )
 from pydantic import BaseModel
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-from fastmcp.client.elicitation import ElicitResult
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.context import Context
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.elicitation import (
     AcceptedElicitation,
-    CancelledElicitation,
     DeclinedElicitation,
+)
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    running_task_server,
+    submit_task,
+    update_task,
+    wait_for_task,
 )
 
 # =============================================================================
 # Unit tests: Context API surface (no Redis/Docket needed)
 # =============================================================================
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
-)
 
 
 class TestContextBackgroundTaskSupport:
@@ -85,23 +79,9 @@ class TestContextBackgroundTaskSupport:
             setattr(ctx, "task_id", "new-id")
 
 
-async def test_task_session_is_released_after_client_disconnect():
-    _task_sessions.clear()
-    mcp = FastMCP("test")
-
-    @mcp.tool(task=True)
-    async def work() -> str:
-        return "done"
-
-    async with Client(mcp, mode="legacy") as client:
-        task = await client.call_tool("work", task=True)
-        await task.result()
-        assert len(_task_sessions) == 1
-
-    assert _task_sessions == {}
-
-
 async def test_live_task_session_is_released_on_connection_disconnect():
+    """A registered in-process task session is dropped when its connection
+    exit stack unwinds."""
     _task_sessions.clear()
 
     class MockConnection:
@@ -124,6 +104,7 @@ async def test_live_task_session_is_released_on_connection_disconnect():
 
 
 async def test_connection_cleanup_does_not_remove_replacement_session():
+    """Registering a replacement session under the same id keeps the newer one."""
     _task_sessions.clear()
 
     class MockConnection:
@@ -147,6 +128,7 @@ async def test_connection_cleanup_does_not_remove_replacement_session():
 
 
 def test_replaced_task_session_is_not_removed_by_old_weakref():
+    """A stale weakref for a replaced session does not evict the new session."""
     _task_sessions.clear()
 
     class MockSession:
@@ -177,7 +159,7 @@ class TestContextSessionProperty:
             _ = ctx.session
 
     def test_session_uses_stored_session_in_background_task(self):
-        """session should use _session in background task mode."""
+        """session should use the stored session in background task mode."""
         mcp = FastMCP("test")
 
         class MockSession:
@@ -191,7 +173,7 @@ class TestContextSessionProperty:
         assert ctx.session is mock_session
 
     def test_session_uses_stored_session_during_on_initialize(self):
-        """session should use _session during on_initialize (no request context)."""
+        """session should use the stored session during on_initialize."""
         mcp = FastMCP("test")
 
         class MockSession:
@@ -228,7 +210,7 @@ class TestContextBackgroundTaskLogging:
         return ctx, send_log_message
 
     async def test_background_task_honors_session_level(self):
-        """A background task has a session but no request context; the
+        """A background task has a stored session but no request context; the
         per-session minimum registered via logging/setLevel must still gate
         its logs, so sub-threshold messages are not sent to the client."""
         mcp = FastMCP("test")
@@ -258,10 +240,10 @@ class TestContextBackgroundTaskLogging:
 class TestContextClientExtensionBackgroundTask:
     """Tests for Context.client_supports_extension() in background task mode.
 
-    A background task has a live snapshot session but no request context. The
-    client's advertised capabilities are preserved on the snapshot session's
-    ``client_params``, so extension detection must read from the session rather
-    than gating on ``request_context``.
+    A background task may carry a stored snapshot session but no request
+    context. The client's advertised capabilities are preserved on the
+    session's ``client_params``, so extension detection reads from the session
+    rather than gating on ``request_context``.
     """
 
     def _make_task_context(
@@ -286,7 +268,7 @@ class TestContextClientExtensionBackgroundTask:
         )
 
     def test_background_task_detects_advertised_extension(self):
-        """The snapshot session preserves the client's initialize params, so an
+        """The stored session preserves the client's initialize params, so an
         advertised extension is detected even with no request context."""
         mcp = FastMCP("test")
         ctx = self._make_task_context(mcp, {"ext-abc": {}})
@@ -315,8 +297,9 @@ class TestContextClientExtensionBackgroundTask:
 class TestContextElicitBackgroundTask:
     """Tests for Context.elicit() in background task mode."""
 
-    async def test_elicit_raises_when_background_task_but_no_docket(self):
-        """elicit() should raise when in background task mode but Docket unavailable."""
+    async def test_elicit_raises_when_no_task_engine(self):
+        """elicit() fails fast when in a background task but no tasks extension
+        is installed to answer the request."""
         mcp = FastMCP("test")
         ctx = Context(mcp, task_id="test-task-123")
 
@@ -325,51 +308,8 @@ class TestContextElicitBackgroundTask:
 
         ctx._session = cast(ServerSession, MockSession())
 
-        with pytest.raises(RuntimeError, match="Docket"):
+        with pytest.raises(RuntimeError, match="tasks extension"):
             await ctx.elicit("Need input", str)
-
-
-class TestElicitFailFast:
-    """Tests for elicit_for_task fail-fast on notification push failure."""
-
-    async def test_elicit_returns_cancel_when_notification_push_fails(self):
-        """elicit_for_task should return cancel immediately when push_notification fails.
-
-        If the client can't receive the input_required notification, waiting
-        for a response that will never come would block for up to 1 hour.
-        Instead, we return cancel immediately (fail-fast).
-
-        This test patches ONLY push_notification — all other components
-        (Docket, Redis, session) are real via the memory:// backend.
-        """
-        mcp = FastMCP("failfast-test")
-        elicit_started = asyncio.Event()
-        captured: dict[str, object] = {}
-
-        @mcp.tool(task=True)
-        async def failfast_tool(ctx: Context) -> str:
-            elicit_started.set()
-            result = await ctx.elicit("This notification will fail", str)
-            captured["result_type"] = type(result).__name__
-            captured["is_cancelled"] = isinstance(result, CancelledElicitation)
-            return "done"
-
-        # Patch push_notification BEFORE starting client so it's active
-        # when the tool runs in the Docket worker
-        with patch(
-            "fastmcp.server.tasks.notifications.push_notification",
-            side_effect=ConnectionError("Redis queue unavailable"),
-        ):
-            async with Client(mcp, mode="legacy") as client:
-                task = await client.call_tool("failfast_tool", {}, task=True)
-                await asyncio.wait_for(elicit_started.wait(), timeout=5.0)
-                await task.wait(timeout=10.0)
-                result = await task.result()
-                assert result.data == "done"
-
-        # The tool should have received CancelledElicitation (fail-fast)
-        assert captured["is_cancelled"] is True
-        assert captured["result_type"] == "CancelledElicitation"
 
 
 class TestContextDocumentation:
@@ -392,143 +332,67 @@ class TestContextDocumentation:
 
 
 # =============================================================================
-# Integration tests: Client(mcp, mode="legacy") + memory:// Docket backend
+# Integration tests: in-process SEP-2663 tasks via the shared helpers
 # =============================================================================
 
 
 class TestBackgroundTaskIntegration:
-    """Integration tests for background task context using real Docket memory backend.
-
-    These tests use Client(mcp, mode="legacy") with the memory:// broker — no mocking.
-    The memory:// backend provides a fully functional in-memory Redis store
-    that Docket uses automatically when running tests.
-    """
+    """End-to-end background task context, driven in-process via the helpers."""
 
     async def test_report_progress_in_background_task(self):
         """report_progress() should complete without error in a background task."""
         mcp = FastMCP("progress-test")
-        progress_reported = asyncio.Event()
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def progress_tool(ctx: Context) -> str:
             await ctx.report_progress(0, 100, "Starting...")
             await ctx.report_progress(50, 100, "Half done")
             await ctx.report_progress(100, 100, "Complete")
-            progress_reported.set()
             return "done"
 
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("progress_tool", {}, task=True)
-            await asyncio.wait_for(progress_reported.wait(), timeout=5.0)
-            await task.wait(timeout=5.0)
-            result = await task.result()
-            assert result.data == "done"
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "progress_tool", {})
+            final = await wait_for_task(mcp, created.task_id)
+
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "done"}
 
     async def test_context_wiring_in_background_task(self):
-        """Context should be properly wired with task_id and session_id."""
+        """A worker Context is wired as a background task with no live session."""
         mcp = FastMCP("wiring-test")
-        task_completed = asyncio.Event()
-        captured: dict[str, object] = {}
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
-        async def verify_wiring(ctx: Context) -> str:
-            captured["task_id"] = ctx.task_id
-            captured["session_id"] = ctx.session_id
-            captured["is_background"] = ctx.is_background_task
-            task_completed.set()
-            return "ok"
+        async def verify_wiring(ctx: Context) -> dict[str, bool]:
+            session_unavailable = False
+            try:
+                _ = ctx.session
+            except RuntimeError:
+                session_unavailable = True
+            return {
+                "task_id_set": ctx.task_id is not None,
+                "is_background": ctx.is_background_task,
+                "no_request_context": ctx.request_context is None,
+                "session_unavailable": session_unavailable,
+            }
 
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("verify_wiring", {}, task=True)
-            await asyncio.wait_for(task_completed.wait(), timeout=5.0)
-            await task.wait(timeout=5.0)
-            result = await task.result()
-            assert result.data == "ok"
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "verify_wiring", {})
+            final = await wait_for_task(mcp, created.task_id)
 
-        assert captured["task_id"] is not None
-        assert captured["session_id"] is not None
-        assert captured["is_background"] is True
-
-    async def test_origin_request_id_round_trips_through_background_task(self):
-        """E2E: origin_request_id captured at submit time is restored in worker.
-
-        We validate this by comparing ctx.origin_request_id with the value
-        stored in Docket's Redis for this task.
-        """
-
-        mcp = FastMCP("origin-request-id-roundtrip")
-
-        @mcp.tool(task=True)
-        async def check_origin_request_id(ctx: Context, docket=CurrentDocket()) -> str:
-            assert ctx.is_background_task is True
-            assert ctx.request_context is None
-            assert ctx.task_id is not None
-
-            origin = ctx.origin_request_id
-            assert origin is not None
-            assert isinstance(origin, str)
-            assert origin != ""
-
-            # Verify the snapshot in Redis contains the same value
-            task_scope = get_task_scope()
-            key = docket.key(f"{task_redis_prefix(task_scope)}:{ctx.task_id}:snapshot")
-            async with docket.redis() as redis:
-                raw = await redis.get(key)
-
-            assert raw is not None
-            if isinstance(raw, bytes):
-                raw = raw.decode()
-            snapshot = json.loads(raw)
-            assert snapshot["origin_request_id"] == origin
-            return "ok"
-
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("check_origin_request_id", {}, task=True)
-            result = await task.result()
-            assert result.data == "ok"
-
-    @pytest.mark.xfail(
-        reason="Background-task sampling has no back-channel under SDK v2: the "
-        "per-request ServerSession that would carry sampling/createMessage is "
-        "gone once the submitting request completes, so ctx.sample() from a "
-        "worker raises NoBackChannelError. Needs a relay like elicit() "
-        "(context.py TODO); tracked in sdk-feedback.",
-        strict=True,
-    )
-    async def test_sample_uses_origin_request_id_in_background_task(self):
-        """E2E: ctx.sample() works in a task without an active request context."""
-        mcp = FastMCP("sample-background-test")
-        captured: dict[str, object] = {}
-
-        @mcp.tool(task=True)
-        async def ask_client(ctx: Context) -> str:
-            assert ctx.is_background_task is True
-            assert ctx.request_context is None
-            assert ctx.origin_request_id is not None
-            result = await ctx.sample("Say hello")
-            return result.text or ""
-
-        def sampling_handler(messages, params, ctx):
-            captured["called"] = True
-            return CreateMessageResult(
-                role="assistant",
-                content=TextContent(type="text", text="hello from background"),
-                model="test-model",
-                stop_reason="endTurn",
-            )
-
-        async with Client(
-            mcp, mode="legacy", sampling_handler=sampling_handler
-        ) as client:
-            task = await client.call_tool("ask_client", {}, task=True)
-            result = await task.result()
-
-        assert result.data == "hello from background"
-        assert captured["called"] is True
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {
+            "task_id_set": True,
+            "is_background": True,
+            "no_request_context": True,
+            "session_unavailable": True,
+        }
 
     async def test_elicit_accept_flow(self):
-        """E2E: tool elicits input, client accepts via elicitation_handler."""
+        """E2E: tool elicits input, client accepts via tasks/update (poll)."""
         mcp = FastMCP("elicit-accept-test")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def ask_name(ctx: Context) -> str:
@@ -537,18 +401,26 @@ class TestBackgroundTaskIntegration:
                 return f"Hello, {result.data}!"
             return "No name provided"
 
-        async def handler(message, response_type, params, ctx):
-            return ElicitResult(action="accept", content={"value": "Bob"})
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "ask_name", {})
+            parked = await wait_for_task(
+                mcp, created.task_id, target_states=frozenset({"input_required"})
+            )
+            key = next(iter(parked.input_requests))
+            await update_task(
+                mcp,
+                created.task_id,
+                {key: {"action": "accept", "content": {"value": "Bob"}}},
+            )
+            final = await wait_for_task(mcp, created.task_id)
 
-        async with Client(mcp, mode="legacy", elicitation_handler=handler) as client:
-            task = await client.call_tool("ask_name", {}, task=True)
-            await task.wait(timeout=10.0)
-            result = await task.result()
-            assert result.data == "Hello, Bob!"
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "Hello, Bob!"}
 
     async def test_elicit_decline_flow(self):
-        """E2E: tool elicits input, client declines via elicitation_handler."""
+        """E2E: tool elicits input, client declines via tasks/update (poll)."""
         mcp = FastMCP("elicit-decline-test")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def optional_input(ctx: Context) -> str:
@@ -559,23 +431,27 @@ class TestBackgroundTaskIntegration:
                 return f"Got: {result.data}"
             return "Cancelled"
 
-        async def handler(message, response_type, params, ctx):
-            return ElicitResult(action="decline")
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "optional_input", {})
+            parked = await wait_for_task(
+                mcp, created.task_id, target_states=frozenset({"input_required"})
+            )
+            key = next(iter(parked.input_requests))
+            await update_task(mcp, created.task_id, {key: {"action": "decline"}})
+            final = await wait_for_task(mcp, created.task_id)
 
-        async with Client(mcp, mode="legacy", elicitation_handler=handler) as client:
-            task = await client.call_tool("optional_input", {}, task=True)
-            await task.wait(timeout=10.0)
-            result = await task.result()
-            assert result.data == "User declined"
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "User declined"}
 
     async def test_elicit_with_pydantic_model(self):
-        """E2E: tool elicits structured Pydantic input via elicitation_handler."""
+        """E2E: tool elicits structured Pydantic input via tasks/update (poll)."""
 
         class UserInfo(BaseModel):
             name: str
             age: int
 
         mcp = FastMCP("elicit-pydantic-test")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def get_user_info(ctx: Context) -> str:
@@ -585,51 +461,35 @@ class TestBackgroundTaskIntegration:
                 return f"{result.data.name} is {result.data.age}"
             return "No info"
 
-        async def handler(message, response_type, params, ctx):
-            return ElicitResult(action="accept", content={"name": "Alice", "age": 30})
-
-        async with Client(mcp, mode="legacy", elicitation_handler=handler) as client:
-            task = await client.call_tool("get_user_info", {}, task=True)
-            await task.wait(timeout=10.0)
-            result = await task.result()
-            assert result.data == "Alice is 30"
-
-    async def test_handle_task_input_rejects_when_not_waiting(self):
-        """handle_task_input returns False when no task is waiting for input."""
-        mcp = FastMCP("reject-test")
-
-        @mcp.tool(task=True)
-        async def simple_tool() -> str:
-            return "done"
-
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("simple_tool", {}, task=True)
-            await task.wait(timeout=5.0)
-
-            # Task already completed — no elicitation waiting
-            success = await handle_task_input(
-                task_id=task.task_id,
-                task_scope="nonexistent-scope",
-                action="accept",
-                content={"value": "too late"},
-                fastmcp=mcp,
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "get_user_info", {})
+            parked = await wait_for_task(
+                mcp, created.task_id, target_states=frozenset({"input_required"})
             )
-            assert success is False
+            key = next(iter(parked.input_requests))
+            await update_task(
+                mcp,
+                created.task_id,
+                {key: {"action": "accept", "content": {"name": "Alice", "age": 30}}},
+            )
+            final = await wait_for_task(mcp, created.task_id)
+
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "Alice is 30"}
 
 
 class TestAccessTokenInBackgroundTasks:
     """Tests for access token availability in background tasks (#3095).
 
-    Integration tests use Client(mcp, mode="legacy") with the real memory:// Docket backend.
-    The token snapshot/restore round-trip flows through actual Redis (fakeredis).
-
-    Note: async tests run in isolated asyncio tasks, so ContextVar changes
-    are automatically scoped — no cleanup required.
+    The token set at submit time is available inside the worker (via the
+    captured context snapshot). Async tests run in isolated asyncio tasks, so
+    ContextVar changes are automatically scoped — no cleanup required.
     """
 
     async def test_token_round_trips_through_background_task(self):
         """E2E: token set at submit time is available inside the worker."""
         mcp = FastMCP("token-roundtrip")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def check_token(ctx: Context) -> str:
@@ -646,81 +506,31 @@ class TestAccessTokenInBackgroundTasks:
         )
         auth_context_var.set(AuthenticatedUser(test_token))
 
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("check_token", {}, task=True)
-            result = await task.result()
-            assert result.data == "roundtrip-jwt|test-client"
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "check_token", {})
+            final = await wait_for_task(mcp, created.task_id)
+
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {
+            "result": "roundtrip-jwt|test-client"
+        }
 
     async def test_no_token_when_unauthenticated(self):
         """E2E: background task gets no token when nothing was set."""
         mcp = FastMCP("no-auth")
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=True)
         async def check_token(ctx: Context) -> str:
             token = get_access_token()
             return "no-token" if token is None else token.token
 
-        async with Client(mcp, mode="legacy") as client:
-            task = await client.call_tool("check_token", {}, task=True)
-            result = await task.result()
-            assert result.data == "no-token"
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "check_token", {})
+            final = await wait_for_task(mcp, created.task_id)
 
-    async def test_expired_token_returns_none(self):
-        """get_access_token() returns None when task token has expired."""
-        expired = AccessToken(
-            token="expired-jwt",
-            client_id="test-client",
-            scopes=["read"],
-            expires_at=int(datetime.now(timezone.utc).timestamp()) - 3600,
-        )
-        _remember_snapshot(
-            "test-task",
-            TaskContextSnapshot(access_token_json=expired.model_dump_json()),
-        )
-        fake_ctx = TaskContextInfo(task_id="test-task", task_scope="s")
-        with patch(
-            "fastmcp.server.dependencies.get_task_context", return_value=fake_ctx
-        ):
-            assert get_access_token() is None
-
-    async def test_valid_token_with_future_expiry(self):
-        """get_access_token() returns token when expiry is in the future."""
-        valid = AccessToken(
-            token="valid-jwt",
-            client_id="test-client",
-            scopes=["read"],
-            expires_at=int(datetime.now(timezone.utc).timestamp()) + 3600,
-        )
-        _remember_snapshot(
-            "test-task",
-            TaskContextSnapshot(access_token_json=valid.model_dump_json()),
-        )
-        fake_ctx = TaskContextInfo(task_id="test-task", task_scope="s")
-        with patch(
-            "fastmcp.server.dependencies.get_task_context", return_value=fake_ctx
-        ):
-            result = get_access_token()
-            assert result is not None
-            assert result.token == "valid-jwt"
-
-    async def test_token_without_expiry_always_valid(self):
-        """get_access_token() returns token when no expires_at is set."""
-        no_expiry = AccessToken(
-            token="eternal-jwt",
-            client_id="test-client",
-            scopes=["read"],
-        )
-        _remember_snapshot(
-            "test-task",
-            TaskContextSnapshot(access_token_json=no_expiry.model_dump_json()),
-        )
-        fake_ctx = TaskContextInfo(task_id="test-task", task_scope="s")
-        with patch(
-            "fastmcp.server.dependencies.get_task_context", return_value=fake_ctx
-        ):
-            result = get_access_token()
-            assert result is not None
-            assert result.token == "eternal-jwt"
+        assert final.status == "completed"
+        assert final.result["structuredContent"] == {"result": "no-token"}
 
 
 class TestLifespanContextInBackgroundTasks:

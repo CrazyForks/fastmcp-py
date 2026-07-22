@@ -1,153 +1,104 @@
-"""
-Tests for authorization-based task isolation (CRITICAL SECURITY).
+"""Authorization-based task isolation (CRITICAL SECURITY).
 
-Ensures that tasks are properly scoped to authorization identity and clients
-cannot access each other's tasks.
+Tasks are scoped to the caller's authorization identity via the auth-scoped
+compound Docket key, so a caller can only resolve tasks it created. A cross-scope
+task id is indistinguishable from a missing one (-32602 "not found"), which keeps
+task existence from leaking across callers. These tests drive the task lifecycle
+in-process (there is no client task API until Phase 4), binding a different
+access token per caller through the shared helper.
 """
+
+from __future__ import annotations
 
 import pytest
-from mcp.server.auth.middleware.auth_context import (
-    auth_context_var,
-)
-from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.shared.exceptions import MCPError
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-from fastmcp.server.auth import AccessToken
-
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    get_task,
+    make_access_token,
+    run_task,
+    running_task_server,
+    submit_task,
+    wait_for_task,
 )
 
 
 @pytest.fixture
-def task_server():
-    """Create a server with background tasks enabled."""
+def task_server() -> FastMCP:
     mcp = FastMCP("security-test-server")
+    mcp.add_extension(TasksExtension())
 
     @mcp.tool(task=True)
     async def secret_tool(data: str) -> str:
-        """A tool that processes sensitive data."""
         return f"Secret result: {data}"
 
     return mcp
 
 
 async def test_same_client_can_access_all_its_tasks(task_server: FastMCP):
-    """A single authenticated client can access all tasks it created."""
-    token = AccessToken(
-        token="token-a",
-        client_id="client-a",
-        scopes=["read"],
-    )
-    reset = auth_context_var.set(AuthenticatedUser(token))
-    try:
-        async with Client(task_server, mode="legacy") as client:
-            task1 = await client.call_tool(
-                "secret_tool", {"data": "first"}, task=True, task_id="task-1"
-            )
-            task2 = await client.call_tool(
-                "secret_tool", {"data": "second"}, task=True, task_id="task-2"
-            )
-
-            await task1.wait(timeout=2.0)
-            await task2.wait(timeout=2.0)
-
-            result1 = await task1.result()
-            result2 = await task2.result()
-
-            assert "first" in str(result1.data)
-            assert "second" in str(result2.data)
-    finally:
-        auth_context_var.reset(reset)
+    """A single authenticated caller can resolve every task it created."""
+    token = make_access_token("client-a")
+    async with running_task_server(task_server):
+        first = await run_task(
+            task_server, "secret_tool", {"data": "first"}, access_token=token
+        )
+        second = await run_task(
+            task_server, "secret_tool", {"data": "second"}, access_token=token
+        )
+        assert "first" in first.result["content"][0]["text"]
+        assert "second" in second.result["content"][0]["text"]
 
 
 async def test_unauthenticated_client_can_access_its_tasks(task_server: FastMCP):
-    """An unauthenticated client can access tasks it created (by task ID)."""
-    async with Client(task_server, mode="legacy") as client:
-        task = await client.call_tool(
-            "secret_tool", {"data": "hello"}, task=True, task_id="my-task"
-        )
-        await task.wait(timeout=2.0)
-        result = await task.result()
-        assert "hello" in str(result.data)
-
-
-def _set_auth(client_id: str, sub: str | None = None):
-    """Install an auth context for a given client_id/sub. Returns the reset token."""
-    claims = {"sub": sub} if sub else {}
-    token = AccessToken(
-        token=f"token-{client_id}-{sub or ''}",
-        client_id=client_id,
-        scopes=["read"],
-        claims=claims,
-    )
-    return auth_context_var.set(AuthenticatedUser(token))
-
-
-async def _submit_task_id(client: Client, data: str) -> str:
-    """Submit a background task and return its server-assigned task id."""
-    task = await client.call_tool("secret_tool", {"data": data}, task=True)
-    await task.wait(timeout=2.0)
-    return task.task_id
+    """An anonymous caller can resolve tasks in the anonymous keyspace."""
+    async with running_task_server(task_server):
+        final = await run_task(task_server, "secret_tool", {"data": "hello"})
+        assert "hello" in final.result["content"][0]["text"]
 
 
 async def test_distinct_clients_cannot_access_each_others_tasks(
     task_server: FastMCP,
 ):
-    """Two distinct authenticated clients live in disjoint scopes — looking up
-    a peer's task id returns 'not found'."""
-    reset = _set_auth("client-a")
-    try:
-        async with Client(task_server, mode="legacy") as client_a:
-            task_id = await _submit_task_id(client_a, "client-a-secret")
-    finally:
-        auth_context_var.reset(reset)
-
-    reset = _set_auth("client-b")
-    try:
-        async with Client(task_server, mode="legacy") as client_b:
-            with pytest.raises(Exception, match="not found"):
-                await client_b.get_task_status(task_id)
-    finally:
-        auth_context_var.reset(reset)
+    """Two distinct client_ids live in disjoint scopes: a peer's id is 'not found'."""
+    alice = make_access_token("client-a")
+    bob = make_access_token("client-b")
+    async with running_task_server(task_server):
+        created = await submit_task(
+            task_server, "secret_tool", {"data": "a-secret"}, access_token=alice
+        )
+        with pytest.raises(MCPError, match="not found"):
+            await get_task(task_server, created.task_id, access_token=bob)
 
 
 async def test_distinct_subs_same_client_id_cannot_access_each_others_tasks(
     task_server: FastMCP,
 ):
-    """Fixed-OAuth case: two users share a client_id but have distinct ``sub``
-    claims.  The ``sub``-aware scope must still isolate them."""
-    shared_client = "shared-oauth-app"
-
-    reset = _set_auth(shared_client, sub="user-alice")
-    try:
-        async with Client(task_server, mode="legacy") as alice:
-            task_id = await _submit_task_id(alice, "alice-secret")
-    finally:
-        auth_context_var.reset(reset)
-
-    reset = _set_auth(shared_client, sub="user-bob")
-    try:
-        async with Client(task_server, mode="legacy") as bob:
-            with pytest.raises(Exception, match="not found"):
-                await bob.get_task_status(task_id)
-    finally:
-        auth_context_var.reset(reset)
+    """Fixed-OAuth case: one client_id, distinct ``sub`` claims stay isolated."""
+    shared = "shared-oauth-app"
+    alice = make_access_token(shared, sub="user-alice")
+    bob = make_access_token(shared, sub="user-bob")
+    async with running_task_server(task_server):
+        created = await submit_task(
+            task_server, "secret_tool", {"data": "alice-secret"}, access_token=alice
+        )
+        with pytest.raises(MCPError, match="not found"):
+            await get_task(task_server, created.task_id, access_token=bob)
 
 
 async def test_authenticated_and_anonymous_keyspaces_are_disjoint(
     task_server: FastMCP,
 ):
-    """An anonymous client must not be able to read an authenticated client's
-    tasks (and vice versa) even when colliding on task id."""
-    reset = _set_auth("client-a")
-    try:
-        async with Client(task_server, mode="legacy") as authed:
-            authed_task_id = await _submit_task_id(authed, "authed-secret")
-    finally:
-        auth_context_var.reset(reset)
-
-    async with Client(task_server, mode="legacy") as anon:
-        with pytest.raises(Exception, match="not found"):
-            await anon.get_task_status(authed_task_id)
+    """An anonymous caller cannot read an authenticated caller's task."""
+    authed = make_access_token("client-a")
+    async with running_task_server(task_server):
+        created = await submit_task(
+            task_server, "secret_tool", {"data": "authed-secret"}, access_token=authed
+        )
+        # No access_token -> anonymous keyspace -> cannot resolve the authed task.
+        with pytest.raises(MCPError, match="not found"):
+            await get_task(task_server, created.task_id)
+        # And the authenticated caller still resolves it.
+        seen = await wait_for_task(task_server, created.task_id, access_token=authed)
+        assert seen.status == "completed"

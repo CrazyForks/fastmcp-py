@@ -1,22 +1,40 @@
-"""Tests for TaskConfig (SEP-1686).
+"""Tests for TaskConfig (SEP-2663, tools only).
 
 Tests for TaskConfig:
-- Mode enforcement (forbidden, optional, required)
+- Normalization of boolean task values to TaskConfig
+- Sync-function validation
+- Tool mode enforcement (forbidden, optional, required)
+- Tool execution metadata (task_support in tools/list)
 - Poll interval configuration
 """
 
 from datetime import timedelta
 
 import pytest
+from fastmcp_tasks.models import (
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    CreateTaskResult,
+)
 from mcp.shared.exceptions import MCPError
-from mcp_types import TextContent, ToolExecution
-from mcp_types import Tool as MCPTool
+from mcp_types import ToolExecution
 
 from fastmcp import FastMCP
-from fastmcp.client import Client
-from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool
 from fastmcp.utilities.tasks import TaskConfig
+from fastmcp_tasks import TasksExtension
+from tests.tasks.task_helpers import (
+    _opted_in_request,
+    auth_scope,
+    call_tool_without_optin,
+    running_task_server,
+    submit_task,
+)
+
+
+async def _opted_in_call(server: FastMCP, name: str, arguments: dict | None = None):
+    """Run a `tools/call` WITH the tasks opt-in bound (used to prove sync paths)."""
+    with auth_scope(None), _opted_in_request(name, arguments or {}, None):
+        return await server.call_tool(name, arguments or {})
 
 
 class TestTaskConfigNormalization:
@@ -83,248 +101,114 @@ class TestTaskConfigNormalization:
         assert tool2.task_config.mode == "optional"
 
 
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 class TestToolModeEnforcement:
-    """Test mode enforcement for tools."""
+    """Test mode enforcement for tools under the SEP-2663 interceptor."""
 
-    @pytest.fixture
-    def server(self):
-        """Create server with tools in different modes."""
+    def _server(self) -> FastMCP:
         mcp = FastMCP("test", tasks=False)
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=TaskConfig(mode="required"))
         async def required_tool() -> str:
-            """Tool that requires task execution."""
             return "required result"
 
         @mcp.tool(task=TaskConfig(mode="forbidden"))
         async def forbidden_tool() -> str:
-            """Tool that forbids task execution."""
             return "forbidden result"
 
         @mcp.tool(task=TaskConfig(mode="optional"))
         async def optional_tool() -> str:
-            """Tool that supports both modes."""
             return "optional result"
 
         return mcp
 
-    async def test_required_mode_without_task_returns_error(self, server):
-        """Required mode raises error when called without task metadata."""
-        async with Client(server, mode="legacy") as client:
-            with pytest.raises(ToolError) as exc_info:
-                await client.call_tool("required_tool", {})
-
-            assert "requires task-augmented execution" in str(exc_info.value)
-
-    async def test_required_mode_with_task_succeeds(self, server):
-        """Required mode succeeds when called with task metadata."""
-        async with Client(server, mode="legacy") as client:
-            task = await client.call_tool("required_tool", {}, task=True)
-            assert task is not None
-            result = await task.result()
-            assert result.data == "required result"
-
-    async def test_forbidden_mode_with_task_returns_error(self, server):
-        """Forbidden mode returns error when called with task metadata."""
-        async with Client(server, mode="legacy") as client:
-            # Call with task=True should fail
-            task = await client.call_tool(
-                "forbidden_tool", {}, task=True, raise_on_error=False
-            )
-            assert task is not None
-            # The task should have returned immediately with an error
-            assert task.returned_immediately
-            result = await task.result()
-            # Check for error in the result
-            assert result.is_error
-
-    async def test_forbidden_mode_without_task_succeeds(self, server):
-        """Forbidden mode succeeds when called without task metadata."""
-        async with Client(server, mode="legacy") as client:
-            result = await client.call_tool("forbidden_tool", {})
-            assert "forbidden result" in str(result)
-
-    async def test_optional_mode_without_task_succeeds(self, server):
-        """Optional mode succeeds when called without task metadata."""
-        async with Client(server, mode="legacy") as client:
-            result = await client.call_tool("optional_tool", {})
-            assert "optional result" in str(result)
-
-    async def test_optional_mode_with_task_succeeds(self, server):
-        """Optional mode succeeds when called with task metadata."""
-        async with Client(server, mode="legacy") as client:
-            task = await client.call_tool("optional_tool", {}, task=True)
-            assert task is not None
-            result = await task.result()
-            assert result.data == "optional result"
-
-
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
-class TestResourceModeEnforcement:
-    """Test mode enforcement for resources."""
-
-    @pytest.fixture
-    def server(self):
-        """Create server with resources in different modes."""
-        mcp = FastMCP("test", tasks=False)
-
-        @mcp.resource("resource://required", task=TaskConfig(mode="required"))
-        async def required_resource() -> str:
-            """Resource that requires task execution."""
-            return "required content"
-
-        @mcp.resource("resource://forbidden", task=TaskConfig(mode="forbidden"))
-        async def forbidden_resource() -> str:
-            """Resource that forbids task execution."""
-            return "forbidden content"
-
-        @mcp.resource("resource://optional", task=TaskConfig(mode="optional"))
-        async def optional_resource() -> str:
-            """Resource that supports both modes."""
-            return "optional content"
-
-        return mcp
-
-    async def test_required_resource_without_task_returns_error(self, server):
-        """Required mode returns error when read without task metadata."""
-        from mcp_types import METHOD_NOT_FOUND
-
-        async with Client(server, mode="legacy") as client:
+    async def test_required_mode_without_opt_in_raises(self):
+        """Required mode raises -32003 when called without a tasks opt-in."""
+        mcp = self._server()
+        async with running_task_server(mcp):
             with pytest.raises(MCPError) as exc_info:
-                await client.read_resource("resource://required")
+                await call_tool_without_optin(mcp, "required_tool")
+            assert exc_info.value.error.code == MISSING_REQUIRED_CLIENT_CAPABILITY
 
-            assert exc_info.value.error.code == METHOD_NOT_FOUND
-            assert "requires task-augmented execution" in exc_info.value.error.message
+    async def test_required_mode_with_opt_in_tasks(self):
+        """Required mode tasks when the caller opts in."""
+        mcp = self._server()
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "required_tool")
+            assert isinstance(created, CreateTaskResult)
 
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_required_resource_with_task_succeeds(self, server):
-        """Required mode succeeds when read with task metadata."""
-        async with Client(server, mode="legacy") as client:
-            task = await client.read_resource("resource://required", task=True)
-            assert task is not None
-            result = await task.result()
-            # Result is a list of resource contents
-            assert "required content" in str(result)
+    async def test_forbidden_mode_never_tasks_even_with_opt_in(self):
+        """Forbidden mode runs synchronously even when the caller opts in."""
+        mcp = self._server()
+        async with running_task_server(mcp):
+            result = await _opted_in_call(mcp, "forbidden_tool")
+            assert not isinstance(result, CreateTaskResult)
+            assert result.structured_content == {"result": "forbidden result"}
 
-    async def test_forbidden_resource_without_task_succeeds(self, server):
-        """Forbidden mode succeeds when read without task metadata."""
-        async with Client(server, mode="legacy") as client:
-            result = await client.read_resource("resource://forbidden")
-            assert "forbidden content" in str(result)
+    async def test_optional_mode_without_opt_in_runs_sync(self):
+        """Optional mode runs synchronously without a tasks opt-in."""
+        mcp = self._server()
+        async with running_task_server(mcp):
+            result = await call_tool_without_optin(mcp, "optional_tool")
+            assert not isinstance(result, CreateTaskResult)
+            assert result.structured_content == {"result": "optional result"}
 
-
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
-class TestPromptModeEnforcement:
-    """Test mode enforcement for prompts."""
-
-    @pytest.fixture
-    def server(self):
-        """Create server with prompts in different modes."""
-        mcp = FastMCP("test", tasks=False)
-
-        @mcp.prompt(task=TaskConfig(mode="required"))
-        async def required_prompt() -> str:
-            """Prompt that requires task execution."""
-            return "required message"
-
-        @mcp.prompt(task=TaskConfig(mode="forbidden"))
-        async def forbidden_prompt() -> str:
-            """Prompt that forbids task execution."""
-            return "forbidden message"
-
-        @mcp.prompt(task=TaskConfig(mode="optional"))
-        async def optional_prompt() -> str:
-            """Prompt that supports both modes."""
-            return "optional message"
-
-        return mcp
-
-    async def test_required_prompt_without_task_returns_error(self, server):
-        """Required mode returns error when called without task metadata."""
-        from mcp_types import METHOD_NOT_FOUND
-
-        async with Client(server, mode="legacy") as client:
-            with pytest.raises(MCPError) as exc_info:
-                await client.get_prompt("required_prompt")
-
-            assert exc_info.value.error.code == METHOD_NOT_FOUND
-            assert "requires task-augmented execution" in exc_info.value.error.message
-
-    @pytest.mark.xfail(
-        reason="SDK v2 has no `task` field on GetPromptRequestParams / "
-        "ReadResourceRequestParams; prompt/resource task submission is not "
-        "wire-expressible and always graceful-degrades (sdk-feedback #3).",
-        strict=True,
-    )
-    async def test_required_prompt_with_task_succeeds(self, server):
-        """Required mode succeeds when called with task metadata."""
-        async with Client(server, mode="legacy") as client:
-            task = await client.get_prompt("required_prompt", task=True)
-            assert task is not None
-            result = await task.result()
-            # Result contains the prompt messages
-            assert "required message" in str(result)
-
-    async def test_forbidden_prompt_without_task_succeeds(self, server):
-        """Forbidden mode succeeds when called without task metadata."""
-        async with Client(server, mode="legacy") as client:
-            result = await client.get_prompt("forbidden_prompt")
-            assert isinstance(result.messages[0].content, TextContent)
-            assert "forbidden message" in str(result.messages[0].content)
+    async def test_optional_mode_with_opt_in_tasks(self):
+        """Optional mode tasks when the caller opts in."""
+        mcp = self._server()
+        async with running_task_server(mcp):
+            created = await submit_task(mcp, "optional_tool")
+            assert isinstance(created, CreateTaskResult)
 
 
-@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 class TestToolExecutionMetadata:
-    """Test that ToolExecution.task_support is set correctly in tool metadata."""
+    """Test that ToolExecution.task_support is set correctly in tool metadata.
+
+    The tools/list payload is produced by ``Tool.to_mcp_tool()``; these tests
+    assert on that serialization directly, which is what a server advertises on
+    the wire. (The FastMCP client session does not yet surface ``execution`` back
+    to callers, so a client round-trip cannot observe it until Phase 4.)
+    """
 
     async def test_optional_tool_exposes_task_support(self):
-        """Tools with task enabled should expose taskSupport in metadata."""
+        """Tools with mode=optional expose task_support='optional'."""
         mcp = FastMCP("test", tasks=False)
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=TaskConfig(mode="optional"))
         async def my_tool() -> str:
             return "ok"
 
-        async with Client(mcp, mode="legacy") as client:
-            tools = await client.list_tools()
-            tool = next(t for t in tools if t.name == "my_tool")
-            assert isinstance(tool, MCPTool)
-            assert isinstance(tool.execution, ToolExecution)
-            assert tool.execution.task_support == "optional"
+        tool = await mcp.get_tool("my_tool")
+        execution = tool.to_mcp_tool().execution
+        assert isinstance(execution, ToolExecution)
+        assert execution.task_support == "optional"
 
     async def test_required_tool_exposes_task_support(self):
-        """Tools with mode=required should expose task_support='required'."""
+        """Tools with mode=required expose task_support='required'."""
         mcp = FastMCP("test", tasks=False)
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=TaskConfig(mode="required"))
         async def my_tool() -> str:
             return "ok"
 
-        async with Client(mcp, mode="legacy") as client:
-            tools = await client.list_tools()
-            tool = next(t for t in tools if t.name == "my_tool")
-            assert isinstance(tool, MCPTool)
-            assert isinstance(tool.execution, ToolExecution)
-            assert tool.execution.task_support == "required"
+        tool = await mcp.get_tool("my_tool")
+        execution = tool.to_mcp_tool().execution
+        assert isinstance(execution, ToolExecution)
+        assert execution.task_support == "required"
 
     async def test_forbidden_tool_has_no_execution(self):
-        """Tools with mode=forbidden should not expose execution metadata."""
+        """Tools with mode=forbidden do not expose execution metadata."""
         mcp = FastMCP("test", tasks=False)
+        mcp.add_extension(TasksExtension())
 
         @mcp.tool(task=TaskConfig(mode="forbidden"))
         async def my_tool() -> str:
             return "ok"
 
-        async with Client(mcp, mode="legacy") as client:
-            tools = await client.list_tools()
-            tool = next(t for t in tools if t.name == "my_tool")
-            assert tool.execution is None
+        tool = await mcp.get_tool("my_tool")
+        assert tool.to_mcp_tool().execution is None
 
 
 class TestSyncFunctionValidation:

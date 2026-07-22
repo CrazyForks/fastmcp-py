@@ -13,9 +13,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.settings import Settings
 from fastmcp.utilities.tests import temporary_settings
 
-pytestmark = pytest.mark.skip(
-    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
-)
+pytestmark = pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
 
 
 @pytest.mark.parametrize("value", [0, -0.5, -1])
