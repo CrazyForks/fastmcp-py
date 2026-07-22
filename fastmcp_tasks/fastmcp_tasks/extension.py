@@ -35,7 +35,11 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from fastmcp.exceptions import NotFoundError
-from fastmcp.server.extensions import MethodBinding, ServerExtension
+from fastmcp.server.extensions import (
+    MethodBinding,
+    ServerExtension,
+    read_client_extension_settings,
+)
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from fastmcp_tasks.creation import create_task
@@ -130,19 +134,42 @@ class TasksExtension(ServerExtension):
             ),
         ]
 
+    def _require_tasks_capability(self, ctx: ServerRequestContext[Any, Any]) -> None:
+        """Reject a task method from a client that did not declare the extension.
+
+        SEP-2663: a client issuing `tasks/get`/`tasks/update`/`tasks/cancel`
+        without the tasks capability in the request's `_meta` gets -32003. A
+        client normally only holds a taskId because it declared the capability
+        on the creating `tools/call`, but the method-level check is an explicit
+        MUST, so enforce it here rather than assume.
+        """
+        if read_client_extension_settings(ctx, TASKS_EXTENSION_ID) is None:
+            raise MCPError(
+                code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+                message=(
+                    "This request targets the tasks extension "
+                    f"({TASKS_EXTENSION_ID}); the client did not declare it for "
+                    "this request."
+                ),
+                data=missing_capability_error_data(),
+            )
+
     async def _handle_get(
         self, ctx: ServerRequestContext[Any, Any], params: GetTaskParams
     ) -> GetTaskResult:
+        self._require_tasks_capability(ctx)
         return await tasks_get(self.server, params.task_id)
 
     async def _handle_update(
         self, ctx: ServerRequestContext[Any, Any], params: UpdateTaskParams
     ) -> UpdateTaskResult:
+        self._require_tasks_capability(ctx)
         return await tasks_update(self.server, params.task_id, params.input_responses)
 
     async def _handle_cancel(
         self, ctx: ServerRequestContext[Any, Any], params: CancelTaskParams
     ) -> CancelTaskResult:
+        self._require_tasks_capability(ctx)
         return await tasks_cancel(self.server, params.task_id)
 
     async def intercept_tool_call(

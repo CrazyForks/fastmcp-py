@@ -29,16 +29,18 @@ from mcp.shared.exceptions import MCPError
 from mcp_types import INVALID_PARAMS
 
 from fastmcp.exceptions import NotFoundError
-from fastmcp.tools.base import InputRequiredToolResult, Tool
+from fastmcp.tools.base import InputRequiredToolResult, Tool, ToolResult
 from fastmcp.utilities.tasks import DEFAULT_POLL_INTERVAL_MS
 from fastmcp.utilities.versions import VersionSpec
 from fastmcp_tasks.context import get_task_scope
 from fastmcp_tasks.creation import enqueue_task_leg, registered_component_for_key
 from fastmcp_tasks.input_store import (
+    acquire_update_lock,
     clear_outstanding,
     load_current_leg,
     load_task_args,
     read_outstanding_inputs,
+    release_update_lock,
     save_current_leg,
     store_input_responses,
     translate_responses,
@@ -190,7 +192,13 @@ def _inline_result(tool: Tool, raw_value: Any) -> dict[str, Any]:
                 "Guard-pattern tasks are supported for function tools."
             ),
         )
-    mcp_result = tool.convert_result(raw_value).to_mcp_result()
+    # A raised tool error arrives as an is_error ToolResult the wrapper built
+    # (end-and-reenter G2); use it directly so isError round-trips. A normal
+    # return is converted through the tool's own result coercion.
+    if isinstance(raw_value, ToolResult):
+        mcp_result = raw_value.to_mcp_result()
+    else:
+        mcp_result = tool.convert_result(raw_value).to_mcp_result()
     if isinstance(mcp_result, mcp_types.CallToolResult):
         call_tool_result = mcp_result
     elif isinstance(mcp_result, tuple):
@@ -299,36 +307,44 @@ async def tasks_update(
         docket, task_scope, task_id
     )
 
-    translated = await translate_responses(
-        docket, task_scope, task_id, leg_number, input_responses
-    )
-    if translated is None:
-        # Nothing matched the current leg's outstanding requests: the leg was
-        # already answered, or the keys are unknown. Idempotent no-op.
+    # Serialize concurrent updates for this task so two racing answers cannot
+    # each enqueue a next leg (double execution). A loser is an idempotent no-op.
+    if not await acquire_update_lock(docket, task_scope, task_id):
         return UpdateTaskResult()
+    try:
+        translated = await translate_responses(
+            docket, task_scope, task_id, leg_number, input_responses
+        )
+        if translated is None:
+            # Nothing matched the current leg's outstanding requests: the leg was
+            # already answered, or the keys are unknown. Idempotent no-op.
+            return UpdateTaskResult()
 
-    # Store the answers for the next leg to read, then enqueue that leg. Ordering
-    # matters: the answers must be in Redis before the next leg's worker context
-    # loads them, and current_leg must not advance to an execution that is not
-    # yet durable — so enqueue (with its durable wait) precedes the pointer swap.
-    await store_input_responses(docket, task_scope, task_id, translated)
+        # Store the answers for the next leg to read, then enqueue that leg.
+        # Ordering matters: the answers must be in Redis before the next leg's
+        # worker context loads them, and current_leg must not advance to an
+        # execution that is not yet durable — so enqueue (with its durable wait)
+        # precedes the pointer swap.
+        await store_input_responses(docket, task_scope, task_id, translated)
 
-    component = await registered_component_for_key(
-        server, parse_task_key(base_task_key)["component_identifier"]
-    )
-    raw_arguments = await load_task_args(docket, task_scope, task_id)
-    next_leg = leg_number + 1
-    next_leg_key = leg_execution_key(base_task_key, next_leg)
+        component = await registered_component_for_key(
+            server, parse_task_key(base_task_key)["component_identifier"]
+        )
+        raw_arguments = await load_task_args(docket, task_scope, task_id)
+        next_leg = leg_number + 1
+        next_leg_key = leg_execution_key(base_task_key, next_leg)
 
-    await enqueue_task_leg(server, docket, component, raw_arguments, next_leg_key)
-    ttl_seconds = int(docket.execution_ttl.total_seconds())
-    await save_current_leg(
-        docket, task_scope, task_id, next_leg_key, next_leg, ttl_seconds
-    )
-    # The answered leg's surfaced keys are now superseded; drop them so they are
-    # never reused (SEP-2663 L350).
-    await clear_outstanding(docket, task_scope, task_id, leg_number)
-    return UpdateTaskResult()
+        await enqueue_task_leg(server, docket, component, raw_arguments, next_leg_key)
+        ttl_seconds = int(docket.execution_ttl.total_seconds())
+        await save_current_leg(
+            docket, task_scope, task_id, next_leg_key, next_leg, ttl_seconds
+        )
+        # The answered leg's surfaced keys are now superseded; drop them so they
+        # are never reused (SEP-2663 L350).
+        await clear_outstanding(docket, task_scope, task_id, leg_number)
+        return UpdateTaskResult()
+    finally:
+        await release_update_lock(docket, task_scope, task_id)
 
 
 async def tasks_cancel(server: FastMCP, task_id: str) -> CancelTaskResult:

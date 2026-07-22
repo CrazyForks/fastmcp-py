@@ -393,8 +393,11 @@ class TestBackgroundTaskIntegration:
         }
 
     async def test_imperative_elicit_fails_with_guard_guidance(self):
-        """A task=True tool that calls ctx.elicit() fails with the guard-pattern
-        error rather than parking a worker on a client round-trip."""
+        """A task=True tool that calls ctx.elicit() errors with guard guidance.
+
+        The ToolError it raises surfaces as a completed is_error result (like any
+        raised tool error, SEP-2663), never parking a worker on a round-trip.
+        """
         mcp = FastMCP("elicit-forbidden")
         mcp.add_extension(TasksExtension())
 
@@ -407,9 +410,10 @@ class TestBackgroundTaskIntegration:
             created = await submit_task(mcp, "ask_name", {})
             final = await wait_for_task(mcp, created.task_id)
 
-        assert final.status == "failed"
-        assert final.error is not None
-        assert "InputRequiredResult" in final.error["message"]
+        assert final.status == "completed"
+        assert final.result is not None
+        assert final.result["isError"] is True
+        assert "InputRequiredResult" in final.result["content"][0]["text"]
 
 
 class TestAccessTokenInBackgroundTasks:

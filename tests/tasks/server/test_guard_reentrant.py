@@ -170,5 +170,5 @@ def test_reentrant_wrapper_preserves_signature():
     async def fn(n: int, ctx: Any) -> int:
         return n
 
-    wrapped = reentrant_task_fn(fn)
+    wrapped = reentrant_task_fn(fn, "fn")
     assert list(inspect.signature(wrapped).parameters) == ["n", "ctx"]

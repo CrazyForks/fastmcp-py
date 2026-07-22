@@ -359,6 +359,44 @@ async def clear_outstanding(
         await redis.delete(_map_key(docket, task_scope, task_id, leg))
 
 
+# How long the per-task update lock lives if its holder dies mid-update. A
+# generous ceiling: a single tasks/update is fast, so the lock is normally held
+# for milliseconds; the TTL only guards against a crashed holder.
+_UPDATE_LOCK_TTL_SECONDS = 30
+
+
+def _update_lock_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:update_lock")
+
+
+async def acquire_update_lock(
+    docket: Docket, task_scope: str | None, task_id: str
+) -> bool:
+    """Take the per-task update lock, or return False if one is already held.
+
+    Serializes concurrent ``tasks/update`` calls for a task so two racing
+    answers cannot each enqueue a next leg (double execution). A well-behaved
+    client polls sequentially and never contends; a loser is an idempotent
+    no-op, matching SEP-2663's "ignore already-satisfied" rule.
+    """
+    async with docket.redis() as redis:
+        got = await redis.set(
+            _update_lock_key(docket, task_scope, task_id),
+            b"1",
+            nx=True,
+            ex=_UPDATE_LOCK_TTL_SECONDS,
+        )
+    return bool(got)
+
+
+async def release_update_lock(
+    docket: Docket, task_scope: str | None, task_id: str
+) -> None:
+    """Release the per-task update lock."""
+    async with docket.redis() as redis:
+        await redis.delete(_update_lock_key(docket, task_scope, task_id))
+
+
 async def load_pending_input(
     docket: Docket, task_scope: str | None, task_id: str
 ) -> tuple[str | None, mcp_types.InputResponses | None]:

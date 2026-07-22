@@ -68,15 +68,16 @@ async def test_tasks_get_includes_poll_interval():
         assert got.poll_interval_ms == 5000
 
 
-async def test_tasks_get_returns_error_for_failed_task():
-    """`tasks/get` surfaces the error for a failed task rather than a result."""
+async def test_tasks_get_returns_is_error_result_for_raised_tool():
+    """A raised tool error is a completed task with an is_error result (SEP-2663)."""
     mcp = _methods_server()
     async with running_task_server(mcp):
         final = await run_task(mcp, "error_tool", {})
-        assert final.status == "failed"
-        assert final.error is not None
-        assert "Task failed!" in final.error["message"]
-        assert final.result is None
+        assert final.status == "completed"
+        assert final.error is None
+        assert final.result is not None
+        assert final.result["isError"] is True
+        assert "Task failed!" in final.result["content"][0]["text"]
 
 
 async def test_tasks_get_unknown_id_raises_not_found():

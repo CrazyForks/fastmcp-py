@@ -14,16 +14,18 @@ from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from typing import cast
 
+import mcp_types
 import pytest
 from fastmcp_tasks.models import (
     MISSING_REQUIRED_CLIENT_CAPABILITY,
     CreateTaskResult,
+    GetTaskParams,
 )
 from mcp.server.context import ServerRequestContext
 from mcp.server.session import ServerSession
 from mcp.shared.exceptions import MCPError
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.client import Client
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import bind_request_context
@@ -40,6 +42,7 @@ from tests.tasks.task_helpers import (
     run_task,
     running_task_server,
     submit_task,
+    update_task,
     wait_for_task,
 )
 
@@ -178,15 +181,22 @@ async def test_get_unknown_task_raises_not_found():
             await get_task(mcp, "does-not-exist")
 
 
-async def test_failed_task_surfaces_error_not_completed():
+async def test_raised_tool_error_completes_with_is_error():
+    """A tool that RAISES is a completed task with an is_error result, not failed.
+
+    SEP-2663 reserves `failed` for protocol faults; a raised tool error is the
+    same `isError` CallToolResult a live tools/call returns (the task path must
+    return exactly what the underlying request would).
+    """
     mcp = _tasks_server()
     async with running_task_server(mcp):
         created = await submit_task(mcp, "boom", {})
         final = await wait_for_task(mcp, created.task_id)
-        assert final.status == "failed"
-        assert final.error is not None
-        assert "kaboom" in final.error["message"]
-        assert final.result is None
+        assert final.status == "completed"
+        assert final.error is None
+        assert final.result is not None
+        assert final.result["isError"] is True
+        assert "kaboom" in final.result["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +379,74 @@ async def test_worker_hooks_survive_sibling_server_shutdown():
         assert core_dependencies._background_context_factory is not None
     # The last extension exited; hooks are cleared.
     assert core_dependencies._background_context_factory is None
+
+
+# ---------------------------------------------------------------------------
+# Compliance: -32003 on task methods for non-declaring clients (SEP-2663)
+# ---------------------------------------------------------------------------
+
+
+async def test_task_method_without_capability_raises_missing_capability():
+    """tasks/get from a client that did not declare the extension gets -32003."""
+    mcp = _tasks_server()
+    extension = cast(TasksExtension, mcp._extensions[TASKS_EXTENSION_ID])
+    # A request context with no tasks capability in its _meta.
+    srctx = ServerRequestContext(
+        session=cast(ServerSession, SimpleNamespace()),
+        lifespan_context={},
+        protocol_version="2026-07-28",
+        method="tasks/get",
+        params={"taskId": "whatever"},
+    )
+    params = GetTaskParams.model_validate({"taskId": "whatever"})
+    async with running_task_server(mcp):
+        with pytest.raises(MCPError) as exc_info:
+            await extension._handle_get(srctx, params)
+    assert exc_info.value.error.code == MISSING_REQUIRED_CLIENT_CAPABILITY
+
+
+# ---------------------------------------------------------------------------
+# Compliance: concurrent tasks/update must not enqueue two next legs
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_update_enqueues_a_single_next_leg():
+    """Two racing tasks/update answers re-enter the task exactly once."""
+    calls: list[int] = []
+    mcp = FastMCP("race")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def guard(ctx: Context) -> str | mcp_types.InputRequiredResult:
+        calls.append(1)
+        if ctx.input_responses is None:
+            req = mcp_types.ElicitRequest(
+                params=mcp_types.ElicitRequestFormParams(
+                    message="?", requested_schema={"type": "object"}
+                )
+            )
+            return mcp_types.InputRequiredResult(
+                result_type="input_required", input_requests={"k": req}
+            )
+        return "done"
+
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "guard", {})
+        parked = await wait_for_task(
+            mcp, created.task_id, target_states=frozenset({"input_required"})
+        )
+        assert parked.input_requests is not None
+        key = next(iter(parked.input_requests))
+        answer = {key: {"action": "accept", "content": {}}}
+        # Fire two identical updates concurrently.
+        await asyncio.gather(
+            update_task(mcp, created.task_id, answer),
+            update_task(mcp, created.task_id, answer),
+            return_exceptions=True,
+        )
+        final = await wait_for_task(mcp, created.task_id)
+
+    assert final.status == "completed"
+    # Leg 1 (park) + exactly one re-entered leg 2 — never a third from a double
+    # enqueue.
+    assert calls == [1, 1]

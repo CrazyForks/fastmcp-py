@@ -42,12 +42,17 @@ async def test_task_metadata_includes_task_id_and_ttl():
         assert created.ttl_ms is not None and created.ttl_ms > 0
 
 
-async def test_failed_task_stores_error():
-    """A task whose tool raises reaches `failed` and stores the error."""
+async def test_raised_tool_error_completes_with_is_error():
+    """A task whose tool raises completes with an is_error result (SEP-2663).
+
+    `failed` is reserved for protocol faults; a raised tool error is the same
+    `isError` result a live tools/call returns.
+    """
     mcp = _task_server()
     async with running_task_server(mcp):
         final = await run_task(mcp, "failing_tool", {})
-        assert final.status == "failed"
-        assert final.error is not None
-        assert "This tool always fails" in final.error["message"]
-        assert final.result is None
+        assert final.status == "completed"
+        assert final.error is None
+        assert final.result is not None
+        assert final.result["isError"] is True
+        assert "This tool always fails" in final.result["content"][0]["text"]

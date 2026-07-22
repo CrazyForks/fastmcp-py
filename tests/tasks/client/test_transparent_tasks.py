@@ -142,9 +142,7 @@ async def test_in_task_input_answered_transparently(guard_server: FastMCP):
     async def handle_elicitation(message, response_type, params, context):
         return DinnerPrefs(cuisine="Thai", vegetarian=True)
 
-    client = Client(
-        guard_server, mode="auto", elicitation_handler=handle_elicitation
-    )
+    client = Client(guard_server, mode="auto", elicitation_handler=handle_elicitation)
     async with client:
         result = await client.call_tool("plan_dinner", {})
 

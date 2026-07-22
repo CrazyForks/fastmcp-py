@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING, Any
 
 import mcp_types
 
-from fastmcp.tools.base import InputRequiredToolResult
+from fastmcp.exceptions import FastMCPError
+from fastmcp.tools.base import InputRequiredToolResult, ToolResult
 from fastmcp_tasks.context import get_task_context, get_task_leg_number
 from fastmcp_tasks.input_store import store_outstanding
 
@@ -82,8 +83,40 @@ def _resolve_docket() -> Docket | None:
     return docket
 
 
+def _mask_error_details() -> bool:
+    """The worker server's error-masking policy, mirroring the sync call path."""
+    import fastmcp
+    from fastmcp.server.dependencies import get_context
+
+    try:
+        return get_context().fastmcp._mask_error_details
+    except RuntimeError:
+        return fastmcp.settings.mask_error_details
+
+
+def _error_result(tool_name: str, exc: Exception) -> ToolResult:
+    """An ``is_error`` result for a task tool that raised, mirroring foreground.
+
+    A raised tool error is a *completed* task carrying an error result, never a
+    ``failed`` task (SEP-2663 reserves ``failed`` for protocol faults, and a live
+    ``tools/call`` returns the same `isError` result). A `FastMCPError` (e.g.
+    ``ToolError``) reaches the client verbatim, as the synchronous path re-raises
+    it unmasked; any other exception is masked per the server's policy.
+    """
+    if isinstance(exc, FastMCPError):
+        message = str(exc)
+    elif _mask_error_details():
+        message = f"Error calling tool {tool_name!r}"
+    else:
+        message = f"Error calling tool {tool_name!r}: {exc}"
+    return ToolResult(
+        content=[mcp_types.TextContent(type="text", text=message)], is_error=True
+    )
+
+
 def reentrant_task_fn(
     fn: Callable[..., Awaitable[Any]],
+    tool_name: str,
 ) -> Callable[..., Awaitable[Any]]:
     """Wrap a task tool's callable to capture a guard leg's ask (end-and-reenter).
 
@@ -91,12 +124,20 @@ def reentrant_task_fn(
     unchanged. The body runs exactly once: a real return is the leg's result; an
     `InputRequiredResult` is captured to Redis (outstanding requests + carried
     state) and the wrapper returns, ending the leg without blocking. The next
-    leg is enqueued by ``tasks/update`` when the client answers.
+    leg is enqueued by ``tasks/update`` when the client answers. A raised tool
+    error becomes a completed `is_error` result (not a failed task), matching the
+    synchronous `tools/call` path.
     """
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        result = await fn(*args, **kwargs)
+        try:
+            result = await fn(*args, **kwargs)
+        except FastMCPError as exc:
+            return _error_result(tool_name, exc)
+        except Exception as exc:
+            logger.exception("background task tool %r raised", tool_name)
+            return _error_result(tool_name, exc)
         input_required = _as_input_required(result)
         if input_required is None:
             return result

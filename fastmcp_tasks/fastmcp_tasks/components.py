@@ -59,7 +59,9 @@ def register_component_with_docket(component: FastMCPComponent, docket: Docket) 
         # InputRequiredResult drives the reentrant in-task input cycle. The
         # wrapper is signature-preserving, so Docket's dependency injection is
         # unchanged for a body that never asks for input.
-        docket.register(reentrant_task_fn(component.fn), names=[component.key])
+        docket.register(
+            reentrant_task_fn(component.fn, component.name), names=[component.key]
+        )
     elif isinstance(component, Tool):
         docket.register(component.run, names=[component.key])
     elif isinstance(component, FunctionResource):
