@@ -80,7 +80,7 @@ For fine-grained control over task execution behavior, use `TaskConfig` instead 
 
 ```python
 from fastmcp import FastMCP
-from fastmcp.server.tasks import TaskConfig
+from fastmcp.utilities.tasks import TaskConfig
 
 mcp = FastMCP("MyServer")
 
@@ -113,7 +113,7 @@ When clients poll for task status, the server tells them how frequently to check
 ```python
 from datetime import timedelta
 from fastmcp import FastMCP
-from fastmcp.server.tasks import TaskConfig
+from fastmcp.utilities.tasks import TaskConfig
 
 mcp = FastMCP("MyServer")
 
@@ -241,7 +241,8 @@ FastMCP exposes Docket's full dependency injection system within your task-enabl
 ```python
 from docket import Docket, Worker
 from fastmcp import FastMCP
-from fastmcp.dependencies import Progress, CurrentDocket, CurrentWorker
+from fastmcp.dependencies import Progress
+from fastmcp_tasks.dependencies import CurrentDocket, CurrentWorker
 
 mcp = FastMCP("MyServer")
 

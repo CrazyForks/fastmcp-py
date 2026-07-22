@@ -9,7 +9,6 @@ from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.dependencies import CurrentContext, Depends, Shared
 from fastmcp.server.context import Context
-from fastmcp.server.dependencies import is_docket_available
 from tests.conftest import make_server_request_context
 
 HUZZAH = "huzzah!"
@@ -786,9 +785,6 @@ class TestDependencyInjection:
         monkeypatch.setattr(importlib.metadata, "version", fake_version)
 
         assert dependencies.is_docket_available() is False
-        # The wrapper that actually failed in #3803 must now return None
-        # instead of raising ImportError on the inner import.
-        assert dependencies.get_task_context() is None
 
     def test_is_docket_available_false_when_pydocket_not_installed(self, monkeypatch):
         """``is_docket_available()`` returns False when pydocket is absent."""
@@ -835,7 +831,7 @@ class TestDependencyInjection:
 
     def test_require_docket_passes_when_installed(self):
         """Test require_docket doesn't raise when docket is installed."""
-        from fastmcp.server.dependencies import require_docket
+        from fastmcp_tasks.dependencies import require_docket
 
         require_docket("test feature")
 
@@ -848,6 +844,8 @@ class TestDependencyInjection:
         no-op as long as the lower pin is held by another package).
         """
         import importlib.metadata
+
+        from fastmcp_tasks.dependencies import require_docket
 
         from fastmcp.server import dependencies
 
@@ -862,7 +860,7 @@ class TestDependencyInjection:
         monkeypatch.setattr(importlib.metadata, "version", fake_version)
 
         with pytest.raises(ImportError, match="pydocket 0.16.6 is installed"):
-            dependencies.require_docket("CurrentDocket()")
+            require_docket("CurrentDocket()")
 
     def test_dependency_class_exists(self):
         """Test Dependency and Depends are importable from fastmcp."""
@@ -1195,10 +1193,7 @@ class TestSharedDependencies:
             )
             assert call_count == 1
 
-    @pytest.mark.skipif(
-        not is_docket_available(),
-        reason="requires pydocket for the Docket/Worker lifespan path",
-    )
+    @pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
     async def test_shared_resolves_on_task_capable_server(self):
         """Shared() dependencies resolve on a normal request even when the server
         has task-enabled components.

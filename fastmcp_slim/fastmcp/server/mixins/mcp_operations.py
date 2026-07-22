@@ -29,7 +29,6 @@ from fastmcp.exceptions import (
 )
 from fastmcp.server.completions import CompletionValues, normalize_completion
 from fastmcp.server.dependencies import bind_request_context, extract_version_spec
-from fastmcp.server.tasks.config import TaskMeta
 from fastmcp.tools.base import InputRequiredToolResult
 from fastmcp.utilities.async_utils import (
     call_sync_fn_in_threadpool,
@@ -127,9 +126,6 @@ class MCPOperationsMixin:
             "logging/setLevel", SetLevelRequestParams, self._on_set_logging_level
         )
 
-        # Register SEP-1686 task protocol handlers
-        self._setup_task_protocol_handlers()
-
     async def _on_list_tools(
         self: FastMCP,
         ctx: ServerRequestContext,
@@ -220,16 +216,8 @@ class MCPOperationsMixin:
         self: FastMCP,
         ctx: ServerRequestContext,
         params: CallToolRequestParams,
-    ) -> (
-        mcp_types.CallToolResult
-        | mcp_types.InputRequiredResult
-        | mcp_types.CreateTaskResult
-    ):
+    ) -> mcp_types.CallToolResult | mcp_types.InputRequiredResult:
         """Handle MCP 'tools/call' requests.
-
-        Task metadata is a first-class params field (``params.task``); its
-        presence triggers backgrounding. The tool's ``_run()`` handles the
-        backgrounding decision so middleware runs before Docket.
 
         A guard tool (SEP-2322 multi-round-trip) requests client input by
         returning an ``InputRequiredResult`` from its body; the run machinery
@@ -250,14 +238,9 @@ class MCPOperationsMixin:
             )
 
             version = _version_from_ctx(ctx)
-            task_meta = (
-                TaskMeta(ttl=params.task.ttl) if params.task is not None else None
-            )
 
             try:
-                result = await self.call_tool(
-                    key, arguments, version=version, task_meta=task_meta
-                )
+                result = await self.call_tool(key, arguments, version=version)
             except (DisabledError, NotFoundError):
                 # Unknown/disabled tool: return an error result (matching the
                 # v1 SDK's call_tool behavior) so the client surfaces a
@@ -280,8 +263,6 @@ class MCPOperationsMixin:
                     is_error=True,
                 )
 
-            if isinstance(result, mcp_types.CreateTaskResult):
-                return result
             if isinstance(result, InputRequiredToolResult):
                 # A guard tool requested client input (SEP-2322). The
                 # multi-round-trip result type only exists at 2026-07-28; on an
@@ -305,14 +286,8 @@ class MCPOperationsMixin:
         self: FastMCP,
         ctx: ServerRequestContext,
         params: ReadResourceRequestParams,
-    ) -> mcp_types.ReadResourceResult | mcp_types.CreateTaskResult:
-        """Handle MCP 'resources/read' requests.
-
-        Note: ``ReadResourceRequestParams`` has no ``task`` field in this SDK
-        version, so resource task submission over the wire is not expressible;
-        ``task_meta`` is always None here. The CreateTaskResult return branch is
-        retained harmlessly pending an upstream ``task`` field on these params.
-        """
+    ) -> mcp_types.ReadResourceResult:
+        """Handle MCP 'resources/read' requests."""
         with bind_request_context(ctx):
             uri = params.uri
             logger.debug(f"[{self.name}] Handler called: read_resource %s", uri)
@@ -336,21 +311,14 @@ class MCPOperationsMixin:
                 # already happened inside read_resource.
                 raise to_mcp_error(e) from e
 
-            if isinstance(result, mcp_types.CreateTaskResult):
-                return result
             return result.to_mcp_result(uri)
 
     async def _on_get_prompt(
         self: FastMCP,
         ctx: ServerRequestContext,
         params: GetPromptRequestParams,
-    ) -> mcp_types.GetPromptResult | mcp_types.CreateTaskResult:
-        """Handle MCP 'prompts/get' requests.
-
-        Note: ``GetPromptRequestParams`` has no ``task`` field in this SDK
-        version, so prompt task submission over the wire is not expressible;
-        ``task_meta`` is always None here.
-        """
+    ) -> mcp_types.GetPromptResult:
+        """Handle MCP 'prompts/get' requests."""
         with bind_request_context(ctx):
             name = params.name
             arguments = params.arguments
@@ -374,8 +342,6 @@ class MCPOperationsMixin:
                 # Masking already happened inside render_prompt.
                 raise to_mcp_error(e) from e
 
-            if isinstance(result, mcp_types.CreateTaskResult):
-                return result
             return result.to_mcp_prompt_result()
 
     async def _on_set_logging_level(

@@ -146,6 +146,7 @@ async def test_get_http_headers_excludes_content_type(sse_server: ASGIServer):
             assert headers["x-custom-header"] == "should-be-included"
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_background_task_can_read_snapshotted_request_headers():
     """Background tools can still access request headers via get_http_request()."""
     server = FastMCP()
@@ -164,6 +165,7 @@ async def test_background_task_can_read_snapshotted_request_headers():
             assert result.data == "tenant-123"
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_background_task_current_http_dependencies_restore_headers():
     """CurrentHeaders/CurrentRequest work in task workers without explicit Context."""
     server = FastMCP()

@@ -1,8 +1,9 @@
 """Dependency injection for FastMCP.
 
 DI features (Depends, CurrentContext, CurrentFastMCP) work without pydocket
-using the uncalled-for DI engine. Only task-related dependencies (CurrentDocket,
-CurrentWorker) and background task execution require fastmcp[tasks].
+using the uncalled-for DI engine. The docket-specific dependencies
+(``CurrentDocket``, ``CurrentWorker``) and background task execution live in the
+``fastmcp-tasks`` package.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from collections.abc import AsyncGenerator, Callable, Generator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from functools import lru_cache
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, cast, get_type_hints, runtime_checkable
@@ -43,9 +43,6 @@ from fastmcp.utilities.async_utils import (
 from fastmcp.utilities.types import find_kwarg_by_type, is_class_member_of_type
 
 if TYPE_CHECKING:
-    from docket import Docket
-    from docket.worker import Worker
-
     from fastmcp.server.context import Context
     from fastmcp.server.server import FastMCP
 
@@ -143,15 +140,11 @@ __all__ = [
     "AccessToken",
     "CurrentAccessToken",
     "CurrentContext",
-    "CurrentDocket",
     "CurrentFastMCP",
     "CurrentHeaders",
     "CurrentRequest",
-    "CurrentWorker",
     "FastMCPRequestContext",
     "Progress",
-    "TaskContextInfo",
-    "TaskContextSnapshot",
     "TokenClaim",
     "bind_request_context",
     "extract_version_spec",
@@ -161,37 +154,16 @@ __all__ = [
     "get_http_headers",
     "get_http_request",
     "get_server",
-    "get_task_context",
-    "get_task_session",
     "is_docket_available",
-    "register_task_server",
-    "register_task_session",
-    "require_docket",
     "resolve_dependencies",
     "transform_context_annotations",
     "without_injected_parameters",
 ]
 
 
-# Task context lives in fastmcp.server.tasks.context; public symbols are
-# re-exported here so existing imports from dependencies continue to work.
-from fastmcp.server.tasks.context import (  # noqa: E402
-    TaskContextInfo,
-    TaskContextSnapshot,
-    _recall_snapshot,
-    get_task_context,
-    get_task_server,
-    get_task_session,
-    register_task_server,
-    register_task_session,
-)
-
 _current_server: ContextVar[weakref.ref[FastMCP] | None] = ContextVar(
     "server", default=None
 )
-
-_current_docket: ContextVar[Docket | None] = ContextVar("docket", default=None)
-_current_worker: ContextVar[Worker | None] = ContextVar("worker", default=None)
 
 
 # --- Docket availability check ---
@@ -229,43 +201,6 @@ def is_docket_available() -> bool:
         except (importlib.metadata.PackageNotFoundError, ImportError):
             _DOCKET_AVAILABLE = False
     return _DOCKET_AVAILABLE
-
-
-def require_docket(feature: str) -> None:
-    """Raise ImportError with install instructions if docket not available.
-
-    Args:
-        feature: Description of what requires docket (e.g., "`task=True`",
-                 "CurrentDocket()"). Will be included in the error message.
-    """
-    if is_docket_available():
-        return
-
-    try:
-        installed = importlib.metadata.version("pydocket")
-    except importlib.metadata.PackageNotFoundError:
-        installed = None
-
-    if installed is None:
-        detail = (
-            "FastMCP background tasks require the `tasks` extra. "
-            "Install with: pip install 'fastmcp[tasks]'."
-        )
-    else:
-        detail = (
-            f"FastMCP background tasks require pydocket>={_MIN_DOCKET_VERSION}, "
-            f"but pydocket {installed} is installed (likely pulled in by another "
-            f"package). Upgrade with: pip install -U 'pydocket>={_MIN_DOCKET_VERSION}'."
-        )
-
-    raise ImportError(f"{detail} (Triggered by {feature})")
-
-
-# Import Progress separately — it's docket-specific, not part of uncalled-for
-try:
-    from docket.dependencies import Progress as DocketProgress
-except ImportError:
-    DocketProgress = None  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
 
 
 # --- Context utilities ---
@@ -425,24 +360,12 @@ def get_context() -> Context:
 def get_server() -> FastMCP:
     """Get the current FastMCP server instance directly.
 
-    In a background-task worker, checks the task-server map first so that
-    mounted-child tasks resolve to the child server (not the parent that
-    started the worker).
-
     Returns:
         The active FastMCP server
 
     Raises:
         RuntimeError: If no server in context
     """
-    # In a task context, prefer the task-specific server mapping.
-    # This handles mounted-child tasks where _current_server is the parent.
-    task_info = get_task_context()
-    if task_info is not None:
-        task_server = get_task_server(task_info.task_id)
-        if task_server is not None:
-            return task_server
-
     server_ref = _current_server.get()
     if server_ref is None:
         raise RuntimeError("No FastMCP server instance in context")
@@ -456,8 +379,6 @@ def get_http_request() -> Request:
     """Get the current HTTP request.
 
     Tries MCP SDK's request_ctx first, then falls back to FastMCP's HTTP context.
-    In background tasks, returns a synthetic request populated with the
-    snapshotted headers from the originating HTTP request.
     """
     # Try FastMCP's request context first (set during normal MCP request handling)
     request = None
@@ -469,33 +390,6 @@ def get_http_request() -> Request:
     # This is needed during `on_initialize` middleware where request_ctx isn't set yet
     if request is None:
         request = _current_http_request.get()
-
-    # In Docket workers, restore a minimal request from the snapshotted
-    # headers.  The snapshot is preloaded by restore_task_snapshot before
-    # user code runs, so this is a pure ContextVar read.
-    if request is None:
-        task_info = get_task_context()
-        snapshot = _recall_snapshot(task_info.task_id) if task_info else None
-        task_headers = snapshot.http_headers if snapshot else None
-        if task_headers:
-            request = Request(
-                {
-                    "type": "http",
-                    "http_version": "1.1",
-                    "method": "POST",
-                    "scheme": "http",
-                    "path": "/",
-                    "raw_path": b"/",
-                    "query_string": b"",
-                    "headers": [
-                        (name.encode("latin-1"), value.encode("latin-1"))
-                        for name, value in task_headers.items()
-                    ],
-                    "client": None,
-                    "server": None,
-                    "root_path": "",
-                }
-            )
 
     if request is None:
         raise RuntimeError("No active HTTP request found.")
@@ -565,8 +459,7 @@ def get_access_token() -> AccessToken | None:
     This function first tries to get the token from the current HTTP request's scope,
     which is more reliable for long-lived connections where the SDK's auth_context_var
     may become stale after token refresh. Falls back to the SDK's context var if no
-    request is available. In background tasks (Docket workers), falls back to the
-    token snapshot stored in Redis at task submission time.
+    request is available.
 
     Returns:
         The access token if an authenticated user is available, None otherwise.
@@ -588,19 +481,6 @@ def get_access_token() -> AccessToken | None:
     # Fall back to SDK's context var if we didn't get a token from the request
     if access_token is None:
         access_token = _sdk_get_access_token()
-
-    # Fall back to background task snapshot (#3095).  In Docket workers,
-    # neither the HTTP request nor the SDK context var is available; the
-    # snapshot is preloaded by restore_task_snapshot before user code runs.
-    if access_token is None:
-        task_info = get_task_context()
-        snapshot = _recall_snapshot(task_info.task_id) if task_info else None
-        if snapshot is not None and snapshot.access_token_json is not None:
-            task_token = AccessToken.model_validate_json(snapshot.access_token_json)
-            if task_token.expires_at is not None:
-                if task_token.expires_at < int(datetime.now(timezone.utc).timestamp()):
-                    return None
-            return task_token
 
     if access_token is None or isinstance(access_token, AccessToken):
         return access_token
@@ -843,53 +723,24 @@ async def resolve_dependencies(
 class _CurrentContext(Dependency["Context"]):
     """Async context manager for Context dependency.
 
-    In foreground (request) mode: returns the active context from _current_context.
-    In background (Docket worker) mode: creates a task-aware Context with task_id
-    and loads the unified task snapshot from Redis.
+    Returns the active context from _current_context (normal MCP request).
 
     The shared default instance is a stateless factory. All per-invocation
-    state lives on the returned Context or in task-local ContextVars, so
-    concurrent tasks never share mutable state.
+    state lives on the returned Context, so concurrent calls never share
+    mutable state.
     """
 
     async def __aenter__(self) -> Context:
-        from fastmcp.server.context import Context, _current_context
+        from fastmcp.server.context import _current_context
 
         # Try foreground context first (normal MCP request)
         context = _current_context.get()
         if context is not None:
             return context
 
-        # Check if we're in a Docket worker context
-        task_info = get_task_context()
-        if task_info is not None:
-            server = get_server()
-
-            # The snapshot is preloaded by restore_task_snapshot (worker-level
-            # Docket dependency) before any task code runs, so this is a pure
-            # ContextVar read — no Redis I/O here.
-            snapshot = _recall_snapshot(task_info.task_id)
-            origin_request_id = snapshot.origin_request_id if snapshot else None
-
-            # Session ID is stored in the snapshot for notification delivery
-            snapshot_session_id = snapshot.session_id if snapshot else None
-            session = (
-                get_task_session(snapshot_session_id) if snapshot_session_id else None
-            )
-
-            ctx = Context(
-                fastmcp=server,
-                session=session,
-                task_id=task_info.task_id,
-                origin_request_id=origin_request_id,
-            )
-            await ctx.__aenter__()
-            return ctx
-
         raise RuntimeError(
             "No active context found. This can happen if:\n"
             "  - Called outside an MCP request handler\n"
-            "  - Called in a background task before session was registered\n"
             "Check `context.request_context` for None before accessing."
         )
 
@@ -964,118 +815,6 @@ def CurrentContext() -> Context:
 def OptionalCurrentContext() -> Context | None:
     """Get the current FastMCP Context, or None when no context is active."""
     return cast("Context | None", _OptionalCurrentContext())
-
-
-class _CurrentDocket(Dependency["Docket"]):
-    """Async context manager for Docket dependency."""
-
-    async def __aenter__(self) -> Docket:
-        require_docket("CurrentDocket()")
-        # Check server instance first, fall back to ContextVar for mounted children
-        # whose parent owns the Docket
-        try:
-            docket = get_server()._docket
-        except RuntimeError:
-            docket = None
-        if docket is None:
-            docket = _current_docket.get()
-        if docket is None:
-            raise RuntimeError(
-                "No Docket instance found. Docket is only initialized when there are "
-                "task-enabled components (task=True). Add task=True to a component "
-                "to enable Docket infrastructure."
-            )
-        return docket
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        pass
-
-
-def CurrentDocket() -> Docket:
-    """Get the current Docket instance managed by FastMCP.
-
-    This dependency provides access to the Docket instance that FastMCP
-    automatically creates for background task scheduling.
-
-    Returns:
-        A dependency that resolves to the active Docket instance
-
-    Raises:
-        RuntimeError: If not within a FastMCP server context
-        ImportError: If fastmcp[tasks] not installed
-
-    Example:
-        ```python
-        from fastmcp.dependencies import CurrentDocket
-
-        @mcp.tool()
-        async def schedule_task(docket: Docket = CurrentDocket()) -> str:
-            await docket.add(some_function)(arg1, arg2)
-            return "Scheduled"
-        ```
-    """
-    require_docket("CurrentDocket()")
-    return cast("Docket", _CurrentDocket())
-
-
-class _CurrentWorker(Dependency["Worker"]):
-    """Async context manager for Worker dependency."""
-
-    async def __aenter__(self) -> Worker:
-        require_docket("CurrentWorker()")
-        # Check server instance first, fall back to ContextVar for mounted children
-        try:
-            worker = get_server()._worker
-        except RuntimeError:
-            worker = None
-        if worker is None:
-            worker = _current_worker.get()
-        if worker is None:
-            raise RuntimeError(
-                "No Worker instance found. Worker is only initialized when there are "
-                "task-enabled components (task=True). Add task=True to a component "
-                "to enable Docket infrastructure."
-            )
-        return worker
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        pass
-
-
-def CurrentWorker() -> Worker:
-    """Get the current Docket Worker instance managed by FastMCP.
-
-    This dependency provides access to the Worker instance that FastMCP
-    automatically creates for background task processing.
-
-    Returns:
-        A dependency that resolves to the active Worker instance
-
-    Raises:
-        RuntimeError: If not within a FastMCP server context
-        ImportError: If fastmcp[tasks] not installed
-
-    Example:
-        ```python
-        from fastmcp.dependencies import CurrentWorker
-
-        @mcp.tool()
-        async def check_worker_status(worker: Worker = CurrentWorker()) -> str:
-            return f"Worker: {worker.name}"
-        ```
-    """
-    require_docket("CurrentWorker()")
-    return cast("Worker", _CurrentWorker())
 
 
 class _CurrentFastMCP(Dependency["FastMCP"]):

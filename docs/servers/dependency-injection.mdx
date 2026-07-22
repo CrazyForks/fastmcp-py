@@ -282,7 +282,8 @@ For background task execution, FastMCP provides dependencies that integrate with
 
 ```python
 from fastmcp import FastMCP
-from fastmcp.dependencies import CurrentDocket, CurrentWorker, Progress
+from fastmcp.dependencies import Progress
+from fastmcp_tasks.dependencies import CurrentDocket, CurrentWorker
 
 mcp = FastMCP("Task Demo")
 

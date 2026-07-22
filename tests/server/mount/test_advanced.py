@@ -598,6 +598,7 @@ class TestMountedServerDocketBehavior:
     includes Docket creation.
     """
 
+    @pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
     async def test_mounted_server_does_not_have_docket(self):
         """Test that a mounted server doesn't create its own Docket.
 

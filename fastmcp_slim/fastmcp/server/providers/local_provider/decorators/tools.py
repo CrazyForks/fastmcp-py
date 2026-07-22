@@ -26,9 +26,9 @@ import mcp_types
 from mcp_types import ToolAnnotations
 
 from fastmcp.server.auth.authorization import AuthCheck
-from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.base import Tool
 from fastmcp.tools.function_tool import FunctionTool
+from fastmcp.utilities.tasks import TaskConfig
 from fastmcp.utilities.types import AnyFunction, NotSet, NotSetT
 
 try:

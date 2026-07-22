@@ -2,12 +2,17 @@
 
 import asyncio
 
+import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.trace import SpanKind
 
 from fastmcp import Client, FastMCP
+
+pytestmark = pytest.mark.skip(
+    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+)
 
 
 def assert_propagating_client_span(

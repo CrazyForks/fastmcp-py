@@ -308,25 +308,9 @@ class Context:
         self._tokens.append(token)
 
         # Set current server for dependency injection (use weakref to avoid reference cycles)
-        from fastmcp.server.dependencies import (
-            _current_docket,
-            _current_server,
-            _current_worker,
-            is_docket_available,
-        )
+        from fastmcp.server.dependencies import _current_server, is_docket_available
 
         self._server_token = _current_server.set(weakref.ref(self.fastmcp))
-
-        # Re-set docket/worker from the server instance so mounted children
-        # inherit the parent's Docket via the ContextVar. Only servers that
-        # own the Docket (the parent) have _docket set; children skip this,
-        # leaving the parent's value in place.
-        if is_docket_available():
-            server = self.fastmcp
-            if server._docket is not None:
-                self._docket_token = _current_docket.set(server._docket)
-            if server._worker is not None:
-                self._worker_token = _current_worker.set(server._worker)
 
         if not is_docket_available():
             # Without docket, the lifespan won't provide a SharedContext,
@@ -338,18 +322,8 @@ class Context:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit the context manager and reset the most recent token."""
-        from fastmcp.server.dependencies import (
-            _current_docket,
-            _current_server,
-            _current_worker,
-        )
+        from fastmcp.server.dependencies import _current_server
 
-        if hasattr(self, "_worker_token"):
-            _current_worker.reset(self._worker_token)
-            del self._worker_token
-        if hasattr(self, "_docket_token"):
-            _current_docket.reset(self._docket_token)
-            del self._docket_token
         if hasattr(self, "_shared_context"):
             await self._shared_context.__aexit__(exc_type, exc_val, exc_tb)
             del self._shared_context
@@ -1409,15 +1383,13 @@ class Context:
                 "_elicit_for_task called but not in a background task context"
             )
 
-        # Import here to avoid circular imports and optional dependency issues
-        from fastmcp.server.tasks.elicitation import elicit_for_task
-
-        return await elicit_for_task(
-            task_id=self._task_id,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
-            session=self._session,
-            message=message,
-            schema=schema,
-            fastmcp=self.fastmcp,
+        # In-task elicitation is provided by the tasks extension (SEP-2663)
+        # from the `fastmcp-tasks` package. Core no longer ships the SEP-1686
+        # push relay this used to call.
+        raise RuntimeError(
+            "In-task elicitation requires the tasks extension. Install "
+            "'fastmcp[tasks]' and register the tasks extension via "
+            "mcp.add_extension(...)."
         )
 
     def _make_state_key(self, key: str) -> str:

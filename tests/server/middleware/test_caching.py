@@ -355,9 +355,18 @@ class TestResponseCachingMiddlewareIntegration:
 
     async def test_list_operations_preserve_component_metadata(self):
         """Base component fields should survive conversion through the cache."""
+        from fastmcp.server.extensions import ServerExtension
+        from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
+
+        class _StubTasksExtension(ServerExtension):
+            identifier = TASKS_EXTENSION_ID
+
         icon = mcp_types.Icon(src="https://example.com/component.png")
         mcp = FastMCP("MetadataServer")
         mcp.add_middleware(ResponseCachingMiddleware())
+        # A task-enabled tool requires the tasks extension to serve; register a
+        # stub so the metadata (execution.task_support) can be verified end-to-end.
+        mcp.add_extension(_StubTasksExtension())
 
         @mcp.tool(icons=[icon], task=TaskConfig(mode="optional"))
         async def greet() -> str:

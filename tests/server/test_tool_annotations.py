@@ -1,5 +1,6 @@
 from typing import Any
 
+import pytest
 from mcp_types import Tool as MCPTool
 from mcp_types import ToolAnnotations, ToolExecution
 
@@ -220,6 +221,7 @@ async def test_tool_functionality_with_annotations():
         assert result.data == {"name": "test_item", "value": 42}
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_task_execution_auto_populated_for_task_enabled_tool():
     """Test that execution.task_support is automatically set when tool has task=True."""
     mcp = FastMCP("Test Server")

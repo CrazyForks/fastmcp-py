@@ -475,11 +475,10 @@ class LowLevelServer(_Server[LifespanResultT]):
         *,
         protocol_version: str | None = None,
     ) -> mcp_types.ServerCapabilities:
-        """Override to set capabilities.tasks as a first-class field per SEP-1686
-        and advertise the MCP Apps UI extension.
+        """Override to advertise registered extensions and the MCP Apps UI extension.
 
-        ``ServerCapabilities.tasks`` and ``ServerCapabilities.extensions`` are
-        real declared fields in v2, so we update them directly. The
+        ``ServerCapabilities.extensions`` is a real declared field in v2, so we
+        update it directly. The
         `FastMCP(experimental_capabilities=...)` merge also lives here rather
         than in `create_initialization_options`: the modern `server/discover`
         handler calls this directly, without going through
@@ -487,8 +486,6 @@ class LowLevelServer(_Server[LifespanResultT]):
         the handshake-era `initialize` response and silently dropped
         constructor-configured experimental capabilities from `discover`.
         """
-        from fastmcp.server.tasks.capabilities import get_task_capabilities
-
         merged_experimental = {
             **self.fastmcp.experimental_capabilities,
             **(experimental_capabilities or {}),
@@ -513,7 +510,6 @@ class LowLevelServer(_Server[LifespanResultT]):
         }
         return capabilities.model_copy(
             update={
-                "tasks": get_task_capabilities(),
                 "extensions": {
                     **existing_extensions,
                     UI_EXTENSION_ID: {},

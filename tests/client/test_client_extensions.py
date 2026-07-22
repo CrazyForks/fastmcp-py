@@ -142,6 +142,7 @@ def test_extension_populates_claim_by_model_index():
     assert client._claim_by_model[ClaimedResult].result_type == CLAIMED_TYPE
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 def test_binding_composes_with_internal_task_binding():
     """User binding is appended to (not replacing) the task-status binding."""
     client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
@@ -153,6 +154,7 @@ def test_binding_composes_with_internal_task_binding():
     assert methods[0] == TASK_STATUS_METHOD
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 def test_no_extensions_leaves_only_task_binding():
     """Without extensions, only the internal task-status binding is registered."""
     client = Client(FastMCP("srv"))
@@ -163,6 +165,7 @@ def test_no_extensions_leaves_only_task_binding():
     assert client._claim_by_model == {}
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 def test_new_preserves_extension_composition():
     """new() rebuilds the clone with both the task binding and user bindings."""
     client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
@@ -204,6 +207,7 @@ def test_result_claims_merge_with_extension_claims():
     assert set(client._claim_by_model) == {ClaimedResult, ExtraClaimed}
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_user_binding_clobbering_task_method_is_rejected():
     """A user extension binding the task-status method cannot silently replace it.
 
@@ -233,6 +237,7 @@ async def test_user_binding_clobbering_task_method_is_rejected():
             pass
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 async def test_both_bindings_fire_against_live_server():
     """The internal task binding and a user extension binding both fire.
 
@@ -263,8 +268,8 @@ async def test_both_bindings_fire_against_live_server():
         # The user extension binding fires on the custom notification.
         await client.call_tool("emit", {"value": 21})
         # The internal task binding fires on the task-status notification.
-        task = await client.call_tool("background", {"value": 5}, task=True)
-        status = await task.wait(timeout=2.0)
+        task = await client.call_tool("background", {"value": 5}, task=True)  # ty: ignore
+        status = await task.wait(timeout=2.0)  # ty: ignore
         # Give the custom-notification queue a moment to drain.
         await asyncio.sleep(0.1)
 

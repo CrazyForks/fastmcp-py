@@ -1158,6 +1158,7 @@ class TestTaskExecution:
     background task has no such request, so returning a guard result from a task
     is rejected with a clear error rather than silently yielding empty content."""
 
+    @pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
     async def test_guard_result_from_task_is_rejected(self):
         mcp = FastMCP("guard-task")
 

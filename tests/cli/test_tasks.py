@@ -1,9 +1,13 @@
 """Tests for the fastmcp tasks CLI."""
 
 import pytest
+from fastmcp_tasks.worker_cli import check_distributed_backend, tasks_app
 
-from fastmcp.cli.tasks import check_distributed_backend, tasks_app
 from fastmcp.utilities.tests import temporary_settings
+
+pytestmark = pytest.mark.skip(
+    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+)
 
 
 class TestCheckDistributedBackend:

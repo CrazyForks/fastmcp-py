@@ -7,7 +7,6 @@ import hashlib
 import secrets
 import ssl
 import uuid
-import weakref
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -43,11 +42,6 @@ from mcp.client.extension import (
     ResultClaim,
 )
 from mcp.client.session import ClientRequestContext, MessageHandlerFnT
-from mcp_types import (
-    GetTaskResult,
-    TaskStatusNotification,
-    TaskStatusNotificationParams,
-)
 from mcp_types.methods import validate_server_result
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 from pydantic import AnyUrl, ValidationError
@@ -67,7 +61,6 @@ from fastmcp.client.messages import MessageHandler, MessageHandlerT
 from fastmcp.client.mixins import (
     ClientPromptsMixin,
     ClientResourcesMixin,
-    ClientTaskManagementMixin,
     ClientToolsMixin,
 )
 from fastmcp.client.progress import ProgressHandler, default_progress_handler
@@ -79,12 +72,6 @@ from fastmcp.client.roots import (
 from fastmcp.client.sampling import (
     SamplingHandler,
     create_sampling_callback,
-)
-from fastmcp.client.tasks import (
-    PromptTask,
-    ResourceTask,
-    TaskNotificationHandler,
-    ToolTask,
 )
 from fastmcp.mcp_config import MCPConfig
 from fastmcp.utilities.exceptions import get_catch_handlers
@@ -256,7 +243,6 @@ class Client(
     ClientResourcesMixin,
     ClientPromptsMixin,
     ClientToolsMixin,
-    ClientTaskManagementMixin,
 ):
     """
     MCP client that delegates connection management to a Transport instance.
@@ -500,12 +486,10 @@ class Client(
             cache
         )
 
-        # The unwrapped base handler (default routes task notifications; a user
-        # handler is preserved as-is). Retained so `new()` can rebuild the clone's
-        # handler without unwrapping the cache-eviction wrapper below.
-        self._base_message_handler: MessageHandlerFnT | None = (
-            message_handler or TaskNotificationHandler(self)
-        )
+        # The unwrapped base handler (a user handler is preserved as-is).
+        # Retained so `new()` can rebuild the clone's handler without unwrapping
+        # the cache-eviction wrapper below.
+        self._base_message_handler: MessageHandlerFnT | None = message_handler
         effective_message_handler = self._base_message_handler
         if self._response_cache is not None:
             effective_message_handler = _evicting_message_handler(
@@ -556,15 +540,6 @@ class Client(
         # Session context management - see class docstring for detailed explanation
         self._session_state = ClientSessionState()
         self._transport_options: TransportOptions | None = None
-
-        # Track task IDs submitted by this client (for list_tasks support)
-        self._submitted_task_ids: set[str] = set()
-
-        # Registry for routing notifications/tasks/status to Task objects
-
-        self._task_registry: dict[
-            str, weakref.ref[ToolTask | PromptTask | ResourceTask]
-        ] = {}
 
     def _build_response_cache(
         self, cache: CacheConfig | bool | None
@@ -724,26 +699,16 @@ class Client(
         new_client._session_state = ClientSessionState()
         new_client._transport_options = self._transport_options
 
-        # Reset mutable task tracking state so new client is independent
-        new_client._task_registry = {}
-        new_client._submitted_task_ids = set()
-
         # Give the clone its own response cache so cached entries are not shared
         # across independent sessions, and rebuild the negotiated_version closure
         # to point at the clone's session state.
         new_client._response_cache = new_client._build_response_cache(self._cache_arg)
 
         # Create a fresh session kwargs dict so the clone doesn't share
-        # the original's mutable dict. Rebind the task notification handler
-        # to the new client if the default handler is in use; preserve any
-        # custom message handler the user may have set.
+        # the original's mutable dict; preserve any custom message handler the
+        # user may have set, re-wrapping with the clone's own cache if one exists.
         new_client._session_kwargs = {**self._session_kwargs}  # type: ignore[typeddict-item]
-        # Recover the unwrapped base handler (never the cache-evicting wrapper): a
-        # default (TaskNotificationHandler) rebinds to the clone; a user handler is
-        # preserved. Then re-wrap with the clone's own cache if one exists.
         base_handler: MessageHandlerFnT | None = self._base_message_handler
-        if isinstance(base_handler, TaskNotificationHandler) or base_handler is None:
-            base_handler = TaskNotificationHandler(new_client)
         new_client._base_message_handler = base_handler
         if new_client._response_cache is not None:
             new_client._session_kwargs["message_handler"] = _evicting_message_handler(
@@ -752,8 +717,7 @@ class Client(
         else:
             new_client._session_kwargs["message_handler"] = base_handler
         # Rebuild the extension-contributed kwargs (capability ad, result claims,
-        # notification bindings) so the clone's task-status binding routes to the
-        # clone while user extensions still compose with it.
+        # notification bindings) so user extensions compose on the clone.
         new_client._session_kwargs.update(new_client._build_extension_kwargs())
 
         new_client.name += f":{secrets.token_hex(2)}"
@@ -1217,41 +1181,12 @@ class Client(
             max_rounds=self.input_required_max_rounds,
         )
 
-    def _handle_task_status_notification(
-        self, notification: TaskStatusNotification
-    ) -> None:
-        """Route task status notification to appropriate Task object.
-
-        Called when notifications/tasks/status is received from server.
-        Updates Task object's cache and triggers events/callbacks.
-        """
-        self._handle_task_status_params(notification.params)
-
-    def _handle_task_status_params(self, params: TaskStatusNotificationParams) -> None:
-        """Route task status notification params to the matching Task object."""
-        task_id = params.task_id
-        if not task_id:
-            return
-
-        # Look up task in registry (weakref)
-        task_ref = self._task_registry.get(task_id)
-        if task_ref:
-            task = task_ref()  # Dereference weakref
-            if task:
-                # Convert notification params to GetTaskResult (they share the same fields via Task)
-                status = GetTaskResult.model_validate(params.model_dump())
-                task._handle_status_notification(status)
-
     def _build_extension_kwargs(self) -> SessionKwargs:
         """Session kwargs contributed by `extensions=` / `result_claims=`.
 
         Folds the user's `ClientExtension` instances into the capability ad, result
         claims, and notification bindings the SDK `ClientSession` consumes, then
-        merges in any explicitly-passed `result_claims`. The internal task-status
-        binding is always prepended to the folded bindings so user extensions
-        *compose* with it rather than clobbering it; a user extension that binds the
-        same `notifications/tasks/status` method surfaces a duplicate-method error
-        from the SDK rather than silently replacing FastMCP's routing.
+        merges in any explicitly-passed `result_claims`.
 
         Also rebuilds `self._claim_by_model`, the model→claim index the resolution
         path uses to finish a claimed `tools/call` result, covering both the folded
@@ -1269,11 +1204,7 @@ class Client(
         self._claim_by_model = by_model
 
         kwargs: SessionKwargs = {
-            # The internal task binding must lead so user bindings extend it.
-            "notification_bindings": [
-                self._task_status_binding(),
-                *(folded.bindings or ()),
-            ],
+            "notification_bindings": [*(folded.bindings or ())],
         }
         if folded.ad:
             kwargs["extensions"] = folded.ad
@@ -1308,26 +1239,6 @@ class Client(
         if not final.is_error:
             await self.session.validate_tool_result(name, final)
         return final
-
-    def _task_status_binding(self) -> NotificationBinding[TaskStatusNotificationParams]:
-        """Build a binding routing `notifications/tasks/status` to Task objects.
-
-        SDK v2 drops notifications whose method is absent from the negotiated
-        version's core tables before they reach the message_handler; a binding is
-        the supported channel for observing such vendor notifications.
-        """
-        client_ref = weakref.ref(self)
-
-        async def _handler(params: TaskStatusNotificationParams) -> None:
-            client = client_ref()
-            if client is not None:
-                client._handle_task_status_params(params)
-
-        return NotificationBinding(
-            method="notifications/tasks/status",
-            params_type=TaskStatusNotificationParams,
-            handler=_handler,
-        )
 
     async def close(self):
         await self._disconnect(force=True)

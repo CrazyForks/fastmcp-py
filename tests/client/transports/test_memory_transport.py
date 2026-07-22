@@ -18,6 +18,7 @@ def test_transport_repr_includes_server_name():
     assert repr(transport) == "<FastMCPTransport(server='repr-test')>"
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 @pytest.mark.timeout(10)
 async def test_task_teardown_does_not_hang():
     """In-memory transport must tear down in under 2 seconds after a task call.

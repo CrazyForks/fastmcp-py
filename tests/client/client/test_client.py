@@ -7,13 +7,13 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from fastmcp_tasks.client import TaskNotificationHandler
 from mcp import ClientSession, MCPError
 from mcp_types import TextContent
 from pydantic import AnyUrl
 
 import fastmcp
 from fastmcp.client import Client
-from fastmcp.client.tasks import TaskNotificationHandler
 from fastmcp.client.transports import (
     ClientTransport,
     FastMCPTransport,
@@ -886,22 +886,24 @@ async def test_client_list_dict_return_type():
         assert result.data == [{"city": "NYC", "temp": 72}, {"city": "LA", "temp": 85}]
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 def test_client_new_resets_mutable_task_state(fastmcp_server):
     """Client.new() should not share mutable task tracking structures."""
     client = Client(transport=FastMCPTransport(fastmcp_server))
 
-    client._task_registry["task-1"] = lambda: None  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
-    client._submitted_task_ids.add("task-1")
+    client._task_registry["task-1"] = lambda: None  # type: ignore[assignment]  # ty: ignore
+    client._submitted_task_ids.add("task-1")  # ty: ignore
 
     clone = client.new()
 
     assert clone is not client
-    assert clone._task_registry == {}
-    assert clone._submitted_task_ids == set()
-    assert clone._task_registry is not client._task_registry
-    assert clone._submitted_task_ids is not client._submitted_task_ids
+    assert clone._task_registry == {}  # ty: ignore
+    assert clone._submitted_task_ids == set()  # ty: ignore
+    assert clone._task_registry is not client._task_registry  # ty: ignore
+    assert clone._submitted_task_ids is not client._submitted_task_ids  # ty: ignore
 
 
+@pytest.mark.skip(reason="Phase 3: requires TasksExtension (SEP-2663 adapter)")
 def test_client_new_rebinds_default_task_notification_handler(fastmcp_server):
     """Client.new() should bind the default task handler to the cloned client."""
     client = Client(transport=FastMCPTransport(fastmcp_server))

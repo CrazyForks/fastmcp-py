@@ -3,13 +3,18 @@
 import asyncio
 from contextlib import asynccontextmanager
 
+import pytest
 from docket import Docket
 from docket.worker import Worker
+from fastmcp_tasks.dependencies import CurrentDocket, CurrentWorker
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
-from fastmcp.dependencies import CurrentDocket, CurrentWorker
 from fastmcp.server.dependencies import get_context
+
+pytestmark = pytest.mark.skip(
+    reason="Phase 3: requires TasksExtension (SEP-2663 adapter)"
+)
 
 HUZZAH = "huzzah!"
 

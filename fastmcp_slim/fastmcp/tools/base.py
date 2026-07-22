@@ -6,7 +6,6 @@ from typing import (
     Annotated,
     Any,
     ClassVar,
-    overload,
 )
 
 import mcp_types
@@ -27,7 +26,7 @@ from pydantic.json_schema import SkipJsonSchema
 from fastmcp.utilities.authorization import AuthCheck
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.tasks import TaskConfig, TaskMeta
+from fastmcp.utilities.tasks import TaskConfig
 from fastmcp.utilities.types import (
     Audio,
     File,
@@ -45,9 +44,6 @@ except ImportError:
     _HAS_PREFAB = False
 
 if TYPE_CHECKING:
-    from docket import Docket
-    from docket.execution import Execution
-
     from fastmcp.tools.function_tool import FunctionTool
     from fastmcp.tools.tool_transform import ArgTransform, TransformedTool
 
@@ -396,86 +392,14 @@ class Tool(FastMCPComponent):
             meta={"fastmcp": {"wrap_result": True}} if wrap_result else None,
         )
 
-    @overload
-    async def _run(
-        self,
-        arguments: dict[str, Any],
-        task_meta: None = None,
-    ) -> ToolResult: ...
+    async def _run(self, arguments: dict[str, Any]) -> ToolResult:
+        """Server entry point for tool execution.
 
-    @overload
-    async def _run(
-        self,
-        arguments: dict[str, Any],
-        task_meta: TaskMeta,
-    ) -> mcp_types.CreateTaskResult: ...
-
-    async def _run(
-        self,
-        arguments: dict[str, Any],
-        task_meta: TaskMeta | None = None,
-    ) -> ToolResult | mcp_types.CreateTaskResult:
-        """Server entry point that handles task routing.
-
-        This allows ANY Tool subclass to support background execution by setting
-        task_config.mode to "supported" or "required". The server calls this
-        method instead of run() directly.
-
-        Args:
-            arguments: Tool arguments
-            task_meta: If provided, execute as background task and return
-                CreateTaskResult. If None (default), execute synchronously and
-                return ToolResult.
-
-        Returns:
-            ToolResult when task_meta is None.
-            CreateTaskResult when task_meta is provided.
-
-        Subclasses can override this to customize task routing behavior.
-        For example, FastMCPProviderTool overrides to delegate to child
-        middleware without submitting to Docket.
+        The server calls this method instead of ``run()`` directly so that
+        subclasses can customize dispatch. For example, ``FastMCPProviderTool``
+        overrides this to delegate to child-server middleware.
         """
-        from fastmcp.server.tasks.routing import check_background_task
-
-        task_result = await check_background_task(
-            component=self,
-            task_type="tool",
-            arguments=arguments,
-            task_meta=task_meta,
-        )
-        if task_result:
-            return task_result
-
         return await self.run(arguments)
-
-    def register_with_docket(self, docket: Docket) -> None:
-        """Register this tool with docket for background execution."""
-        if not self.task_config.supports_tasks():
-            return
-        docket.register(self.run, names=[self.key])
-
-    async def add_to_docket(  # type: ignore[override]
-        self,
-        docket: Docket,
-        arguments: dict[str, Any],
-        *,
-        fn_key: str | None = None,
-        task_key: str | None = None,
-        **kwargs: Any,
-    ) -> Execution:
-        """Schedule this tool for background execution via docket.
-
-        Args:
-            docket: The Docket instance
-            arguments: Tool arguments
-            fn_key: Function lookup key in Docket registry (defaults to self.key)
-            task_key: Redis storage key for the result
-            **kwargs: Additional kwargs passed to docket.add()
-        """
-        lookup_key = fn_key or self.key
-        if task_key:
-            kwargs["key"] = task_key
-        return await docket.add(lookup_key, **kwargs)(arguments)
 
     @classmethod
     def from_tool(
