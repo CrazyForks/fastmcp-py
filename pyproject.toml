@@ -155,9 +155,6 @@ exclude = [
     "examples/providers/sqlite",        # needs aiosqlite
     "examples/memory.py",               # needs asyncpg, numpy, pydantic_ai, pgvector
     "examples/get_file.py",             # needs aiohttp
-    # Skipped pending client task support; rewritten in the client-task follow-up.
-    "tests/tasks/client/test_task_context_validation.py",
-    "tests/tasks/client/test_task_result_caching.py",
 ]
 
 [tool.ty.environment]

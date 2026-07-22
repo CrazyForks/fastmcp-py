@@ -1,626 +1,443 @@
-"""SEP-1686 client Task classes."""
+"""SEP-2663 client task support: the tasks extension, resolver, and handle.
+
+FastMCP drives a server's background tasks transparently. When a `task=True`
+tool runs a call as a task, the server answers `tools/call` with a claimed
+`CreateTaskResult` (SEP-2133) instead of the tool's result. This module supplies
+the client half:
+
+- `TasksClientExtension` advertises the tasks capability (so the server *may*
+  task the call) and declares a `ResultClaim` for `resultType: "task"`. It is
+  registered on every FastMCP `Client` automatically, so the caller opts in to
+  nothing.
+- The claim's resolver polls `tasks/get` to completion under the hood and returns
+  the tool's real result as a `CallToolResult` — the caller of `call_tool` never
+  learns the call was tasked. A task that pauses for input is answered through the
+  client's `elicitation_handler` via `tasks/update`, then polling resumes.
+- `ToolTask` is the explicit handle for callers who want to return immediately and
+  drive the task themselves (`status`/`wait`/`result`/`cancel`), built via
+  `call_tool_task`.
+
+Tasks are modern-protocol only: on a legacy connection the SDK strips the
+capability ad, the server never tasks, and this extension is inert.
+"""
 
 from __future__ import annotations
 
-import abc
 import asyncio
-import inspect
-import time
-import weakref
-from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Generic, TypeVar
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 import mcp_types
-from mcp_types import GetTaskResult, TaskStatusNotification
+from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
+from mcp.client.session import ClientRequestContext, ClientSession, ElicitationFnT
+from mcp_types import CallToolResult
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-import fastmcp
-from fastmcp.client.messages import Message, MessageHandler
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
+from fastmcp.utilities.timeout import normalize_timeout_to_seconds
+from fastmcp_tasks.client_models import (
+    CancelTaskRequest,
+    CancelTaskRequestParams,
+    ClientCreateTaskResult,
+    ClientGetTaskResult,
+    GetTaskRequest,
+    GetTaskRequestParams,
+    UpdateTaskRequest,
+    UpdateTaskRequestParams,
+)
+from fastmcp_tasks.settings import client_settings
+
+if TYPE_CHECKING:
+    from fastmcp.client.client import CallToolResult as FastMCPCallToolResult
+    from fastmcp.client.client import Client
 
 logger = get_logger(__name__)
 
-# Floor for the fallback poll interval in Task.wait() (seconds). When the server
-# does not advertise a pollInterval, each wait() call starts its backoff ramp
-# here so fast tasks resolve quickly even if a status notification is missed.
-# When the server does advertise one, this is only a safety floor that keeps a
-# server sending `pollInterval: 0` from spinning the client in a tight loop.
+#: Floor for the fallback poll interval (seconds). When the server does not
+#: advertise a `pollIntervalMs`, each drive starts its backoff ramp here so quick
+#: tasks resolve fast; when it does advertise one, this floors it so a server
+#: sending `0` cannot spin the client in a tight loop.
 MIN_POLL_INTERVAL = 0.02
 
-if TYPE_CHECKING:
-    from fastmcp.client.client import CallToolResult, Client
+_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
-class TaskNotificationHandler(MessageHandler):
-    """MessageHandler that routes task status notifications to Task objects."""
-
-    def __init__(self, client: Client):
-        super().__init__()
-        self._client_ref: weakref.ref[Client] = weakref.ref(client)
-
-    async def dispatch(self, message: Message) -> None:
-        """Dispatch messages, including task status notifications."""
-        # SDK v2 delivers notifications unwrapped (no `.root` wrapper).
-        if isinstance(message, TaskStatusNotification):
-            client = self._client_ref()
-            if client:
-                client._handle_task_status_notification(message)  # ty: ignore[unresolved-attribute]
-
-        await super().dispatch(message)
+# ---------------------------------------------------------------------------
+# Wire senders (tasks/get, tasks/update, tasks/cancel) over a ClientSession
+# ---------------------------------------------------------------------------
 
 
-TaskResultT = TypeVar("TaskResultT")
+async def _send_get(session: ClientSession, task_id: str) -> ClientGetTaskResult:
+    """Send `tasks/get` and parse the detailed task response."""
+    request = GetTaskRequest(params=GetTaskRequestParams(task_id=task_id))
+    return await session.send_request(request, ClientGetTaskResult)
 
 
-class Task(abc.ABC, Generic[TaskResultT]):
+async def _send_update(
+    session: ClientSession, task_id: str, input_responses: dict[str, Any]
+) -> None:
+    """Send `tasks/update` delivering the caller's answers to a parked task."""
+    request = UpdateTaskRequest(
+        params=UpdateTaskRequestParams(task_id=task_id, input_responses=input_responses)
+    )
+    await session.send_request(request, mcp_types.Result)
+
+
+async def _send_cancel(session: ClientSession, task_id: str) -> None:
+    """Send `tasks/cancel` to cooperatively cancel a task."""
+    request = CancelTaskRequest(params=CancelTaskRequestParams(task_id=task_id))
+    await session.send_request(request, mcp_types.Result)
+
+
+# ---------------------------------------------------------------------------
+# Poll cadence
+# ---------------------------------------------------------------------------
+
+
+def _poll_ceiling(poll_interval_ms: float | None) -> float:
+    """The upper bound for the poll backoff, in seconds.
+
+    A server-advertised `pollIntervalMs` is a deliberate statement about how much
+    load the server wants to take, so it caps the backoff. A zero, negative, or
+    absent value falls back to the `poll_interval` client setting; the ceiling is
+    never below `MIN_POLL_INTERVAL` so a hostile `0` cannot spin the client.
     """
-    Abstract base class for MCP background tasks (SEP-1686).
+    if poll_interval_ms is not None and poll_interval_ms > 0:
+        return max(poll_interval_ms / 1000, MIN_POLL_INTERVAL)
+    return client_settings.poll_interval
 
-    Provides a uniform API whether the server accepts background execution
-    or executes synchronously (graceful degradation per SEP-1686).
 
-    Subclasses:
-        - ToolTask: For tool calls (result type: CallToolResult)
-        - PromptTask: For prompts (future, result type: GetPromptResult)
-        - ResourceTask: For resources (future, result type: ReadResourceResult)
+def _next_poll_delay(
+    poll_interval_ms: float | None, backoff: float
+) -> tuple[float, float]:
+    """Delay before the next poll, plus the backoff for the round after.
+
+    With no status notifications on the modern protocol, polling is the only
+    signal, so a fixed cadence at the server's advertised interval would make a
+    quick task take that full interval to observe as done. Instead the backoff
+    ramps from `MIN_POLL_INTERVAL`, doubling each round up to the ceiling
+    (`_poll_ceiling`): a quick task resolves in ~20ms while a long one settles to
+    the server's advertised cadence, hammering neither.
+    """
+    ceiling = _poll_ceiling(poll_interval_ms)
+    return min(backoff, ceiling), min(backoff * 2, ceiling)
+
+
+# ---------------------------------------------------------------------------
+# In-task input: answer a parked task's requests via the elicitation handler
+# ---------------------------------------------------------------------------
+
+
+async def _answer_input_requests(
+    session: ClientSession,
+    task_id: str,
+    input_requests: dict[str, Any],
+    elicitation_callback: ElicitationFnT | None,
+) -> None:
+    """Answer a task's outstanding input requests, then deliver via `tasks/update`.
+
+    Each request is surfaced by a server-minted key and carries a serialized
+    `ElicitRequest`. The client's elicitation handler produces each answer; the
+    keyed answers are sent back with `tasks/update`, which re-enters the task.
+    Sampling and roots requests are not supported on the modern protocol.
+    """
+    if elicitation_callback is None:
+        raise ToolError(
+            f"Task {task_id} requires input but the client has no elicitation "
+            "handler; pass elicitation_handler= to Client() to drive tasks that "
+            "ask for input."
+        )
+
+    responses: dict[str, Any] = {}
+    for surfaced_key, payload in input_requests.items():
+        method = payload.get("method") if isinstance(payload, dict) else None
+        if method != "elicitation/create":
+            raise ToolError(
+                f"Task {task_id} requested in-task input via {method!r}, which the "
+                "client cannot answer; only elicitation is supported on the modern "
+                "protocol (sampling and roots are deprecated)."
+            )
+        request = mcp_types.ElicitRequest.model_validate(payload)
+        context = ClientRequestContext(
+            session=session, request_id=f"task-{task_id}-{surfaced_key}"
+        )
+        answer = await elicitation_callback(context, request.params)
+        if isinstance(answer, mcp_types.ErrorData):
+            raise ToolError(f"Elicitation for task {task_id} failed: {answer.message}")
+        responses[surfaced_key] = answer.model_dump(
+            by_alias=True, mode="json", exclude_none=True
+        )
+
+    await _send_update(session, task_id, responses)
+
+
+# ---------------------------------------------------------------------------
+# The shared poll loop
+# ---------------------------------------------------------------------------
+
+
+async def _drive_to_terminal(
+    session: ClientSession,
+    task_id: str,
+    elicitation_callback: ElicitationFnT | None,
+) -> ClientGetTaskResult:
+    """Poll `tasks/get` until the task reaches a terminal state.
+
+    `working` sleeps and polls again; `input_required` answers the outstanding
+    requests through the elicitation handler and re-enters; a terminal state
+    (completed / failed / cancelled) is returned. Shared by the transparent
+    resolver and `ToolTask.result()`.
+    """
+    backoff = MIN_POLL_INTERVAL
+    while True:
+        current = await _send_get(session, task_id)
+        if current.status in _TERMINAL_STATES:
+            return current
+        if current.status == "input_required":
+            await _answer_input_requests(
+                session, task_id, current.input_requests or {}, elicitation_callback
+            )
+            backoff = MIN_POLL_INTERVAL
+            continue
+        # working
+        delay, backoff = _next_poll_delay(current.poll_interval_ms, backoff)
+        await asyncio.sleep(delay)
+
+
+def _inlined_call_tool_result(result: dict[str, Any] | None) -> CallToolResult:
+    """Parse a completed task's inlined result dict into a `CallToolResult`."""
+    return CallToolResult.model_validate(result or {})
+
+
+def _terminal_error_message(final: ClientGetTaskResult) -> str:
+    """The best available error message for a failed task."""
+    if isinstance(final.error, dict):
+        message = final.error.get("message")
+        if isinstance(message, str) and message:
+            return message
+    if final.status_message:
+        return final.status_message
+    return f"Task {final.task_id} failed"
+
+
+# ---------------------------------------------------------------------------
+# The tasks client extension and its claim resolver
+# ---------------------------------------------------------------------------
+
+
+class TasksClientExtension(ClientExtension):
+    """The client half of the `io.modelcontextprotocol/tasks` extension (SEP-2663).
+
+    Advertising this extension tells the server the client can drive tasks, so a
+    `task=True` tool may run as a task; the declared `ResultClaim` then resolves
+    the `CreateTaskResult` the server returns by polling `tasks/get` to the real
+    result. Registered automatically on every FastMCP `Client`.
+    """
+
+    identifier = TASKS_EXTENSION_ID
+
+    def __init__(self, elicitation_callback: ElicitationFnT | None = None) -> None:
+        self._elicitation_callback = elicitation_callback
+
+    def settings(self) -> dict[str, Any]:
+        """The tasks extension advertises no per-extension settings."""
+        return {}
+
+    def claims(self) -> Sequence[ResultClaim[Any]]:
+        return (
+            ResultClaim(
+                result_type="task",
+                model=ClientCreateTaskResult,
+                resolve=self._resolve_task,
+                protocol_versions=frozenset(MODERN_PROTOCOL_VERSIONS),
+            ),
+        )
+
+    async def _resolve_task(
+        self, create_result: ClientCreateTaskResult, ctx: ClaimContext
+    ) -> CallToolResult:
+        """Finish a tasked `tools/call` by polling `tasks/get` to completion.
+
+        Returns the tool's real result on completion; a failed or cancelled task
+        becomes an error `CallToolResult` so the ordinary `call_tool` error path
+        (raise `ToolError`) applies uniformly, and the completed inlined result is
+        schema-valid so the SDK's output-schema revalidation passes.
+        """
+        final = await _drive_to_terminal(
+            ctx.session, create_result.task_id, self._elicitation_callback
+        )
+        if final.status == "completed":
+            return _inlined_call_tool_result(final.result)
+        if final.status == "failed":
+            message = _terminal_error_message(final)
+        else:
+            message = f"Task {final.task_id} was cancelled"
+        return CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=message)],
+            is_error=True,
+        )
+
+
+def _build_tasks_client_extension(
+    elicitation_callback: ElicitationFnT | None,
+) -> ClientExtension:
+    """Factory registered with core so every `Client` folds in task support."""
+    return TasksClientExtension(elicitation_callback)
+
+
+# ---------------------------------------------------------------------------
+# The explicit task handle (return-quickly surface)
+# ---------------------------------------------------------------------------
+
+
+class ToolTask:
+    """A handle to a tool call the server is running as a background task.
+
+    Returned by `call_tool_task`. Lets a caller return immediately and then drive
+    the task: check `status`, `wait` for a state, get the finished `result`
+    (answering any input prompts through the client's elicitation handler), or
+    `cancel`. Awaiting the handle is shorthand for `result()`.
     """
 
     def __init__(
         self,
         client: Client,
-        task_id: str,
-        immediate_result: TaskResultT | None = None,
-    ):
-        """
-        Create a Task wrapper.
-
-        Args:
-            client: The FastMCP client
-            task_id: The task identifier
-            immediate_result: If server executed synchronously, the immediate result
-        """
+        tool_name: str,
+        create_result: ClientCreateTaskResult,
+        *,
+        raise_on_error: bool = True,
+    ) -> None:
         self._client = client
-        self._task_id = task_id
-        self._immediate_result = immediate_result
-        self._is_immediate = immediate_result is not None
-
-        # Notification-based optimization (SEP-1686 notifications/tasks/status)
-        self._status_cache: GetTaskResult | None = None
-        self._status_event: asyncio.Event | None = None  # Lazy init
-        self._status_callbacks: list[
-            Callable[[GetTaskResult], None | Awaitable[None]]
-        ] = []
-        self._cached_result: TaskResultT | None = None
-
-    def _check_client_connected(self) -> None:
-        """Validate that client context is still active.
-
-        Raises:
-            RuntimeError: If accessed outside client context (unless immediate)
-        """
-        if self._is_immediate:
-            return  # Already resolved, no client needed
-
-        try:
-            _ = self._client.session
-        except RuntimeError as e:
-            raise RuntimeError(
-                "Cannot access task results outside client context. "
-                "Task futures must be used within 'async with client:' block."
-            ) from e
+        self._tool_name = tool_name
+        self._create_result = create_result
+        self._raise_on_error = raise_on_error
+        self._cached_result: FastMCPCallToolResult | None = None
 
     @property
     def task_id(self) -> str:
-        """Get the task ID."""
-        return self._task_id
+        """The server-generated task id."""
+        return self._create_result.task_id
 
     @property
-    def returned_immediately(self) -> bool:
-        """Check if server executed the task immediately.
+    def create_result(self) -> ClientCreateTaskResult:
+        """The raw `CreateTaskResult` the server returned for the tasked call."""
+        return self._create_result
 
-        Returns:
-            True if server executed synchronously (graceful degradation or no task support)
-            False if server accepted background execution
-        """
-        return self._is_immediate
+    @property
+    def _session(self) -> ClientSession:
+        return self._client.session
 
-    def _handle_status_notification(self, status: GetTaskResult) -> None:
-        """Process incoming notifications/tasks/status (internal).
+    @property
+    def _elicitation_callback(self) -> ElicitationFnT | None:
+        return self._client._elicitation_callback
 
-        Called by Client when a notification is received for this task.
-        Updates cache, triggers events, and invokes user callbacks.
-
-        Args:
-            status: Task status from notification
-        """
-        # Update cache for next status() call
-        self._status_cache = status
-
-        # Wake up any wait() calls
-        if self._status_event is not None:
-            self._status_event.set()
-
-        # Invoke user callbacks
-        for callback in self._status_callbacks:
-            try:
-                result = callback(status)
-                if inspect.isawaitable(result):
-                    # Fire and forget async callbacks
-                    asyncio.create_task(result)  # type: ignore[arg-type] # noqa: RUF006  # ty:ignore[invalid-argument-type]
-            except Exception as e:
-                logger.warning(f"Task callback error: {e}", exc_info=True)
-
-    def on_status_change(
-        self,
-        callback: Callable[[GetTaskResult], None | Awaitable[None]],
-    ) -> None:
-        """Register callback for status change notifications.
-
-        The callback will be invoked when a notifications/tasks/status is received
-        for this task (optional server feature per SEP-1686 lines 436-444).
-
-        Supports both sync and async callbacks (auto-detected).
-
-        Args:
-            callback: Function to call with GetTaskResult when status changes.
-                     Can return None (sync) or Awaitable[None] (async).
-
-        Example:
-            >>> task = await client.call_tool("slow_operation", {}, task=True)
-            >>>
-            >>> def on_update(status: GetTaskResult):
-            ...     print(f"Task {status.task_id} is now {status.status}")
-            >>>
-            >>> task.on_status_change(on_update)
-            >>> result = await task  # Callback fires when status changes
-        """
-        self._status_callbacks.append(callback)
-
-    async def status(self) -> GetTaskResult:
-        """Get current task status.
-
-        If server executed immediately, returns synthetic completed status.
-        Otherwise queries the server for current status.
-        """
-        self._check_client_connected()
-
-        if self._is_immediate:
-            # Return synthetic completed status. SDK v2 types the task
-            # timestamps as ISO 8601 strings.
-            now = datetime.now(timezone.utc).isoformat()
-            return GetTaskResult(
-                task_id=self._task_id,
-                status="completed",
-                created_at=now,
-                last_updated_at=now,
-                ttl=None,
-                poll_interval=1000,
-            )
-
-        # Return cached status if available (from notification)
-        if self._status_cache is not None:
-            cached = self._status_cache
-            # Don't clear cache - keep it for next call
-            return cached
-
-        # Query server and cache the result
-        self._status_cache = await self._client.get_task_status(self._task_id)  # ty: ignore[unresolved-attribute]
-        return self._status_cache
-
-    @abc.abstractmethod
-    async def result(self) -> TaskResultT:
-        """Wait for and return the task result.
-
-        Must be implemented by subclasses to return the appropriate result type.
-        """
-        ...
+    async def status(self) -> ClientGetTaskResult:
+        """Fetch the task's current status via `tasks/get`."""
+        return await _send_get(self._session, self.task_id)
 
     async def wait(
         self, *, state: str | None = None, timeout: float = 300.0
-    ) -> GetTaskResult:
-        """Wait for task to reach a specific state or complete.
+    ) -> ClientGetTaskResult:
+        """Poll until the task reaches `state` (or any terminal state if `None`).
 
-        Uses event-based waiting when notifications are available (fast),
-        with fallback to polling (reliable). Optimally wakes up immediately
-        on status changes when server sends notifications/tasks/status.
-
-        The fallback poll cadence has two modes. If the server advertises a
-        `pollInterval`, that interval is honored exactly (subject only to a
-        20ms safety floor), because it is a deliberate statement about how
-        much load the server wants to take. If it does not, the poll starts at
-        20ms and doubles up to the `client_task_poll_interval` setting.
-
-        Args:
-            state: Desired state ('working', 'input_required', 'completed', 'failed', 'cancelled').
-                   If None, waits until the task exits the 'working' state (completed, failed, cancelled, input_required, etc.)
-            timeout: Maximum time to wait in seconds
-
-        Returns:
-            GetTaskResult: Final task status
-
-        Raises:
-            TimeoutError: If desired state not reached within timeout
+        Does not answer input prompts: a caller that wants automatic answering
+        should use `result()`. `wait(state="input_required")` lets a caller
+        observe the parked state and answer it manually.
         """
-        self._check_client_connected()
-
-        if self._is_immediate:
-            # Already done
-            return await self.status()
-
-        # Initialize event for notification wake-ups
-        if self._status_event is None:
-            self._status_event = asyncio.Event()
-
-        start = time.time()
-        in_progress_states = {"working"}
-        # Backoff state for the unadvertised-interval mode; resets per wait()
-        # call. Notifications still short-circuit the wait via the status event,
-        # so this only governs the fallback poll.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
         backoff = MIN_POLL_INTERVAL
-
         while True:
-            # Check cached status first (updated by notifications)
-            if self._status_cache:
-                current = self._status_cache.status
-                if state is None:
-                    if current not in in_progress_states:
-                        return self._status_cache
-                elif current == state:
-                    return self._status_cache
-
-            # Check timeout
-            elapsed = time.time() - start
-            if elapsed >= timeout:
+            current = await self.status()
+            if state is not None:
+                if current.status == state:
+                    return current
+            elif current.status in _TERMINAL_STATES:
+                return current
+            if loop.time() >= deadline:
                 raise TimeoutError(
-                    f"Task {self._task_id} did not reach {state or 'terminal state'} within {timeout}s"
+                    f"Task {self.task_id} did not reach "
+                    f"{state or 'a terminal state'} within {timeout}s"
                 )
+            delay, backoff = _next_poll_delay(current.poll_interval_ms, backoff)
+            await asyncio.sleep(delay)
 
-            remaining = timeout - elapsed
-            interval, backoff = self._next_poll_delay(backoff)
+    async def result(self) -> FastMCPCallToolResult:
+        """Drive the task to completion and return its parsed result.
 
-            # Wait for notification event OR poll timeout
-            try:
-                await asyncio.wait_for(
-                    self._status_event.wait(), timeout=min(interval, remaining)
-                )
-                self._status_event.clear()
-            except asyncio.TimeoutError:
-                # Fallback: poll server (notification didn't arrive in time)
-                self._status_cache = await self._client.get_task_status(self._task_id)  # ty: ignore[unresolved-attribute]
-
-    def _next_poll_delay(self, backoff: float) -> tuple[float, float]:
-        """Delay before the next fallback poll, plus the backoff for the round after.
-
-        Advertised interval -> honor it; no advertised interval -> ramp.
-
-        A server that advertises `pollInterval` (milliseconds) is making a
-        deliberate statement about how much load it wants to take, so that
-        interval is used verbatim as the delay with no backoff ramp. The only
-        adjustment is `MIN_POLL_INTERVAL` as a safety floor, so a server sending
-        a zero or negative interval cannot spin this client in a tight request
-        loop.
-
-        When the server advertises nothing, there is no guidance to honor, so
-        the poll starts at `MIN_POLL_INTERVAL` and doubles each round up to the
-        `client_task_poll_interval` setting.
+        Answers any input prompts through the client's elicitation handler.
+        Raises `ToolError` on a failed or cancelled task when `raise_on_error`
+        (the default); otherwise returns an error result. The result is cached, so
+        repeated calls return the same object.
         """
-        cache = self._status_cache
-        if cache is not None and cache.poll_interval is not None:
-            return max(cache.poll_interval / 1000, MIN_POLL_INTERVAL), backoff
+        if self._cached_result is not None:
+            return self._cached_result
 
-        ceiling = fastmcp.settings.client_task_poll_interval
-        return min(backoff, ceiling), min(backoff * 2, ceiling)
+        final = await _drive_to_terminal(
+            self._session, self.task_id, self._elicitation_callback
+        )
+        if final.status == "completed":
+            mcp_result = _inlined_call_tool_result(final.result)
+        else:
+            if final.status == "failed":
+                message = _terminal_error_message(final)
+            else:
+                message = f"Task {self.task_id} was cancelled"
+            if self._raise_on_error:
+                raise ToolError(message)
+            mcp_result = CallToolResult(
+                content=[mcp_types.TextContent(type="text", text=message)],
+                is_error=True,
+            )
 
-    async def _wait_terminal(self, timeout: float = 300.0) -> GetTaskResult:
-        """Wait until task reaches a terminal state (completed, failed, cancelled).
-
-        Unlike wait(), this will not return on input_required — it continues
-        waiting until the task fully resolves. Used internally by result().
-        """
-        terminal_states = {"completed", "failed", "cancelled"}
-        status = await self.wait(timeout=timeout)
-        while status.status not in terminal_states:
-            # Task is in a non-terminal state (e.g. input_required) — reset
-            # cache so the next wait() call blocks instead of returning immediately.
-            self._status_cache = None
-            status = await self.wait(timeout=timeout)
-        return status
+        parsed = await self._client._parse_call_tool_result(
+            self._tool_name, mcp_result, raise_on_error=self._raise_on_error
+        )
+        self._cached_result = parsed
+        return parsed
 
     async def cancel(self) -> None:
-        """Cancel this task, transitioning it to cancelled state.
-
-        Sends a tasks/cancel protocol request. The server will attempt to halt
-        execution and move the task to cancelled state.
-
-        Note: If server executed immediately (graceful degradation), this is a no-op
-        as there's no server-side task to cancel.
-        """
-        if self._is_immediate:
-            # No server-side task to cancel
-            return
-        self._check_client_connected()
-        await self._client.cancel_task(self._task_id)  # ty: ignore[unresolved-attribute]
-        # Invalidate cache to force fresh status fetch
-        self._status_cache = None
+        """Request cooperative cancellation of the task via `tasks/cancel`."""
+        await _send_cancel(self._session, self.task_id)
 
     def __await__(self):
-        """Allow 'await task' to get result."""
         return self.result().__await__()
 
 
-class ToolTask(Task["CallToolResult"]):
+async def call_tool_task(
+    client: Client,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    timeout: float | int | None = None,
+    raise_on_error: bool = True,
+    meta: dict[str, Any] | None = None,
+) -> ToolTask:
+    """Call a tool as a background task and return a `ToolTask` handle immediately.
+
+    Unlike `client.call_tool` (which polls to completion transparently), this
+    returns as soon as the server accepts the task, so the caller can do other
+    work and drive the task through the handle. Requires the server to run the
+    call as a task (a `task=True` tool on a task-serving backend); a call the
+    server runs synchronously raises `ToolError`.
     """
-    Represents a tool call that may execute in background or immediately.
-
-    Provides a uniform API whether the server accepts background execution
-    or executes synchronously (graceful degradation per SEP-1686).
-
-    Usage:
-        task = await client.call_tool_as_task("analyze", args)
-
-        # Check status
-        status = await task.status()
-
-        # Wait for completion
-        await task.wait()
-
-        # Get result (waits if needed)
-        result = await task.result()  # Returns CallToolResult
-
-        # Or just await the task directly
-        result = await task
-    """
-
-    def __init__(
-        self,
-        client: Client,
-        task_id: str,
-        tool_name: str,
-        immediate_result: CallToolResult | None = None,
-        raise_on_error: bool = True,
-    ):
-        """
-        Create a ToolTask wrapper.
-
-        Args:
-            client: The FastMCP client
-            task_id: The task identifier
-            tool_name: Name of the tool being executed
-            immediate_result: If server executed synchronously, the immediate result
-            raise_on_error: Whether task.result() should raise ToolError on errors
-        """
-        super().__init__(client, task_id, immediate_result)
-        self._tool_name = tool_name
-        self._raise_on_error = raise_on_error
-
-    async def result(self) -> CallToolResult:
-        """Wait for and return the tool result.
-
-        If server executed immediately, returns the immediate result.
-        Otherwise waits for background task to complete and retrieves result.
-
-        Returns:
-            CallToolResult: The parsed tool result (same as call_tool returns)
-        """
-        # Check cache first
-        if self._cached_result is not None:
-            return self._cached_result
-
-        if self._is_immediate:
-            assert self._immediate_result is not None  # Type narrowing
-            result = self._immediate_result
-            if result.is_error and self._raise_on_error:
-                if result.content and isinstance(
-                    result.content[0], mcp_types.TextContent
-                ):
-                    msg = result.content[0].text
-                else:
-                    msg = f"Tool '{self._tool_name}' returned an error"
-                raise ToolError(msg)
-        else:
-            # Check client connected
-            self._check_client_connected()
-
-            # Wait for completion using event-based wait (respects notifications)
-            await self._wait_terminal()
-
-            # Get the raw result (dict or CallToolResult)
-            raw_result = await self._client.get_task_result(self._task_id)  # ty: ignore[unresolved-attribute]
-
-            # Convert to CallToolResult if needed and parse
-            if isinstance(raw_result, dict):
-                # Raw dict from get_task_result - parse as CallToolResult
-                mcp_result = mcp_types.CallToolResult.model_validate(raw_result)
-                result = await self._client._parse_call_tool_result(
-                    self._tool_name,
-                    mcp_result,
-                    raise_on_error=self._raise_on_error,
-                )
-            elif isinstance(raw_result, mcp_types.CallToolResult):
-                # Already a CallToolResult from MCP protocol - parse it
-                result = await self._client._parse_call_tool_result(
-                    self._tool_name,
-                    raw_result,
-                    raise_on_error=self._raise_on_error,
-                )
-            else:
-                # Legacy ToolResult format - convert to MCP type
-                if hasattr(raw_result, "content") and hasattr(
-                    raw_result, "structured_content"
-                ):
-                    mcp_result = mcp_types.CallToolResult(
-                        content=raw_result.content,
-                        structured_content=raw_result.structured_content,
-                        _meta=raw_result.meta,  # type: ignore[call-arg]  # _meta is Pydantic alias for meta field
-                    )
-                    result = await self._client._parse_call_tool_result(
-                        self._tool_name,
-                        mcp_result,
-                        raise_on_error=self._raise_on_error,
-                    )
-                else:
-                    # Unknown type - just return it
-                    result = raw_result
-
-        # Cache before returning
-        self._cached_result = result
-        return result
-
-
-class PromptTask(Task[mcp_types.GetPromptResult]):
-    """
-    Represents a prompt call that may execute in background or immediately.
-
-    Provides a uniform API whether the server accepts background execution
-    or executes synchronously (graceful degradation per SEP-1686).
-
-    Usage:
-        task = await client.get_prompt_as_task("analyze", args)
-        result = await task  # Returns GetPromptResult
-    """
-
-    def __init__(
-        self,
-        client: Client,
-        task_id: str,
-        prompt_name: str,
-        immediate_result: mcp_types.GetPromptResult | None = None,
-    ):
-        """
-        Create a PromptTask wrapper.
-
-        Args:
-            client: The FastMCP client
-            task_id: The task identifier
-            prompt_name: Name of the prompt being executed
-            immediate_result: If server executed synchronously, the immediate result
-        """
-        super().__init__(client, task_id, immediate_result)
-        self._prompt_name = prompt_name
-
-    async def result(self) -> mcp_types.GetPromptResult:
-        """Wait for and return the prompt result.
-
-        If server executed immediately, returns the immediate result.
-        Otherwise waits for background task to complete and retrieves result.
-
-        Returns:
-            GetPromptResult: The prompt result with messages and description
-        """
-        # Check cache first
-        if self._cached_result is not None:
-            return self._cached_result
-
-        if self._is_immediate:
-            assert self._immediate_result is not None
-            result = self._immediate_result
-        else:
-            # Check client connected
-            self._check_client_connected()
-
-            # Wait for completion using event-based wait (respects notifications)
-            await self._wait_terminal()
-
-            # Get the raw MCP result
-            mcp_result = await self._client.get_task_result(self._task_id)  # ty: ignore[unresolved-attribute]
-
-            # Parse as GetPromptResult
-            result = mcp_types.GetPromptResult.model_validate(mcp_result)
-
-        # Cache before returning
-        self._cached_result = result
-        return result
-
-
-class ResourceTask(
-    Task[list[mcp_types.TextResourceContents | mcp_types.BlobResourceContents]]
-):
-    """
-    Represents a resource read that may execute in background or immediately.
-
-    Provides a uniform API whether the server accepts background execution
-    or executes synchronously (graceful degradation per SEP-1686).
-
-    Usage:
-        task = await client.read_resource_as_task("file://data.txt")
-        contents = await task  # Returns list[ReadResourceContents]
-    """
-
-    def __init__(
-        self,
-        client: Client,
-        task_id: str,
-        uri: str,
-        immediate_result: list[
-            mcp_types.TextResourceContents | mcp_types.BlobResourceContents
-        ]
-        | None = None,
-    ):
-        """
-        Create a ResourceTask wrapper.
-
-        Args:
-            client: The FastMCP client
-            task_id: The task identifier
-            uri: URI of the resource being read
-            immediate_result: If server executed synchronously, the immediate result
-        """
-        super().__init__(client, task_id, immediate_result)
-        self._uri = uri
-
-    async def result(
-        self,
-    ) -> list[mcp_types.TextResourceContents | mcp_types.BlobResourceContents]:
-        """Wait for and return the resource contents.
-
-        If server executed immediately, returns the immediate result.
-        Otherwise waits for background task to complete and retrieves result.
-
-        Returns:
-            list[ReadResourceContents]: The resource contents
-        """
-        # Check cache first
-        if self._cached_result is not None:
-            return self._cached_result
-
-        if self._is_immediate:
-            assert self._immediate_result is not None
-            result = self._immediate_result
-        else:
-            # Check client connected
-            self._check_client_connected()
-
-            # Wait for completion using event-based wait (respects notifications)
-            await self._wait_terminal()
-
-            # Get the raw MCP result
-            mcp_result = await self._client.get_task_result(self._task_id)  # ty: ignore[unresolved-attribute]
-
-            # Parse as ReadResourceResult or extract contents
-            if isinstance(mcp_result, mcp_types.ReadResourceResult):
-                # Already parsed by TasksResponse - extract contents
-                result = list(mcp_result.contents)
-            elif isinstance(mcp_result, dict) and "contents" in mcp_result:
-                # Dict format - parse each content item
-                parsed_contents = []
-                for item in mcp_result["contents"]:
-                    if isinstance(item, dict):
-                        if "blob" in item:
-                            parsed_contents.append(
-                                mcp_types.BlobResourceContents.model_validate(item)
-                            )
-                        else:
-                            parsed_contents.append(
-                                mcp_types.TextResourceContents.model_validate(item)
-                            )
-                    else:
-                        parsed_contents.append(item)
-                result = parsed_contents
-            else:
-                # Fallback - might be the list directly
-                result = mcp_result if isinstance(mcp_result, list) else [mcp_result]
-
-        # Cache before returning
-        self._cached_result = result
-        return result
+    read_timeout_seconds = normalize_timeout_to_seconds(timeout)
+    request_meta = cast("mcp_types.RequestParamsMeta | None", meta)
+    raw = await client._await_with_session_monitoring(
+        client.session.call_tool(
+            name=name,
+            arguments=arguments or {},
+            read_timeout_seconds=read_timeout_seconds,
+            meta=request_meta,
+            allow_claimed=True,
+        )
+    )
+    if isinstance(raw, ClientCreateTaskResult):
+        return ToolTask(client, name, raw, raise_on_error=raise_on_error)
+    raise ToolError(
+        f"Tool {name!r} did not run as a task: the server returned a "
+        f"{type(raw).__name__} instead of a task. Ensure the tool is declared "
+        "task=True and the connection is modern (mode='auto')."
+    )

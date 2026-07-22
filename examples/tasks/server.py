@@ -20,13 +20,17 @@ from docket import Logged
 
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
+from fastmcp_tasks import TasksExtension
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create server
+# Create server and enable background tasks (SEP-2663). The extension reads the
+# FASTMCP_DOCKET_* environment for its backend (memory:// by default, Redis for
+# distributed execution).
 mcp = FastMCP("Tasks Example")
+mcp.add_extension(TasksExtension())
 
 
 @mcp.tool(task=True)

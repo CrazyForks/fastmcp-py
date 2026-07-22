@@ -120,3 +120,38 @@ class DocketSettings(BaseSettings):
 
 
 docket_settings = DocketSettings()
+
+
+class TasksClientSettings(BaseSettings):
+    """Client-side settings for driving background tasks.
+
+    Moved here from core ``fastmcp.settings`` during the SEP-1686 -> SEP-2663
+    migration: the entire client task-driving path now lives in
+    ``fastmcp-tasks``, so its one tunable does too.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="FASTMCP_TASKS_CLIENT_",
+        extra="ignore",
+    )
+
+    poll_interval: Annotated[
+        float,
+        Field(
+            description=inspect.cleandoc(
+                """
+                Ceiling, in seconds, for the fallback poll backoff while the client
+                waits on a background task. Applies only when the server does not
+                advertise its own pollIntervalMs: in that case the client starts
+                polling fast (~20ms) and doubles up to this ceiling, so quick tasks
+                resolve promptly while long-running tasks don't hammer the server.
+                When the server advertises a pollIntervalMs, that interval is honored
+                exactly and this setting is ignored. Must be positive.
+                """
+            ),
+            gt=0,
+        ),
+    ] = 0.5
+
+
+client_settings = TasksClientSettings()

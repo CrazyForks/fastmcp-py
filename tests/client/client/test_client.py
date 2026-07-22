@@ -7,7 +7,6 @@ from typing import Any, cast
 
 import anyio
 import pytest
-from fastmcp_tasks.client import TaskNotificationHandler
 from mcp import ClientSession, MCPError
 from mcp_types import TextContent
 from pydantic import AnyUrl
@@ -886,34 +885,19 @@ async def test_client_list_dict_return_type():
         assert result.data == [{"city": "NYC", "temp": 72}, {"city": "LA", "temp": 85}]
 
 
-@pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
-def test_client_new_resets_mutable_task_state(fastmcp_server):
-    """Client.new() should not share mutable task tracking structures."""
-    client = Client(transport=FastMCPTransport(fastmcp_server))
+def test_client_new_preserves_internal_task_extension(fastmcp_server):
+    """Client.new() rebuilds the clone with the auto-registered tasks claim.
 
-    client._task_registry["task-1"] = lambda: None  # type: ignore[assignment]  # ty: ignore
-    client._submitted_task_ids.add("task-1")  # ty: ignore
+    The tasks client extension (from fastmcp-tasks, imported above) is folded into
+    every Client automatically; a clone must carry it too so tasked calls still
+    resolve transparently on the clone.
+    """
+    from fastmcp_tasks.client_models import ClientCreateTaskResult
+
+    client = Client(transport=FastMCPTransport(fastmcp_server))
+    assert ClientCreateTaskResult in client._claim_by_model
 
     clone = client.new()
-
     assert clone is not client
-    assert clone._task_registry == {}  # ty: ignore
-    assert clone._submitted_task_ids == set()  # ty: ignore
-    assert clone._task_registry is not client._task_registry  # ty: ignore
-    assert clone._submitted_task_ids is not client._submitted_task_ids  # ty: ignore
-
-
-@pytest.mark.skip(reason="Phase 4: requires client task support (SEP-2663)")
-def test_client_new_rebinds_default_task_notification_handler(fastmcp_server):
-    """Client.new() should bind the default task handler to the cloned client."""
-    client = Client(transport=FastMCPTransport(fastmcp_server))
-
-    handler = client._session_kwargs.get("message_handler")
-    assert isinstance(handler, TaskNotificationHandler)
-
-    clone = client.new()
-
-    clone_handler = clone._session_kwargs.get("message_handler")
-    assert isinstance(clone_handler, TaskNotificationHandler)
-    assert clone_handler is not handler
-    assert clone_handler._client_ref() is clone
+    assert ClientCreateTaskResult in clone._claim_by_model
+    assert clone._claim_by_model is not client._claim_by_model

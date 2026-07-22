@@ -1353,6 +1353,12 @@ class ProxyClient(Client[ClientTransportT]):
     _proxy_rc_ref: list[Any]
     _proxy_restoring_handler_keys: set[str]
 
+    # A proxy forwards calls; it must not advertise task support to its backend.
+    # Proxied tools run synchronously (forbidden mode), and the proxy has no path
+    # to drive a backend task on the front connection's behalf, so the internal
+    # tasks client extension is not folded into a proxy's backend client.
+    _auto_internal_extensions: bool = False
+
     def __init__(
         self,
         transport: ClientTransportT

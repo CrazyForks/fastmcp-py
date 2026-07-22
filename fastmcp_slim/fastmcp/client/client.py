@@ -41,7 +41,11 @@ from mcp.client.extension import (
     NotificationBinding,
     ResultClaim,
 )
-from mcp.client.session import ClientRequestContext, MessageHandlerFnT
+from mcp.client.session import (
+    ClientRequestContext,
+    ElicitationFnT,
+    MessageHandlerFnT,
+)
 from mcp_types.methods import validate_server_result
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 from pydantic import AnyUrl, ValidationError
@@ -52,6 +56,7 @@ from fastmcp.client.elicitation import (
     ElicitationHandler,
     create_elicitation_callback,
 )
+from fastmcp.client.extension_hooks import build_internal_client_extensions
 from fastmcp.client.logging import (
     LogHandler,
     create_log_callback,
@@ -334,6 +339,13 @@ class Client(
         ```
     """
 
+    #: Whether FastMCP-internal client extensions (e.g. the tasks extension) are
+    #: folded in automatically at construction. `ProxyClient` overrides this to
+    #: `False`: a proxy forwards calls and must not advertise task support to its
+    #: backend, since proxied tools run synchronously (forbidden mode) and the
+    #: proxy has no path to drive a backend task on the front connection's behalf.
+    _auto_internal_extensions: bool = True
+
     @overload
     def __init__(self: Client[T], transport: T, *args: Any, **kwargs: Any) -> None: ...
 
@@ -504,6 +516,16 @@ class Client(
         # `_build_extension_kwargs`.
         self._claim_by_model: dict[type[mcp_types.Result], ResultClaim[Any]] = {}
 
+        # Build the elicitation callback up front: it is threaded both into the
+        # session (to answer server-initiated elicitation) and into the internal
+        # client extensions (so a task resolver can answer in-task input), and
+        # `_build_extension_kwargs` — called below — needs it.
+        self._elicitation_callback: ElicitationFnT | None = (
+            create_elicitation_callback(elicitation_handler)
+            if elicitation_handler is not None
+            else None
+        )
+
         self._session_kwargs: SessionKwargs = {
             "sampling_callback": None,
             "list_roots_callback": None,
@@ -527,10 +549,8 @@ class Client(
                 else mcp_types.SamplingCapability()
             )
 
-        if elicitation_handler is not None:
-            self._session_kwargs["elicitation_callback"] = create_elicitation_callback(
-                elicitation_handler
-            )
+        if self._elicitation_callback is not None:
+            self._session_kwargs["elicitation_callback"] = self._elicitation_callback
 
         # Maximum time to wait for a clean disconnect before giving up.
         # Normally disconnects complete in <100ms; this is a safety net for
@@ -1191,8 +1211,31 @@ class Client(
         Also rebuilds `self._claim_by_model`, the model→claim index the resolution
         path uses to finish a claimed `tools/call` result, covering both the folded
         extension claims and the explicit `result_claims` extras.
+
+        FastMCP-internal extensions (e.g. the tasks extension from `fastmcp-tasks`,
+        registered via `register_internal_client_extension_factory`) are folded in
+        automatically so an ordinary `Client` transparently drives a server's
+        background tasks. They lead the fold order; a user extension declaring the
+        same identifier wins, so the internal one is dropped rather than colliding.
         """
-        folded = _fold_extensions(self._extensions_arg)
+        user_extensions = list(self._extensions_arg or ())
+        user_identifiers = {
+            identifier
+            for extension in user_extensions
+            if (identifier := getattr(extension, "identifier", None)) is not None
+        }
+        internal_extensions = (
+            [
+                extension
+                for extension in build_internal_client_extensions(
+                    self._elicitation_callback
+                )
+                if extension.identifier not in user_identifiers
+            ]
+            if self._auto_internal_extensions
+            else []
+        )
+        folded = _fold_extensions([*internal_extensions, *user_extensions])
 
         claims: dict[str, tuple[ResultClaim[Any], ...]] = dict(folded.claims or {})
         by_model: dict[type[mcp_types.Result], ResultClaim[Any]] = dict(folded.by_model)
