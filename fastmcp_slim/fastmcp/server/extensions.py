@@ -34,7 +34,11 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 from mcp.server.context import ServerRequestContext
 from mcp.shared.exceptions import MCPError
 from mcp.shared.extension import validate_extension_identifier
-from mcp_types import METHOD_NOT_FOUND, CLIENT_CAPABILITIES_META_KEY, CallToolRequestParams
+from mcp_types import (
+    CLIENT_CAPABILITIES_META_KEY,
+    METHOD_NOT_FOUND,
+    CallToolRequestParams,
+)
 from mcp_types.methods import SPEC_CLIENT_METHODS
 from pydantic import BaseModel
 
