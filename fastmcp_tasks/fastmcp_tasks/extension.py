@@ -236,6 +236,7 @@ def _install_worker_hooks() -> None:
         set_background_context_factory,
         set_worker_server_resolver,
     )
+    from fastmcp_tasks import wire_production
     from fastmcp_tasks.context import make_task_context, resolve_worker_server
     from fastmcp_tasks.input_store import elicit_in_task
 
@@ -244,6 +245,10 @@ def _install_worker_hooks() -> None:
     set_background_context_factory(make_task_context)
     set_worker_server_resolver(resolve_worker_server)
     set_task_elicitation_handler(elicit_in_task)
+    # Enable server-side production of the claimed CreateTaskResult on tools/call
+    # (the SDK ships only claim consumption). Refcounted independently but
+    # installed/released in lockstep with the worker hooks.
+    wire_production.install()
 
 
 def _release_worker_hooks() -> None:
@@ -252,6 +257,7 @@ def _release_worker_hooks() -> None:
         set_background_context_factory,
         set_worker_server_resolver,
     )
+    from fastmcp_tasks import wire_production
 
     global _active_worker_hook_holds
     _active_worker_hook_holds -= 1
@@ -260,3 +266,4 @@ def _release_worker_hooks() -> None:
         set_task_elicitation_handler(None)
         set_worker_server_resolver(None)
         set_background_context_factory(None)
+    wire_production.uninstall()

@@ -56,10 +56,10 @@ class _TaskFields(BaseModel):
     false` on the task arm forbids it (see module docstring).
     """
 
-    # Serialization aliases only: these result models are constructed by field
-    # name (the engine builds them) and dumped to camelCase by the runner
-    # (`model_dump(by_alias=True)`). Wire *validation* of results is the client's
-    # concern.
+    # Serialization aliases: the engine constructs these by field name and the
+    # runner dumps them to camelCase (`model_dump(by_alias=True)`). The
+    # claim-production wrap returns that dump unchanged, so no input alias is
+    # needed.
     model_config = ConfigDict(populate_by_name=True)
 
     task_id: str = Field(serialization_alias="taskId")
@@ -80,7 +80,21 @@ class CreateTaskResult(_TaskFields):
 
     A flat merge of `Result` and `Task` (SEP-2663): the finished task stub the
     client polls with `tasks/get`. Status is typically `working`.
+
+    `resultType` is the wire discriminator that distinguishes this from a
+    `CallToolResult` on the shared `tools/call` method: the modern result union
+    carries a required `resultType`, and the SDK's client-side `ResultClaim`
+    for tasks requires this model to pin it to `Literal["task"]`. The vendored
+    draft schema omits `resultType` from the task arm (its
+    `additionalProperties: false` forbids it) — a schema-vs-protocol
+    contradiction reported upstream. Protocol interop requires the field, so we
+    emit it; only this shape needs it (the `tasks/*` methods each have a single
+    result type and bypass the discriminated union).
     """
+
+    result_type: Literal["task"] = Field(
+        default="task", serialization_alias="resultType"
+    )
 
 
 class GetTaskResult(_TaskFields):
@@ -90,8 +104,16 @@ class GetTaskResult(_TaskFields):
     `input_requests` (input_required) alongside the flat task fields, matching
     the schema's 5-status union. The three payload fields default to `None` and
     are dropped from the wire dump for the statuses that do not use them.
+
+    `resultType` is `"complete"` (SEP-2663 L338): `tasks/get` itself completes
+    normally, whatever the task's own status. As with `CreateTaskResult`, the
+    draft schema's `additionalProperties: false` omits this field — a
+    contradiction reported upstream; protocol interop requires emitting it.
     """
 
+    result_type: Literal["complete"] = Field(
+        default="complete", serialization_alias="resultType"
+    )
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     input_requests: dict[str, Any] | None = Field(
@@ -100,11 +122,19 @@ class GetTaskResult(_TaskFields):
 
 
 class UpdateTaskResult(Result):
-    """Empty acknowledgement for `tasks/update` (SEP-2663 `Result`)."""
+    """Acknowledgement for `tasks/update` (SEP-2663 `Result`, `resultType: "complete"`)."""
+
+    result_type: Literal["complete"] = Field(
+        default="complete", serialization_alias="resultType"
+    )
 
 
 class CancelTaskResult(Result):
-    """Empty acknowledgement for `tasks/cancel` (SEP-2663 `Result`)."""
+    """Acknowledgement for `tasks/cancel` (SEP-2663 `Result`, `resultType: "complete"`)."""
+
+    result_type: Literal["complete"] = Field(
+        default="complete", serialization_alias="resultType"
+    )
 
 
 class GetTaskParams(RequestParams):
