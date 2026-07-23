@@ -458,27 +458,34 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     still raise inside a task — there is no request. Runs inside
     ``restore_task_snapshot`` (a Docket dependency), whose context vars propagate
     to the tool the same way the snapshot var already does.
+
+    Both vars are set unconditionally to *this* snapshot's state (``None`` when
+    it carries no token/headers), never left as-is: a Docket worker may reuse an
+    asyncio context across tasks, so an anonymous task following an authenticated
+    one must not inherit the prior caller's identity or headers.
     """
+    import time
+
+    from mcp.server.auth.middleware.auth_context import auth_context_var
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+    from fastmcp.server.auth import AccessToken
+    from fastmcp.server.dependencies import _background_task_headers
+
+    user: AuthenticatedUser | None = None
     if snapshot.access_token_json is not None:
-        import time
-
-        from mcp.server.auth.middleware.auth_context import auth_context_var
-        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-
-        from fastmcp.server.auth import AccessToken
-
         token = AccessToken.model_validate_json(snapshot.access_token_json)
         # A task may sit queued past its submitter's token expiry. Install it
         # only if still valid — mirroring the SDK's bearer check — so a delayed
         # task never runs under credentials a live request would reject (401).
         # An expired token leaves the worker unauthenticated, the honest state.
         if token.expires_at is None or token.expires_at >= int(time.time()):
-            auth_context_var.set(AuthenticatedUser(token))
+            user = AuthenticatedUser(token)
+    auth_context_var.set(user)
 
-    if snapshot.http_headers:
-        from fastmcp.server.dependencies import _background_task_headers
-
-        _background_task_headers.set(dict(snapshot.http_headers))
+    _background_task_headers.set(
+        dict(snapshot.http_headers) if snapshot.http_headers else None
+    )
 
 
 async def make_task_context() -> Context | None:

@@ -168,6 +168,22 @@ async def _answer_input_requests(
             "ask for input."
         )
 
+    # Bound the whole answer phase — elicitation callbacks included — by the
+    # call's remaining budget: a stalled handler must not outlast `timeout=N`
+    # any more than a stalled poll does, matching the synchronous path.
+    loop = asyncio.get_event_loop()
+    deadline = (
+        None if read_timeout_seconds is None else loop.time() + read_timeout_seconds
+    )
+
+    def _remaining() -> float | None:
+        if deadline is None:
+            return None
+        left = deadline - loop.time()
+        if left <= 0:
+            raise TimeoutError(f"Task {task_id} timed out awaiting input")
+        return left
+
     responses: dict[str, Any] = {}
     for surfaced_key, payload in input_requests.items():
         method = payload.get("method") if isinstance(payload, dict) else None
@@ -181,14 +197,16 @@ async def _answer_input_requests(
         context = ClientRequestContext(
             session=session, request_id=f"task-{task_id}-{surfaced_key}"
         )
-        answer = await elicitation_callback(context, request.params)
+        budget = _remaining()
+        call = elicitation_callback(context, request.params)
+        answer = await (asyncio.wait_for(call, budget) if budget is not None else call)
         if isinstance(answer, mcp_types.ErrorData):
             raise ToolError(f"Elicitation for task {task_id} failed: {answer.message}")
         responses[surfaced_key] = answer.model_dump(
             by_alias=True, mode="json", exclude_none=True
         )
 
-    await _send_update(session, task_id, responses, read_timeout_seconds)
+    await _send_update(session, task_id, responses, _remaining())
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +493,7 @@ async def call_tool_task(
     *,
     timeout: float | int | None = None,
     raise_on_error: bool = True,
+    version: str | None = None,
     meta: dict[str, Any] | None = None,
 ) -> ToolTask:
     """Call a tool as a background task and return a `ToolTask` handle immediately.
@@ -484,9 +503,18 @@ async def call_tool_task(
     work and drive the task through the handle. Requires the server to run the
     call as a task (a `task=True` tool on a task-serving backend); a call the
     server runs synchronously raises `ToolError`.
+
+    `version` targets a specific component version, the same as
+    `client.call_tool(..., version=...)`: the server tasks that version rather
+    than the highest. It is carried in the request metadata FastMCP reads.
     """
     read_timeout_seconds = normalize_timeout_to_seconds(timeout)
-    request_meta = cast("mcp_types.RequestParamsMeta | None", meta)
+    combined_meta: dict[str, Any] = dict(meta) if meta else {}
+    if version is not None:
+        fastmcp_meta = dict(combined_meta.get("fastmcp") or {})
+        fastmcp_meta["version"] = version
+        combined_meta["fastmcp"] = fastmcp_meta
+    request_meta = cast("mcp_types.RequestParamsMeta | None", combined_meta or None)
     raw = await client._await_with_session_monitoring(
         client.session.call_tool(
             name=name,

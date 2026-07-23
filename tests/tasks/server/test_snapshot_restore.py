@@ -169,6 +169,33 @@ def test_apply_snapshot_skips_expired_token():
     contextvars.copy_context().run(run_in_clean_worker_context)
 
 
+def test_apply_snapshot_clears_prior_auth_in_reused_context():
+    """An anonymous task must not inherit a prior task's identity or headers.
+
+    A Docket worker may reuse an asyncio context across executions. Applying a
+    tokenless snapshot after an authenticated one must clear the earlier
+    caller's `auth_context_var` and headers rather than leave them installed.
+    """
+    prior = AccessToken(token="jwt-prior", client_id="prior-client", scopes=["read"])
+    authed = TaskContextSnapshot(
+        access_token_json=prior.model_dump_json(),
+        http_headers={"x-trace-id": "prior"},
+    )
+    anonymous = TaskContextSnapshot()
+
+    def run_in_reused_worker_context() -> None:
+        _apply_snapshot_to_context(authed)
+        assert get_access_token() is not None
+        assert get_http_headers()["x-trace-id"] == "prior"
+
+        # Same context, next task carries no auth/headers.
+        _apply_snapshot_to_context(anonymous)
+        assert get_access_token() is None
+        assert get_http_headers() == {}
+
+    contextvars.copy_context().run(run_in_reused_worker_context)
+
+
 async def test_restore_failure_is_nonfatal():
     """If deserialization blows up, the task still runs to completion and
     the snapshot cache stays empty."""

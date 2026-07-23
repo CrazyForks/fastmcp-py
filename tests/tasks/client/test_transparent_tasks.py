@@ -80,6 +80,26 @@ async def test_failed_task_raises_tool_error(task_server: FastMCP):
             await client.call_tool("boom", {})
 
 
+async def test_call_tool_task_forwards_requested_version():
+    """`call_tool_task(..., version=...)` tasks the requested version, not the highest."""
+    mcp = FastMCP("versioned-task-client")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(name="pick", version="1.0", task=True)
+    async def pick_v1() -> str:
+        return "v1"
+
+    @mcp.tool(name="pick", version="2.0", task=True)
+    async def pick_v2() -> str:
+        return "v2"
+
+    async with Client(mcp, mode="auto") as client:
+        task = await call_tool_task(client, "pick", version="1.0")
+        result = await task.result()
+
+    assert result.data == "v1"
+
+
 async def test_raw_create_task_result_is_exposed(task_server: FastMCP):
     """The raw claimed CreateTaskResult is reachable via the session/handle path."""
     async with Client(task_server, mode="auto") as client:
@@ -172,6 +192,25 @@ async def test_in_task_input_without_handler_errors(guard_server: FastMCP):
     async with Client(guard_server, mode="auto") as client:
         with pytest.raises(ToolError, match="no elicitation handler"):
             await client.call_tool("plan_dinner", {})
+
+
+async def test_call_tool_timeout_bounds_a_stalled_elicitation(guard_server: FastMCP):
+    """A stalled elicitation handler cannot outlast the call's timeout.
+
+    The deadline covers the whole drive, elicitation callbacks included: a
+    handler that hangs must abort the tasked call once `timeout=N` elapses,
+    matching the synchronous path rather than blocking forever inside the
+    callback.
+    """
+
+    async def slow_elicitation(message, response_type, params, context):
+        await asyncio.sleep(5)
+        return DinnerPrefs(cuisine="Thai", vegetarian=True)
+
+    client = Client(guard_server, mode="auto", elicitation_handler=slow_elicitation)
+    async with client:
+        with pytest.raises((TimeoutError, ToolError, MCPError)):
+            await client.call_tool("plan_dinner", {}, timeout=0.3)
 
 
 async def test_in_task_input_answered_by_handler_set_after_construction(
