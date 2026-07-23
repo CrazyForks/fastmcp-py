@@ -59,8 +59,8 @@ cd examples/tasks
 docker compose up -d
 export FASTMCP_DOCKET_URL=redis://localhost:24242/0   # or: direnv allow
 
-python server.py                     # in one terminal
-fastmcp tasks worker server.py       # extra worker(s) in others
+python server.py                                        # in one terminal
+python -m fastmcp_tasks.worker_cli worker server.py     # extra worker(s) in others
 ```
 
 | Backend      | Workers                         |

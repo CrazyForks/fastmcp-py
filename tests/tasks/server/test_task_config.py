@@ -38,6 +38,22 @@ async def _opted_in_call(server: FastMCP, name: str, arguments: dict | None = No
         return await server.call_tool(name, arguments or {})
 
 
+def test_docket_settings_load_from_dotenv(tmp_path, monkeypatch):
+    """`FASTMCP_DOCKET_*` in a `.env` file configures the backend.
+
+    A distributed deployment that puts its Redis URL in `.env` must not silently
+    fall back to `memory://` — DocketSettings loads the same dotenv source as
+    core FastMCP settings.
+    """
+    from fastmcp_tasks.settings import DocketSettings
+
+    (tmp_path / ".env").write_text("FASTMCP_DOCKET_URL=redis://dotenv-host:6379/2\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FASTMCP_DOCKET_URL", raising=False)
+
+    assert DocketSettings().url == "redis://dotenv-host:6379/2"
+
+
 async def test_interceptor_tasks_the_requested_version_not_the_highest():
     """A versioned tools/call tasks the version the caller asked for.
 

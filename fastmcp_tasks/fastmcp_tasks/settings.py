@@ -9,11 +9,17 @@ constructor overrides the env defaults).
 from __future__ import annotations
 
 import inspect
+import os
 from datetime import timedelta
 from typing import Annotated
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load the same dotenv source as core FastMCP settings, so a deployment that
+# puts FASTMCP_DOCKET_* in `.env` (or a FASTMCP_ENV_FILE) configures the backend
+# rather than silently falling back to memory://.
+_ENV_FILE = os.getenv("FASTMCP_ENV_FILE", ".env")
 
 
 class DocketSettings(BaseSettings):
@@ -21,6 +27,7 @@ class DocketSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="FASTMCP_DOCKET_",
+        env_file=_ENV_FILE,
         extra="ignore",
     )
 
