@@ -167,6 +167,47 @@ class TestRemoteWorkerServerResolution:
         finally:
             _current_server.reset(token)
 
+    async def test_resolve_owning_server_respects_version(self):
+        """Two versions of a mounted tool name resolve to their own child server."""
+        import weakref
+
+        from fastmcp_tasks.context import (
+            TaskContextSnapshot,
+            _resolve_owning_server,
+        )
+
+        from fastmcp.server.dependencies import _current_server
+
+        child_v1 = FastMCP("child-v1")
+
+        @child_v1.tool(name="calc", version="1.0", task=True)
+        async def calc_v1() -> str:
+            return "v1"
+
+        child_v2 = FastMCP("child-v2")
+
+        @child_v2.tool(name="calc", version="2.0", task=True)
+        async def calc_v2() -> str:
+            return "v2"
+
+        parent = FastMCP("parent-versions")
+        parent.add_extension(TasksExtension())
+        parent.mount(child_v1)
+        parent.mount(child_v2)
+
+        token = _current_server.set(weakref.ref(parent))
+        try:
+            resolved_v1 = await _resolve_owning_server(
+                TaskContextSnapshot(owning_tool_name="calc", owning_tool_version="1.0")
+            )
+            resolved_v2 = await _resolve_owning_server(
+                TaskContextSnapshot(owning_tool_name="calc", owning_tool_version="2.0")
+            )
+            assert resolved_v1 is child_v1
+            assert resolved_v2 is child_v2
+        finally:
+            _current_server.reset(token)
+
 
 class TestMountedToolTasksNoPrefix:
     async def test_mounted_tool_without_prefix_works(self, child_server):

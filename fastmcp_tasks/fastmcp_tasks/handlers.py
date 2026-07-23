@@ -33,7 +33,11 @@ from fastmcp.tools.base import InputRequiredToolResult, Tool, ToolResult
 from fastmcp.utilities.tasks import DEFAULT_POLL_INTERVAL_MS
 from fastmcp.utilities.versions import VersionSpec
 from fastmcp_tasks.context import get_task_scope
-from fastmcp_tasks.creation import enqueue_task_leg, registered_component_for_key
+from fastmcp_tasks.creation import (
+    TASK_MAPPING_TTL_BUFFER_SECONDS,
+    enqueue_task_leg,
+    registered_component_for_key,
+)
 from fastmcp_tasks.input_store import (
     acquire_update_lock,
     acquire_update_lock_blocking,
@@ -43,6 +47,7 @@ from fastmcp_tasks.input_store import (
     load_task_args,
     mark_cancelled,
     read_outstanding_inputs,
+    refresh_current_leg_ttl,
     release_update_lock,
     save_current_leg,
     store_input_responses,
@@ -108,6 +113,16 @@ def _ttl_ms(docket: Docket) -> int:
     return int(docket.execution_ttl.total_seconds() * 1000)
 
 
+def _task_key_ttl_seconds(docket: Docket) -> int:
+    """Wall-clock TTL for a task's Redis metadata keys.
+
+    Docket's ``execution_ttl`` plus a buffer (matching task creation), so a key
+    written or refreshed now comfortably outlives the execution-retention
+    window. Sliding expiration on each poll keeps it alive for long legs.
+    """
+    return int(docket.execution_ttl.total_seconds()) + TASK_MAPPING_TTL_BUFFER_SECONDS
+
+
 async def _lookup_task(
     docket: Docket, task_scope: str | None, task_id: str
 ) -> tuple[Any, str, int, str | None, int]:
@@ -140,6 +155,16 @@ async def _lookup_task(
     execution = await docket.get_execution(execution_key)
     if not execution:
         raise _task_not_found(task_id)
+
+    # Sliding expiration: an actively-polled task refreshes its routing keys so
+    # they never expire mid-execution — a resumed leg that runs longer than the
+    # keys' wall-clock TTL would otherwise strand `_lookup_task` on the base leg.
+    refresh_ttl = _task_key_ttl_seconds(docket)
+    async with docket.redis() as redis:
+        await redis.expire(meta_key, refresh_ttl)
+        await redis.expire(created_at_key, refresh_ttl)
+        await redis.expire(poll_key, refresh_ttl)
+    await refresh_current_leg_ttl(docket, task_scope, task_id, refresh_ttl)
 
     created_at = created_at_bytes.decode("utf-8") if created_at_bytes else None
 
@@ -350,9 +375,13 @@ async def tasks_update(
         next_leg_key = leg_execution_key(base_task_key, next_leg)
 
         await enqueue_task_leg(server, docket, component, raw_arguments, next_leg_key)
-        ttl_seconds = int(docket.execution_ttl.total_seconds())
         await save_current_leg(
-            docket, task_scope, task_id, next_leg_key, next_leg, ttl_seconds
+            docket,
+            task_scope,
+            task_id,
+            next_leg_key,
+            next_leg,
+            _task_key_ttl_seconds(docket),
         )
         # The answered leg's surfaced keys are now superseded; drop them so they
         # are never reused (SEP-2663 L350).

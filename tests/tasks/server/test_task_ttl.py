@@ -69,3 +69,30 @@ async def test_default_ttl_when_unspecified():
         assert created.ttl_ms == DEFAULT_TTL_MS
         got = await get_task(mcp, created.task_id)
         assert got.ttl_ms == DEFAULT_TTL_MS
+
+
+async def test_poll_refreshes_routing_key_ttl():
+    """A poll extends the current-leg pointer's TTL (sliding expiration).
+
+    A leg that runs longer than the pointer's wall-clock TTL would otherwise
+    strand `_lookup_task` on the base leg. Polling must keep the routing keys
+    alive: after shrinking the pointer's TTL, a `tasks/get` restores it.
+    """
+    from fastmcp_tasks.input_store import _current_leg_key
+
+    mcp = _ttl_server()
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "slow_task", {})
+        docket = mcp._docket
+        assert docket is not None
+        key = _current_leg_key(docket, None, created.task_id)
+
+        async with docket.redis() as redis:
+            await redis.expire(key, 5)
+            assert await redis.ttl(key) <= 5
+
+        await get_task(mcp, created.task_id)
+
+        async with docket.redis() as redis:
+            # Refreshed well past the shrunk 5s, back toward the full window.
+            assert await redis.ttl(key) > 60

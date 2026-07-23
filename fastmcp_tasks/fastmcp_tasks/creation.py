@@ -109,7 +109,9 @@ async def create_task(
     created_at_key = docket.key(f"{prefix}:{task_id}:created_at")
     poll_interval_key = docket.key(f"{prefix}:{task_id}:poll_interval")
 
-    snapshot = TaskContextSnapshot.capture(owning_tool_name=tool.name)
+    snapshot = TaskContextSnapshot.capture(
+        owning_tool_name=tool.name, owning_tool_version=tool.version
+    )
 
     async with docket.redis() as redis:
         await redis.set(task_meta_key, task_key, ex=ttl_seconds)

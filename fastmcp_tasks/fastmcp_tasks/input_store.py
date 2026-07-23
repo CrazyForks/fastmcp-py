@@ -184,6 +184,22 @@ async def save_current_leg(
         )
 
 
+async def refresh_current_leg_ttl(
+    docket: Docket, task_scope: str | None, task_id: str, ttl_seconds: int
+) -> None:
+    """Extend the current-leg pointer's TTL (sliding expiration).
+
+    The pointer is written with a wall-clock TTL, but a leg's execution can run
+    longer than that — a resumed guard leg especially. Refreshing on each poll
+    keeps the routing pointer alive for an actively-polled task no matter how
+    long the leg runs, so ``_lookup_task`` never falls back to the base leg
+    while the current leg is still executing.
+    """
+    async with docket.redis() as redis:
+        await redis.expire(_current_leg_key(docket, task_scope, task_id), ttl_seconds)
+        await redis.expire(_leg_number_key(docket, task_scope, task_id), ttl_seconds)
+
+
 async def load_current_leg(
     docket: Docket, task_scope: str | None, task_id: str
 ) -> tuple[str | None, int]:

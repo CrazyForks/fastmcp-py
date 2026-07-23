@@ -145,15 +145,22 @@ class TaskContextSnapshot:
     origin_request_id: str | None = None
     session_id: str | None = None
     owning_tool_name: str | None = None
+    owning_tool_version: str | None = None
 
     @classmethod
-    def capture(cls, owning_tool_name: str | None = None) -> TaskContextSnapshot:
+    def capture(
+        cls,
+        owning_tool_name: str | None = None,
+        owning_tool_version: str | None = None,
+    ) -> TaskContextSnapshot:
         """Capture current context for background task execution.
 
-        ``owning_tool_name`` is the routable name of the tool the call targeted.
-        A remote worker (separate process) cannot reach the submitting process's
-        server map, so it re-resolves the owning (child) server from this name
-        against the root — see ``make_task_context``.
+        ``owning_tool_name``/``owning_tool_version`` identify the exact tool the
+        call targeted. A remote worker (separate process) cannot reach the
+        submitting process's server map, so it re-resolves the owning (child)
+        server from this name and version against the root — see
+        ``make_task_context``. The version matters when two versions of the same
+        mounted tool name live on different child servers.
         """
         from fastmcp.server.dependencies import (
             get_access_token,
@@ -178,6 +185,7 @@ class TaskContextSnapshot:
             ),
             session_id=session_id,
             owning_tool_name=owning_tool_name,
+            owning_tool_version=owning_tool_version,
         )
 
     @classmethod
@@ -195,6 +203,7 @@ class TaskContextSnapshot:
             origin_request_id=parsed.get("origin_request_id"),
             session_id=parsed.get("session_id"),
             owning_tool_name=parsed.get("owning_tool_name"),
+            owning_tool_version=parsed.get("owning_tool_version"),
         )
 
     def to_json(self) -> str:
@@ -206,6 +215,7 @@ class TaskContextSnapshot:
                 "origin_request_id": self.origin_request_id,
                 "session_id": self.session_id,
                 "owning_tool_name": self.owning_tool_name,
+                "owning_tool_version": self.owning_tool_version,
             }
         )
 
@@ -435,10 +445,19 @@ async def _resolve_owning_server(
     from fastmcp.exceptions import NotFoundError
     from fastmcp.server.dependencies import get_server
     from fastmcp.server.providers.fastmcp_provider import FastMCPProviderTool
+    from fastmcp.utilities.versions import VersionSpec
 
     root = get_server()
+    # Resolve the exact version the call targeted: two versions of the same
+    # mounted tool name can live on different child servers, so omitting the
+    # version could pick the wrong server's state and masking policy.
+    version = (
+        VersionSpec(eq=snapshot.owning_tool_version)
+        if snapshot.owning_tool_version
+        else None
+    )
     try:
-        tool = await root.get_tool(snapshot.owning_tool_name)
+        tool = await root.get_tool(snapshot.owning_tool_name, version)
     except NotFoundError:
         return None
     if isinstance(tool, FastMCPProviderTool):
