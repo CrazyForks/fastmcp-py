@@ -37,8 +37,10 @@ from fastmcp_tasks.creation import enqueue_task_leg, registered_component_for_ke
 from fastmcp_tasks.input_store import (
     acquire_update_lock,
     clear_outstanding,
+    is_cancelled,
     load_current_leg,
     load_task_args,
+    mark_cancelled,
     read_outstanding_inputs,
     release_update_lock,
     save_current_leg,
@@ -247,6 +249,12 @@ async def tasks_get(server: FastMCP, task_id: str) -> GetTaskResult:
             **payload,
         )
 
+    # A logical cancellation wins over the underlying execution state: a task
+    # parked on input has a COMPLETED execution, so without this the branches
+    # below would report input_required (or completed) for a cancelled task.
+    if await is_cancelled(docket, task_scope, task_id):
+        return build("cancelled")
+
     if execution.state == ExecutionState.COMPLETED:
         # A guard leg ends its Docket execution and records outstanding input
         # requests to Redis: a completed leg with outstanding requests is the
@@ -312,6 +320,12 @@ async def tasks_update(
     if not await acquire_update_lock(docket, task_scope, task_id):
         return UpdateTaskResult()
     try:
+        # A cancelled task never re-enters: clearing outstanding on cancel makes
+        # translate return None already, but check explicitly so a cancel that
+        # races between this update's lookup and lock acquisition still wins.
+        if await is_cancelled(docket, task_scope, task_id):
+            return UpdateTaskResult()
+
         translated = await translate_responses(
             docket, task_scope, task_id, leg_number, input_responses
         )
@@ -348,14 +362,25 @@ async def tasks_update(
 
 
 async def tasks_cancel(server: FastMCP, task_id: str) -> CancelTaskResult:
-    """Handle ``tasks/cancel``: cooperatively cancel the current leg, empty ack."""
+    """Handle ``tasks/cancel``: cooperatively cancel the task, empty ack.
+
+    A durable cancellation marker is recorded so the logical task reports
+    ``cancelled`` and refuses re-entry even when it is parked on input — whose
+    current Docket execution is already ``COMPLETED``, making ``docket.cancel``
+    on it a no-op. The current leg's outstanding requests are cleared so a
+    racing ``tasks/update`` naming them finds nothing, and the running
+    execution is still cancelled cooperatively for the ``working`` case.
+    """
     docket = server._docket
     if docket is None:
         raise _task_not_found(task_id)
 
     task_scope = get_task_scope()
-    execution, _base_task_key, _leg, _created_at, _poll = await _lookup_task(
+    execution, _base_task_key, leg_number, _created_at, _poll = await _lookup_task(
         docket, task_scope, task_id
     )
+    ttl_seconds = int(docket.execution_ttl.total_seconds())
+    await mark_cancelled(docket, task_scope, task_id, ttl_seconds)
+    await clear_outstanding(docket, task_scope, task_id, leg_number)
     await docket.cancel(execution.key)
     return CancelTaskResult()

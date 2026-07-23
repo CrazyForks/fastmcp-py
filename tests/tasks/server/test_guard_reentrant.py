@@ -18,6 +18,8 @@ import mcp_types
 from fastmcp import Context, FastMCP
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
+    cancel_task,
+    get_task,
     running_task_server,
     submit_task,
     update_task,
@@ -63,6 +65,49 @@ async def _park_key(mcp: FastMCP, task_id: str) -> str:
     assert parked.status == "input_required"
     assert parked.input_requests is not None
     return next(iter(parked.input_requests))
+
+
+async def test_cancel_parked_task_reports_cancelled_and_refuses_resume():
+    """Cancelling an `input_required` task actually cancels it.
+
+    A parked guard leg's Docket execution is already COMPLETED, so cancelling
+    only that execution would leave `tasks/get` reporting `input_required`
+    forever and let a later `tasks/update` resume the task. The logical
+    cancellation marker must make `tasks/get` report `cancelled` and turn a
+    subsequent answer into a no-op that never re-enters the tool.
+    """
+    mcp = FastMCP("guard-cancel")
+    mcp.add_extension(TasksExtension())
+
+    ran_after_cancel = False
+
+    @mcp.tool(task=True)
+    async def greet(ctx: Context) -> str | mcp_types.InputRequiredResult:
+        nonlocal ran_after_cancel
+        responses = ctx.input_responses
+        if responses is None:
+            return _input_required({"name": _elicit_request("Your name?")})
+        ran_after_cancel = True
+        return f"Hello, {_answer(responses, 'name')}!"
+
+    async with running_task_server(mcp):
+        created = await submit_task(mcp, "greet", {})
+        key = await _park_key(mcp, created.task_id)
+
+        await cancel_task(mcp, created.task_id)
+        cancelled = await get_task(mcp, created.task_id)
+        assert cancelled.status == "cancelled"
+
+        # Answering a cancelled task is an idempotent no-op: it must not resume.
+        await update_task(
+            mcp,
+            created.task_id,
+            {key: {"action": "accept", "content": {"value": "Ada"}}},
+        )
+        still_cancelled = await get_task(mcp, created.task_id)
+        assert still_cancelled.status == "cancelled"
+
+    assert ran_after_cancel is False
 
 
 async def test_guard_return_single_round_completes():

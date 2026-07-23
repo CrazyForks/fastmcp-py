@@ -359,6 +359,33 @@ async def clear_outstanding(
         await redis.delete(_map_key(docket, task_scope, task_id, leg))
 
 
+def _cancelled_key(docket: Docket, task_scope: str | None, task_id: str) -> str:
+    return docket.key(f"{_prefix(docket, task_scope, task_id)}:cancelled")
+
+
+async def mark_cancelled(
+    docket: Docket, task_scope: str | None, task_id: str, ttl_seconds: int
+) -> None:
+    """Record that a task was cancelled at the logical (not per-leg) level.
+
+    An ``input_required`` task's current Docket execution is already
+    ``COMPLETED`` — the outstanding-input record is what keeps it parked — so
+    ``docket.cancel`` on that execution is a no-op. This durable marker lets
+    ``tasks/get`` report ``cancelled`` and ``tasks/update`` refuse to resume,
+    regardless of the underlying execution state. Expires with the task's TTL.
+    """
+    async with docket.redis() as redis:
+        await redis.set(
+            _cancelled_key(docket, task_scope, task_id), b"1", ex=max(1, ttl_seconds)
+        )
+
+
+async def is_cancelled(docket: Docket, task_scope: str | None, task_id: str) -> bool:
+    """Whether the task was logically cancelled (see ``mark_cancelled``)."""
+    async with docket.redis() as redis:
+        return bool(await redis.exists(_cancelled_key(docket, task_scope, task_id)))
+
+
 # How long the per-task update lock lives if its holder dies mid-update. A
 # generous ceiling: a single tasks/update is fast, so the lock is normally held
 # for milliseconds; the TTL only guards against a crashed holder.
