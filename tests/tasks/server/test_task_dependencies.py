@@ -18,7 +18,9 @@ from fastmcp_tasks.dependencies import CurrentDocket
 from uncalled_for import Depends
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import CurrentFastMCP
+from fastmcp.server.sessions import UserSession
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
     call_tool_without_optin,
@@ -208,3 +210,39 @@ async def test_dependency_errors_propagate_to_task_failure():
 
     assert final.status == "failed"
     assert final.error is not None
+
+
+async def test_user_session_state_persists_across_task_calls():
+    """`session: UserSession` resolves in a worker and shares state per principal.
+
+    A `UserSession` parameter is injected the same way in a background task as on
+    a foreground call: it resolves through the task-aware `get_server()` and the
+    authenticated principal restored from the task snapshot, with no live session
+    needed. Two tasked calls under one principal therefore share a state bucket.
+    """
+    mcp = FastMCP("session-task")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def remember(fact: str, session: UserSession) -> list[str]:
+        facts = await session.get("facts", default=[])
+        facts.append(fact)
+        await session.set("facts", facts)
+        return facts
+
+    alice = AccessToken(token="a", client_id="alice", scopes=[], claims={"sub": "u1"})
+    bob = AccessToken(token="b", client_id="bob", scopes=[], claims={"sub": "u2"})
+
+    async with running_task_server(mcp):
+        first = await run_task(mcp, "remember", {"fact": "apples"}, access_token=alice)
+        second = await run_task(mcp, "remember", {"fact": "pears"}, access_token=alice)
+        other = await run_task(mcp, "remember", {"fact": "figs"}, access_token=bob)
+
+    assert first.result is not None
+    assert second.result is not None
+    assert other.result is not None
+    assert first.result["structuredContent"]["result"] == ["apples"]
+    # Alice's second call sees her first call's state.
+    assert second.result["structuredContent"]["result"] == ["apples", "pears"]
+    # Bob is a distinct principal — isolated bucket.
+    assert other.result["structuredContent"]["result"] == ["figs"]
