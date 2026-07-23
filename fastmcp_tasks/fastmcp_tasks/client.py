@@ -199,7 +199,15 @@ async def _answer_input_requests(
         )
         budget = _remaining()
         call = elicitation_callback(context, request.params)
-        answer = await (asyncio.wait_for(call, budget) if budget is not None else call)
+        try:
+            answer = await (
+                asyncio.wait_for(call, budget) if budget is not None else call
+            )
+        except asyncio.TimeoutError as exc:
+            # Normalize to the builtin: on Python 3.10 `asyncio.wait_for` raises
+            # `asyncio.TimeoutError`, a distinct type from the builtin the rest of
+            # the drive raises (they were unified in 3.11).
+            raise TimeoutError(f"Task {task_id} timed out awaiting input") from exc
         if isinstance(answer, mcp_types.ErrorData):
             raise ToolError(f"Elicitation for task {task_id} failed: {answer.message}")
         responses[surfaced_key] = answer.model_dump(
