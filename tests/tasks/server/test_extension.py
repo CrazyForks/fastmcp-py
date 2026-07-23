@@ -199,6 +199,33 @@ async def test_raised_tool_error_completes_with_is_error():
         assert "kaboom" in final.result["content"][0]["text"]
 
 
+async def test_raised_generic_error_is_masked_without_ctx_param():
+    """A non-FastMCP exception is masked even when the tool takes no `ctx`.
+
+    Error masking is the server's `_mask_error_details` policy, which the task
+    error path must resolve through the worker-server resolver — not the active
+    `Context`. A tool that never requests `ctx` has no active context when it
+    raises, so a context-based lookup would silently fall back to the global
+    default and leak the raw exception text.
+    """
+    mcp = FastMCP("masked-task-server", mask_error_details=True)
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def leak() -> int:
+        raise ValueError("secret internal detail")
+
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "leak", {})
+
+    assert final.status == "completed"
+    assert final.result is not None
+    assert final.result["isError"] is True
+    text = final.result["content"][0]["text"]
+    assert "secret internal detail" not in text
+    assert "Error calling tool 'leak'" in text
+
+
 # ---------------------------------------------------------------------------
 # Argument coercion parity
 # ---------------------------------------------------------------------------

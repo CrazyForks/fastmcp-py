@@ -84,12 +84,19 @@ def _resolve_docket() -> Docket | None:
 
 
 def _mask_error_details() -> bool:
-    """The worker server's error-masking policy, mirroring the sync call path."""
+    """The worker server's error-masking policy, mirroring the sync call path.
+
+    Resolves the owning server through ``get_server()`` (the worker-server
+    resolver) rather than ``get_context()``: a tool that raises without ever
+    requesting a ``ctx`` parameter has no active ``Context``, so reading the
+    policy off the context would silently fall back to the global default and
+    leak unmasked error text.
+    """
     import fastmcp
-    from fastmcp.server.dependencies import get_context
+    from fastmcp.server.dependencies import get_server
 
     try:
-        return get_context().fastmcp._mask_error_details
+        return get_server()._mask_error_details
     except RuntimeError:
         return fastmcp.settings.mask_error_details
 

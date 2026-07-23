@@ -17,6 +17,7 @@ from fastmcp_tasks.components import (
 from fastmcp_tasks.models import CreateTaskResult
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool, ToolResult
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.tasks import TaskConfig
@@ -62,6 +63,26 @@ class CustomToolForbidden(Tool):
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         return ToolResult(content="Sync only")
+
+
+class CustomToolRaisesToolError(Tool):
+    """A custom tool whose `run` raises a `ToolError`."""
+
+    task_config: TaskConfig = TaskConfig(mode="optional")
+    parameters: dict[str, Any] = {"type": "object", "properties": {}}
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        raise ToolError("kaboom")
+
+
+class CustomToolRaisesValueError(Tool):
+    """A custom tool whose `run` raises a non-FastMCP exception."""
+
+    task_config: TaskConfig = TaskConfig(mode="optional")
+    parameters: dict[str, Any] = {"type": "object", "properties": {}}
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        raise ValueError("secret internal detail")
 
 
 @pytest.fixture
@@ -122,6 +143,50 @@ async def test_custom_tool_forbidden_rejects_task(custom_tool_server):
             result = await custom_tool_server.call_tool("custom_forbidden", {})
         assert not isinstance(result, CreateTaskResult)
         assert "Sync only" in result.content[0].text
+
+
+async def test_custom_tool_raising_tool_error_completes_with_is_error():
+    """A custom Tool that raises `ToolError` is a completed, is_error task.
+
+    Same contract as a raising `FunctionTool`: a raised tool error is a
+    completed task carrying an `isError` result (never a `failed` task), and a
+    `ToolError` reaches the client verbatim — matching the synchronous path.
+    """
+    mcp = FastMCP("custom-raise-server")
+    mcp.add_extension(TasksExtension())
+    mcp.add_tool(CustomToolRaisesToolError(name="boom", description="raises"))
+
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "boom", {})
+
+    assert final.status == "completed"
+    assert final.error is None
+    assert final.result is not None
+    assert final.result["isError"] is True
+    assert "kaboom" in final.result["content"][0]["text"]
+
+
+async def test_custom_tool_raising_generic_error_is_masked():
+    """A custom Tool's non-FastMCP exception is masked, like the sync path.
+
+    A base `Tool` subclass must route through the same error conversion as a
+    `FunctionTool`, so `mask_error_details=True` hides the raw exception text
+    rather than leaking it through Docket's `FAILED` outcome.
+    """
+    mcp = FastMCP("custom-mask-server", mask_error_details=True)
+    mcp.add_extension(TasksExtension())
+    mcp.add_tool(CustomToolRaisesValueError(name="leak", description="raises"))
+
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "leak", {})
+
+    assert final.status == "completed"
+    assert final.error is None
+    assert final.result is not None
+    assert final.result["isError"] is True
+    text = final.result["content"][0]["text"]
+    assert "secret internal detail" not in text
+    assert "Error calling tool 'leak'" in text
 
 
 async def test_custom_tool_registers_with_docket():

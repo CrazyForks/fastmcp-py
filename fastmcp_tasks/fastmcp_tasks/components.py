@@ -63,7 +63,13 @@ def register_component_with_docket(component: FastMCPComponent, docket: Docket) 
             reentrant_task_fn(component.fn, component.name), names=[component.key]
         )
     elif isinstance(component, Tool):
-        docket.register(component.run, names=[component.key])
+        # Custom Tool subclasses route through the same wrapper so a raised
+        # error becomes a masked, completed `is_error` result — matching the
+        # synchronous `tools/call` path — rather than a Docket `FAILED` task
+        # that leaks the raw exception text past the server's masking policy.
+        docket.register(
+            reentrant_task_fn(component.run, component.name), names=[component.key]
+        )
     elif isinstance(component, FunctionResource):
         docket.register(component.fn, names=[component.key])
     elif isinstance(component, FunctionResourceTemplate):
