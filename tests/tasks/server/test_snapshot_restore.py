@@ -118,6 +118,35 @@ def test_apply_snapshot_restores_auth_and_headers_in_clean_context():
     contextvars.copy_context().run(run_in_clean_worker_context)
 
 
+def test_apply_snapshot_skips_expired_token():
+    """An expired snapshot token is not installed, so the worker is unauthenticated.
+
+    A task may sit queued past its submitter's token expiry. A live request with
+    an expired bearer token is rejected (401), so restoring one as authenticated
+    would let a delayed task run under credentials that should now be treated as
+    unauthenticated. The headers still restore — only the auth token is dropped.
+    """
+    expired = AccessToken(
+        token="jwt-expired",
+        client_id="remote-client",
+        scopes=["read"],
+        expires_at=1,  # 1970 — long past
+    )
+    snapshot = TaskContextSnapshot(
+        access_token_json=expired.model_dump_json(),
+        http_headers={"x-trace-id": "abc123"},
+    )
+
+    def run_in_clean_worker_context() -> None:
+        assert get_access_token() is None
+        _apply_snapshot_to_context(snapshot)
+        assert get_access_token() is None
+        # Non-auth context still restores independently of the token.
+        assert get_http_headers()["x-trace-id"] == "abc123"
+
+    contextvars.copy_context().run(run_in_clean_worker_context)
+
+
 async def test_restore_failure_is_nonfatal():
     """If deserialization blows up, the task still runs to completion and
     the snapshot cache stays empty."""

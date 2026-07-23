@@ -420,13 +420,20 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     to the tool the same way the snapshot var already does.
     """
     if snapshot.access_token_json is not None:
+        import time
+
         from mcp.server.auth.middleware.auth_context import auth_context_var
         from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
         from fastmcp.server.auth import AccessToken
 
         token = AccessToken.model_validate_json(snapshot.access_token_json)
-        auth_context_var.set(AuthenticatedUser(token))
+        # A task may sit queued past its submitter's token expiry. Install it
+        # only if still valid — mirroring the SDK's bearer check — so a delayed
+        # task never runs under credentials a live request would reject (401).
+        # An expired token leaves the worker unauthenticated, the honest state.
+        if token.expires_at is None or token.expires_at >= int(time.time()):
+            auth_context_var.set(AuthenticatedUser(token))
 
     if snapshot.http_headers:
         from starlette.requests import Request

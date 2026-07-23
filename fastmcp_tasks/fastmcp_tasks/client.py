@@ -378,7 +378,18 @@ class ToolTask:
         deadline = loop.time() + timeout
         backoff = MIN_POLL_INTERVAL
         while True:
-            current = await self.status()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Task {self.task_id} did not reach "
+                    f"{state or 'a terminal state'} within {timeout}s"
+                )
+            # Bound the request itself by the remaining deadline: a stalled
+            # `tasks/get` must not block past the caller's timeout waiting for
+            # the session-wide default before the deadline is next checked.
+            current = await _send_get(
+                self._session, self.task_id, read_timeout_seconds=remaining
+            )
             if state is not None:
                 if current.status == state:
                     return current
