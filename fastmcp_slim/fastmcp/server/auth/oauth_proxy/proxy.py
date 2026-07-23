@@ -919,6 +919,17 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             value=proxy_client,
         )
 
+        # The SDK's RegistrationHandler serializes this same `client_info` object
+        # into the DCR response after we return. Left untouched it would echo the
+        # SDK's default `client_secret_post` (or a requested `client_secret_basic`)
+        # and a generated secret — a confidential method the proxy never enforces
+        # and does not advertise in server metadata. Normalize it to the public
+        # client we actually store so the registration response, stored client, and
+        # advertised `token_endpoint_auth_methods_supported` all agree.
+        client_info.token_endpoint_auth_method = "none"
+        client_info.client_secret = None
+        client_info.client_secret_expires_at = None
+
         # Log redirect URIs to help users discover what patterns they might need
         if client_info.redirect_uris:
             for uri in client_info.redirect_uris:
@@ -2312,26 +2323,18 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 # always be overridden to advertise support — not just when
                 # CIMD or identity assertion is also enabled.
                 metadata.authorization_response_iss_parameter_supported = True
+                # Every client the proxy authenticates at the token endpoint is
+                # public: DCR-registered and synthesized clients are stored with
+                # `token_endpoint_auth_method="none"`, and CIMD clients use
+                # `private_key_jwt`. The SDK's default advertisement of
+                # `client_secret_basic`/`client_secret_post` is misleading — the
+                # proxy never enforces a downstream client secret — so we override
+                # it to reflect the methods actually supported.
+                auth_methods = ["none"]
                 if self._cimd_manager is not None:
                     metadata.client_id_metadata_document_supported = True
-                    existing = metadata.token_endpoint_auth_methods_supported or []
-                    metadata.token_endpoint_auth_methods_supported = [
-                        *existing,
-                        "private_key_jwt",
-                        "none",
-                    ]
-                if self._identity_assertion is not None:
-                    # DCR clients are public (`token_endpoint_auth_method="none"`),
-                    # so a metadata consumer must see `none` advertised to use the
-                    # jwt-bearer grant — even when CIMD (which also adds it) is off.
-                    methods_supported = (
-                        metadata.token_endpoint_auth_methods_supported or []
-                    )
-                    if "none" not in methods_supported:
-                        metadata.token_endpoint_auth_methods_supported = [
-                            *methods_supported,
-                            "none",
-                        ]
+                    auth_methods.append("private_key_jwt")
+                metadata.token_endpoint_auth_methods_supported = auth_methods
                 handler = MetadataHandler(metadata)
                 methods = route.methods or ["GET", "OPTIONS"]
 
