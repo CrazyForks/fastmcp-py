@@ -35,6 +35,7 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from fastmcp.exceptions import NotFoundError
+from fastmcp.server.dependencies import extract_version_spec
 from fastmcp.server.extensions import (
     MethodBinding,
     ServerExtension,
@@ -42,6 +43,7 @@ from fastmcp.server.extensions import (
 )
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
+from fastmcp.utilities.versions import VersionSpec
 from fastmcp_tasks.creation import create_task
 from fastmcp_tasks.handlers import tasks_cancel, tasks_get, tasks_update
 from fastmcp_tasks.models import (
@@ -185,8 +187,14 @@ class TasksExtension(ServerExtension):
         opt in), ``optional`` tasks only when the client opted in, ``forbidden``
         never tasks. A non-task call passes straight through to the tool body.
         """
+        # Resolve the same version core would dispatch: a versioned tools/call
+        # carries its VersionSpec in the request _meta, so omitting it here would
+        # task the highest version even when the client targeted an older one
+        # (which may differ in task mode or implementation).
+        version_str = extract_version_spec(params.meta)
+        version = VersionSpec(eq=version_str) if version_str else None
         try:
-            tool = await context.fastmcp.get_tool(params.name)
+            tool = await context.fastmcp.get_tool(params.name, version)
         except NotFoundError:
             tool = None
         if tool is None or not tool.task_config.supports_tasks():

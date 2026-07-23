@@ -26,6 +26,7 @@ translated `input_responses`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -414,6 +415,32 @@ async def acquire_update_lock(
             ex=_UPDATE_LOCK_TTL_SECONDS,
         )
     return bool(got)
+
+
+async def acquire_update_lock_blocking(
+    docket: Docket,
+    task_scope: str | None,
+    task_id: str,
+    *,
+    timeout: float = 5.0,
+    poll: float = 0.02,
+) -> bool:
+    """Wait for the per-task update lock, up to ``timeout`` seconds.
+
+    ``tasks/cancel`` uses this to serialize with an in-flight ``tasks/update``:
+    it must not cancel a stale leg while an update concurrently enqueues the
+    next one. A single update is fast (milliseconds), so contention is brief;
+    returns False if the lock is still held at the deadline (a wedged holder),
+    letting the caller proceed best-effort rather than hang.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if await acquire_update_lock(docket, task_scope, task_id):
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(poll)
 
 
 async def release_update_lock(

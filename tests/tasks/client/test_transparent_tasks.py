@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import mcp_types
 import pytest
+from mcp.shared.exceptions import MCPError
 
 from fastmcp import Context, FastMCP
 from fastmcp.client import Client
@@ -35,7 +36,24 @@ def task_server() -> FastMCP:
     async def boom() -> str:
         raise ValueError("kaboom")
 
+    @mcp.tool(task=True)
+    async def slow() -> str:
+        await asyncio.sleep(5)
+        return "done"
+
     return mcp
+
+
+async def test_call_tool_timeout_bounds_total_task_drive(task_server: FastMCP):
+    """A per-call timeout bounds the whole tasked drive, not just one poll.
+
+    The tool runs far longer than the timeout while each individual poll answers
+    instantly; the transparent path must still abort once total execution passes
+    the deadline, matching the synchronous `tools/call` timeout contract.
+    """
+    async with Client(task_server, mode="auto") as client:
+        with pytest.raises((TimeoutError, MCPError)):
+            await client.call_tool("slow", {}, timeout=0.3)
 
 
 async def test_call_tool_transparently_completes_a_task(task_server: FastMCP):

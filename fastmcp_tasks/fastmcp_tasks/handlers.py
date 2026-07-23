@@ -36,6 +36,7 @@ from fastmcp_tasks.context import get_task_scope
 from fastmcp_tasks.creation import enqueue_task_leg, registered_component_for_key
 from fastmcp_tasks.input_store import (
     acquire_update_lock,
+    acquire_update_lock_blocking,
     clear_outstanding,
     is_cancelled,
     load_current_leg,
@@ -370,17 +371,34 @@ async def tasks_cancel(server: FastMCP, task_id: str) -> CancelTaskResult:
     on it a no-op. The current leg's outstanding requests are cleared so a
     racing ``tasks/update`` naming them finds nothing, and the running
     execution is still cancelled cooperatively for the ``working`` case.
+
+    Cancellation runs under the per-task update lock and re-resolves the leg
+    once held, so it never cancels a stale leg while ``tasks/update`` is
+    concurrently enqueuing the next one: whichever wins the lock runs to
+    completion before the other, and the update rechecks the marker under the
+    same lock. If the lock is wedged past its timeout, cancel proceeds
+    best-effort rather than hang.
     """
     docket = server._docket
     if docket is None:
         raise _task_not_found(task_id)
 
     task_scope = get_task_scope()
-    execution, _base_task_key, leg_number, _created_at, _poll = await _lookup_task(
-        docket, task_scope, task_id
-    )
-    ttl_seconds = int(docket.execution_ttl.total_seconds())
-    await mark_cancelled(docket, task_scope, task_id, ttl_seconds)
-    await clear_outstanding(docket, task_scope, task_id, leg_number)
-    await docket.cancel(execution.key)
+    # Validate the task exists within scope before taking the lock.
+    await _lookup_task(docket, task_scope, task_id)
+
+    got_lock = await acquire_update_lock_blocking(docket, task_scope, task_id)
+    try:
+        # Re-resolve under the lock: an update that ran first has advanced the
+        # current leg, so this cancels the leg that is actually live now.
+        execution, _base_task_key, leg_number, _created_at, _poll = await _lookup_task(
+            docket, task_scope, task_id
+        )
+        ttl_seconds = int(docket.execution_ttl.total_seconds())
+        await mark_cancelled(docket, task_scope, task_id, ttl_seconds)
+        await clear_outstanding(docket, task_scope, task_id, leg_number)
+        await docket.cancel(execution.key)
+    finally:
+        if got_lock:
+            await release_update_lock(docket, task_scope, task_id)
     return CancelTaskResult()

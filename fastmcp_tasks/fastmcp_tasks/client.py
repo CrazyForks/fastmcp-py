@@ -200,20 +200,37 @@ async def _drive_to_terminal(
     session: ClientSession,
     task_id: str,
     elicitation_callback: ElicitationFnT | None,
-    read_timeout_seconds: float | None = None,
+    timeout_seconds: float | None = None,
 ) -> ClientGetTaskResult:
     """Poll `tasks/get` until the task reaches a terminal state.
 
     `working` sleeps and polls again; `input_required` answers the outstanding
     requests through the elicitation handler and re-enters; a terminal state
     (completed / failed / cancelled) is returned. Shared by the transparent
-    resolver and `ToolTask.result()`. `read_timeout_seconds`, when set, bounds
-    each `tasks/get`/`tasks/update` request so a stalled poll can't outlast the
-    per-call timeout the synchronous path would have honored.
+    resolver and `ToolTask.result()`.
+
+    `timeout_seconds`, when set, is one deadline for the *entire* drive — not a
+    per-request timeout. The synchronous path aborts a `tools/call` once total
+    execution exceeds the call's timeout, so the tasked path must too: each poll
+    and sleep is bounded by the time remaining, and a `TimeoutError` is raised
+    once the deadline passes. `None` drives to completion unbounded (the default
+    for `ToolTask.result()`, whose caller bounds waiting via `wait(timeout=...)`).
     """
+    loop = asyncio.get_event_loop()
+    deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
     backoff = MIN_POLL_INTERVAL
+
+    def remaining() -> float | None:
+        return None if deadline is None else deadline - loop.time()
+
     while True:
-        current = await _send_get(session, task_id, read_timeout_seconds)
+        budget = remaining()
+        if budget is not None and budget <= 0:
+            raise TimeoutError(
+                f"Task {task_id} did not finish within {timeout_seconds}s"
+            )
+
+        current = await _send_get(session, task_id, budget)
         if current.status in _TERMINAL_STATES:
             return current
         if current.status == "input_required":
@@ -222,12 +239,15 @@ async def _drive_to_terminal(
                 task_id,
                 current.input_requests or {},
                 elicitation_callback,
-                read_timeout_seconds,
+                remaining(),
             )
             backoff = MIN_POLL_INTERVAL
             continue
         # working
         delay, backoff = _next_poll_delay(current.poll_interval_ms, backoff)
+        budget = remaining()
+        if budget is not None:
+            delay = min(delay, budget)
         await asyncio.sleep(delay)
 
 

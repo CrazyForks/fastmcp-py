@@ -21,6 +21,7 @@ from mcp_types import ToolExecution
 from fastmcp import FastMCP
 from fastmcp.tools.base import Tool
 from fastmcp.utilities.tasks import TaskConfig
+from fastmcp.utilities.versions import VersionSpec
 from fastmcp_tasks import TasksExtension
 from tests.tasks.task_helpers import (
     _opted_in_request,
@@ -35,6 +36,32 @@ async def _opted_in_call(server: FastMCP, name: str, arguments: dict | None = No
     """Run a `tools/call` WITH the tasks opt-in bound (used to prove sync paths)."""
     with auth_scope(None), _opted_in_request(name, arguments or {}, None):
         return await server.call_tool(name, arguments or {})
+
+
+async def test_interceptor_tasks_the_requested_version_not_the_highest():
+    """A versioned tools/call tasks the version the caller asked for.
+
+    Two versions share a name but differ in task mode: v1 is task-forbidden,
+    v2 is task-optional. A call targeting v1 (with the tasks opt-in) must run v1
+    synchronously — resolving the highest version instead would wrongly task v2.
+    """
+    mcp = FastMCP("versioned-tasks")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(name="calc", version="1.0")
+    async def calc_v1() -> str:
+        return "v1-sync"
+
+    @mcp.tool(name="calc", version="2.0", task=True)
+    async def calc_v2() -> str:
+        return "v2"
+
+    async with running_task_server(mcp):
+        with auth_scope(None), _opted_in_request("calc", {}, None):
+            result = await mcp.call_tool("calc", {}, version=VersionSpec(eq="1.0"))
+
+    assert not isinstance(result, CreateTaskResult)
+    assert result.structured_content == {"result": "v1-sync"}
 
 
 class TestTaskConfigNormalization:
