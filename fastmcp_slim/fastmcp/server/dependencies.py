@@ -207,6 +207,17 @@ def set_worker_server_resolver(
     _worker_server_resolver = resolver
 
 
+#: Headers a background task carries from its originating request. A worker has
+#: no live HTTP request — especially a Redis-backed worker in a separate process
+#: — so ``get_http_request()`` correctly raises there. The tasks extension sets
+#: this from the task snapshot so ``get_http_headers()`` still returns the
+#: submitting request's headers without fabricating a fake ``Request`` (which
+#: would make ``get_http_request()``/``CurrentRequest()`` wrongly succeed).
+_background_task_headers: ContextVar[dict[str, str] | None] = ContextVar(
+    "fastmcp_background_task_headers", default=None
+)
+
+
 # --- Docket availability check ---
 
 _DOCKET_AVAILABLE: bool | None = None
@@ -494,14 +505,21 @@ def get_http_headers(
     headers: dict[str, str] = {}
 
     try:
-        request = get_http_request()
-        for name, value in request.headers.items():
-            lower_name = name.lower()
-            if lower_name not in exclude_headers:
-                headers[lower_name] = str(value)
-        return headers
+        source: Any = get_http_request().headers.items()
     except RuntimeError:
-        return {}
+        # No live request: inside a background-task worker, fall back to the
+        # headers the task carried from its originating request (set by the
+        # tasks extension from the snapshot). Empty elsewhere.
+        task_headers = _background_task_headers.get()
+        if task_headers is None:
+            return {}
+        source = task_headers.items()
+
+    for name, value in source:
+        lower_name = name.lower()
+        if lower_name not in exclude_headers:
+            headers[lower_name] = str(value)
+    return headers
 
 
 def get_access_token() -> AccessToken | None:

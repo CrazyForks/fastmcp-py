@@ -123,6 +123,51 @@ class TestMountedToolTasks:
             assert "child sync: hi" in result.content[0].text
 
 
+class TestRemoteWorkerServerResolution:
+    """A separate worker process re-resolves the owning child from the root.
+
+    The in-process submission map is unreachable across processes, so the worker
+    recovers the mounted child server from the snapshotted tool name instead of
+    falling back to the root (which would break child-specific state/config).
+    """
+
+    async def test_resolve_owning_server_recovers_mounted_child(self, parent_server):
+        import weakref
+
+        from fastmcp_tasks.context import (
+            TaskContextSnapshot,
+            _resolve_owning_server,
+        )
+
+        from fastmcp.server.dependencies import _current_server
+
+        child = await parent_server.get_tool("child_multiply")
+
+        token = _current_server.set(weakref.ref(parent_server))
+        try:
+            snapshot = TaskContextSnapshot(owning_tool_name="child_multiply")
+            resolved = await _resolve_owning_server(snapshot)
+            assert resolved is child._server
+
+            # A parent-owned (unmounted) tool resolves to None so the caller
+            # falls back to the root, and a missing name is likewise None.
+            assert (
+                await _resolve_owning_server(
+                    TaskContextSnapshot(owning_tool_name="parent_tool")
+                )
+                is None
+            )
+            assert (
+                await _resolve_owning_server(
+                    TaskContextSnapshot(owning_tool_name="does_not_exist")
+                )
+                is None
+            )
+            assert await _resolve_owning_server(TaskContextSnapshot()) is None
+        finally:
+            _current_server.reset(token)
+
+
 class TestMountedToolTasksNoPrefix:
     async def test_mounted_tool_without_prefix_works(self, child_server):
         parent = FastMCP("parent-no-prefix")

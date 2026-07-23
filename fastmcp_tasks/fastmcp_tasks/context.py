@@ -144,10 +144,17 @@ class TaskContextSnapshot:
     http_headers: dict[str, str] | None = None
     origin_request_id: str | None = None
     session_id: str | None = None
+    owning_tool_name: str | None = None
 
     @classmethod
-    def capture(cls) -> TaskContextSnapshot:
-        """Capture current context for background task execution."""
+    def capture(cls, owning_tool_name: str | None = None) -> TaskContextSnapshot:
+        """Capture current context for background task execution.
+
+        ``owning_tool_name`` is the routable name of the tool the call targeted.
+        A remote worker (separate process) cannot reach the submitting process's
+        server map, so it re-resolves the owning (child) server from this name
+        against the root — see ``make_task_context``.
+        """
         from fastmcp.server.dependencies import (
             get_access_token,
             get_context,
@@ -170,6 +177,7 @@ class TaskContextSnapshot:
                 str(request_context.request_id) if request_context is not None else None
             ),
             session_id=session_id,
+            owning_tool_name=owning_tool_name,
         )
 
     @classmethod
@@ -186,6 +194,7 @@ class TaskContextSnapshot:
             http_headers=headers,
             origin_request_id=parsed.get("origin_request_id"),
             session_id=parsed.get("session_id"),
+            owning_tool_name=parsed.get("owning_tool_name"),
         )
 
     def to_json(self) -> str:
@@ -196,6 +205,7 @@ class TaskContextSnapshot:
                 "http_headers": self.http_headers,
                 "origin_request_id": self.origin_request_id,
                 "session_id": self.session_id,
+                "owning_tool_name": self.owning_tool_name,
             }
         )
 
@@ -400,6 +410,8 @@ def resolve_worker_server() -> FastMCP | None:
     Installed as core's worker-server resolver by ``TasksExtension`` so
     ``get_server()``/``CurrentFastMCP()`` inside a worker resolve to the (child)
     server the task was submitted against, not the root that runs the worker.
+    The map is populated at submission (same process) and, for a remote worker,
+    by ``make_task_context`` re-resolving from the snapshot before the tool runs.
     """
     task_info = get_task_context()
     if task_info is None:
@@ -407,15 +419,43 @@ def resolve_worker_server() -> FastMCP | None:
     return get_task_server(task_info.task_id)
 
 
+async def _resolve_owning_server(
+    snapshot: TaskContextSnapshot | None,
+) -> FastMCP | None:
+    """Re-resolve a mounted task's owning child server from the root (remote worker).
+
+    A separate worker process cannot reach the submitting process's server map,
+    so the owning server is recovered by looking the snapshotted tool name up on
+    the root: a mounted tool resolves to a ``FastMCPProviderTool`` referencing
+    its child server. Returns ``None`` for an unmounted tool (the root owns it)
+    or when the name no longer resolves, so the caller falls back to the root.
+    """
+    if snapshot is None or snapshot.owning_tool_name is None:
+        return None
+    from fastmcp.exceptions import NotFoundError
+    from fastmcp.server.dependencies import get_server
+    from fastmcp.server.providers.fastmcp_provider import FastMCPProviderTool
+
+    root = get_server()
+    try:
+        tool = await root.get_tool(snapshot.owning_tool_name)
+    except NotFoundError:
+        return None
+    if isinstance(tool, FastMCPProviderTool):
+        return tool._server
+    return None
+
+
 def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     """Populate the ambient request context a worker's tool body reads.
 
     A Docket worker has no live request or SDK auth context — especially a
-    Redis-backed worker in a separate process. Rather than teach core's
-    ``get_access_token()`` / ``get_http_headers()`` about tasks, this restores
-    the *same* context vars a normal request would set, so those functions work
-    unchanged: the SDK auth context var (from the snapshotted token) and a
-    minimal HTTP request rebuilt from the snapshotted headers. Runs inside
+    Redis-backed worker in a separate process. This restores the context vars a
+    tool reads so ``get_access_token()`` / ``get_http_headers()`` work unchanged:
+    the SDK auth context var (from the snapshotted token) and core's background
+    task-headers var (from the snapshotted headers). It deliberately does *not*
+    fabricate a live ``Request``, so ``get_http_request()`` / ``CurrentRequest()``
+    still raise inside a task — there is no request. Runs inside
     ``restore_task_snapshot`` (a Docket dependency), whose context vars propagate
     to the tool the same way the snapshot var already does.
     """
@@ -436,27 +476,9 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
             auth_context_var.set(AuthenticatedUser(token))
 
     if snapshot.http_headers:
-        from starlette.requests import Request
+        from fastmcp.server.dependencies import _background_task_headers
 
-        from fastmcp.server.http import _current_http_request
-
-        _current_http_request.set(
-            Request(
-                {
-                    "type": "http",
-                    "http_version": "1.1",
-                    "method": "POST",
-                    "scheme": "http",
-                    "path": "/",
-                    "raw_path": b"/",
-                    "query_string": b"",
-                    "headers": [
-                        (name.encode("latin-1"), value.encode("latin-1"))
-                        for name, value in snapshot.http_headers.items()
-                    ],
-                }
-            )
-        )
+        _background_task_headers.set(dict(snapshot.http_headers))
 
 
 async def make_task_context() -> Context | None:
@@ -482,8 +504,16 @@ async def make_task_context() -> Context | None:
     if task_info is None:
         return None
 
-    server = get_task_server(task_info.task_id) or get_server()
     snapshot = _recall_snapshot(task_info.task_id)
+    server = get_task_server(task_info.task_id)
+    if server is None:
+        # In-process submission map missed — this is a remote worker (separate
+        # process). Re-resolve the owning (child) server from the root using the
+        # snapshotted tool name, and register it so `CurrentFastMCP()` mid-tool
+        # resolves the child too. Falls back to the root when unmounted or
+        # unresolvable.
+        server = await _resolve_owning_server(snapshot) or get_server()
+        register_task_server(task_info.task_id, server)
     origin_request_id = snapshot.origin_request_id if snapshot else None
 
     ctx = Context(

@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextvars
 from unittest.mock import patch
 
+import pytest
 from fastmcp_tasks.context import (
     TaskContextSnapshot,
     _apply_snapshot_to_context,
@@ -114,6 +115,27 @@ def test_apply_snapshot_restores_auth_and_headers_in_clean_context():
         assert restored.token == "jwt-remote"
         assert restored.client_id == "remote-client"
         assert get_http_headers()["x-trace-id"] == "abc123"
+
+    contextvars.copy_context().run(run_in_clean_worker_context)
+
+
+def test_apply_snapshot_headers_without_faking_a_request():
+    """Snapshot headers are readable, but no live request is fabricated.
+
+    `get_http_headers()` returns the submitting request's headers, while
+    `get_http_request()` still raises — there is no live request inside a
+    background task, and impersonating one would make `CurrentRequest()` expose
+    invented method/URL/client data.
+    """
+    from fastmcp.server.dependencies import get_http_request
+
+    snapshot = TaskContextSnapshot(http_headers={"x-trace-id": "abc123"})
+
+    def run_in_clean_worker_context() -> None:
+        _apply_snapshot_to_context(snapshot)
+        assert get_http_headers()["x-trace-id"] == "abc123"
+        with pytest.raises(RuntimeError):
+            get_http_request()
 
     contextvars.copy_context().run(run_in_clean_worker_context)
 
