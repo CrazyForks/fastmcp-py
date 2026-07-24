@@ -33,7 +33,9 @@ from mcp.client.session import ClientRequestContext, ClientSession, ElicitationF
 from mcp_types import CallToolResult
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
+from fastmcp.client.telemetry import client_span
 from fastmcp.exceptions import ToolError
+from fastmcp.telemetry import inject_trace_context
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from fastmcp.utilities.timeout import normalize_timeout_to_seconds
@@ -69,16 +71,31 @@ _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 # ---------------------------------------------------------------------------
 
 
+def _trace_meta() -> mcp_types.RequestParamsMeta | None:
+    """Trace context for a task management request, for the current client span.
+
+    Task management calls (`tasks/get`/`update`/`cancel`) use ordinary
+    client-to-server trace propagation, so their server-side spans nest under
+    the client span rather than becoming disconnected trace roots.
+    """
+    return cast("mcp_types.RequestParamsMeta | None", inject_trace_context(None))
+
+
 async def _send_get(
     session: ClientSession,
     task_id: str,
     read_timeout_seconds: float | None = None,
 ) -> ClientGetTaskResult:
     """Send `tasks/get` and parse the detailed task response."""
-    request = GetTaskRequest(params=GetTaskRequestParams(task_id=task_id))
-    return await session.send_request(
-        request, ClientGetTaskResult, request_read_timeout_seconds=read_timeout_seconds
-    )
+    with client_span("tasks/get", "tasks/get", task_id):
+        request = GetTaskRequest(
+            params=GetTaskRequestParams(task_id=task_id, meta=_trace_meta())
+        )
+        return await session.send_request(
+            request,
+            ClientGetTaskResult,
+            request_read_timeout_seconds=read_timeout_seconds,
+        )
 
 
 async def _send_update(
@@ -88,12 +105,15 @@ async def _send_update(
     read_timeout_seconds: float | None = None,
 ) -> None:
     """Send `tasks/update` delivering the caller's answers to a parked task."""
-    request = UpdateTaskRequest(
-        params=UpdateTaskRequestParams(task_id=task_id, input_responses=input_responses)
-    )
-    await session.send_request(
-        request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
-    )
+    with client_span("tasks/update", "tasks/update", task_id):
+        request = UpdateTaskRequest(
+            params=UpdateTaskRequestParams(
+                task_id=task_id, input_responses=input_responses, meta=_trace_meta()
+            )
+        )
+        await session.send_request(
+            request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
+        )
 
 
 async def _send_cancel(
@@ -102,10 +122,13 @@ async def _send_cancel(
     read_timeout_seconds: float | None = None,
 ) -> None:
     """Send `tasks/cancel` to cooperatively cancel a task."""
-    request = CancelTaskRequest(params=CancelTaskRequestParams(task_id=task_id))
-    await session.send_request(
-        request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
-    )
+    with client_span("tasks/cancel", "tasks/cancel", task_id):
+        request = CancelTaskRequest(
+            params=CancelTaskRequestParams(task_id=task_id, meta=_trace_meta())
+        )
+        await session.send_request(
+            request, mcp_types.Result, request_read_timeout_seconds=read_timeout_seconds
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -522,16 +545,19 @@ async def call_tool_task(
         fastmcp_meta = dict(combined_meta.get("fastmcp") or {})
         fastmcp_meta["version"] = version
         combined_meta["fastmcp"] = fastmcp_meta
-    request_meta = cast("mcp_types.RequestParamsMeta | None", combined_meta or None)
-    raw = await client._await_with_session_monitoring(
-        client.session.call_tool(
-            name=name,
-            arguments=arguments or {},
-            read_timeout_seconds=read_timeout_seconds,
-            meta=request_meta,
-            allow_claimed=True,
+    with client_span("tools/call", "tools/call", name, tool_name=name):
+        # Propagate the trace into the tasked submission, like a foreground call.
+        propagated = inject_trace_context(combined_meta)
+        request_meta = cast("mcp_types.RequestParamsMeta | None", propagated or None)
+        raw = await client._await_with_session_monitoring(
+            client.session.call_tool(
+                name=name,
+                arguments=arguments or {},
+                read_timeout_seconds=read_timeout_seconds,
+                meta=request_meta,
+                allow_claimed=True,
+            )
         )
-    )
     if isinstance(raw, ClientCreateTaskResult):
         return ToolTask(client, name, raw, raise_on_error=raise_on_error)
     raise ToolError(

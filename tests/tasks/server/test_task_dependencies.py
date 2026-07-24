@@ -17,7 +17,7 @@ import pytest
 from fastmcp_tasks.dependencies import CurrentDocket
 from uncalled_for import Depends
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import CurrentFastMCP
 from fastmcp.server.sessions import UserSession
@@ -246,3 +246,31 @@ async def test_user_session_state_persists_across_task_calls():
     assert second.result["structuredContent"]["result"] == ["apples", "pears"]
     # Bob is a distinct principal — isolated bucket.
     assert other.result["structuredContent"]["result"] == ["figs"]
+
+
+async def test_ctx_session_state_works_in_background_task():
+    """`ctx.session_id` and `ctx.get_state`/`set_state` work inside a worker.
+
+    A worker has no live session, so the Context-level session API falls back to
+    the stable session id captured in the task snapshot. Session-scoped state a
+    task writes is therefore keyed to the submitting client and readable back.
+    """
+    mcp = FastMCP("ctx-session-task")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def stash(value: str, ctx: Context) -> dict[str, object]:
+        await ctx.set_state("stashed", value)
+        return {
+            "session_id": ctx.session_id,
+            "read_back": await ctx.get_state("stashed"),
+        }
+
+    async with running_task_server(mcp):
+        final = await run_task(mcp, "stash", {"value": "hello"})
+
+    assert final.status == "completed"
+    assert final.result is not None
+    structured = final.result["structuredContent"]
+    assert structured["read_back"] == "hello"
+    assert isinstance(structured["session_id"], str) and structured["session_id"]

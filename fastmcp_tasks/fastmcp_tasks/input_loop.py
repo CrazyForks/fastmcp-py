@@ -151,10 +151,25 @@ def reentrant_task_fn(
 
         requests = input_required.input_requests or {}
         request_state = input_required.request_state
-        if not requests and request_state is None:
-            # A leg that asks nothing and carries nothing can never be answered;
-            # treat it as the terminal result rather than an unanswerable park.
-            return result
+        if not requests:
+            if request_state is None:
+                # Asks nothing and carries nothing — terminal, not a park.
+                return result
+            # State-only round: foreground re-invokes the tool after a backoff,
+            # carrying `request_state` forward with no client interaction. The
+            # tasked path has no self-continuation for that yet, so parking it
+            # (with no requests for the client to answer) would strand the task.
+            # Fail loudly rather than silently report a wrong completed result.
+            return _error_result(
+                tool_name,
+                FastMCPError(
+                    "A background task returned a state-only "
+                    "InputRequiredResult (request_state with no input_requests). "
+                    "Checkpoint-style rounds that carry state without asking the "
+                    "client anything are not yet supported for tasks; include at "
+                    "least one input request, or run the tool synchronously."
+                ),
+            )
 
         task_context = get_task_context()
         docket = _resolve_docket()

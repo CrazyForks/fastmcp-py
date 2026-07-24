@@ -217,3 +217,30 @@ def test_reentrant_wrapper_preserves_signature():
 
     wrapped = reentrant_task_fn(fn, "fn")
     assert list(inspect.signature(wrapped).parameters) == ["n", "ctx"]
+
+
+async def test_state_only_guard_round_fails_clearly():
+    """A state-only guard round (request_state, no input_requests) fails loudly.
+
+    Foreground, the client re-invokes such a round after a backoff. The tasked
+    path has no self-continuation for it, so rather than silently completing with
+    a wrong result it surfaces an actionable error.
+    """
+    mcp = FastMCP("guard-state-only")
+    mcp.add_extension(TasksExtension())
+
+    @mcp.tool(task=True)
+    async def checkpoint(ctx: Context) -> str | mcp_types.InputRequiredResult:
+        if ctx.request_state is None:
+            return _input_required({}, request_state="carried")
+        return "done"
+
+    async with running_task_server(mcp):
+        final = await wait_for_task(
+            mcp, (await submit_task(mcp, "checkpoint", {})).task_id
+        )
+
+    assert final.status == "completed"
+    assert final.result is not None
+    assert final.result["isError"] is True
+    assert "state-only" in final.result["content"][0]["text"]

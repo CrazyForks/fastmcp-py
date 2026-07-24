@@ -223,6 +223,16 @@ _background_task_headers: ContextVar[dict[str, str] | None] = ContextVar(
 )
 
 
+#: The originating request's stable session id, carried into a background task.
+#: A worker has no live session, so ``Context.session_id`` (and the session-scoped
+#: ``get_state``/``set_state`` built on it) would otherwise raise. The tasks
+#: extension sets this from the task snapshot so session-scoped state keyed by the
+#: submitting client survives into the worker.
+_background_task_session_id: ContextVar[str | None] = ContextVar(
+    "fastmcp_background_task_session_id", default=None
+)
+
+
 # --- Docket availability check ---
 
 _DOCKET_AVAILABLE: bool | None = None

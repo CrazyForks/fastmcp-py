@@ -139,6 +139,7 @@ class TasksClientSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="FASTMCP_TASKS_CLIENT_",
+        env_file=_ENV_FILE,
         extra="ignore",
     )
 

@@ -793,6 +793,15 @@ class Context:
         elif self._session is not None:
             session = self._session
         else:
+            # Background task: no live session, but the submitting request's
+            # stable session id was captured in the task snapshot. Use it so
+            # session-scoped state (session_id / get_state / set_state) keeps
+            # working in a worker, keyed to the same client that submitted.
+            from fastmcp.server.dependencies import _background_task_session_id
+
+            task_session_id = _background_task_session_id.get()
+            if task_session_id is not None:
+                return task_session_id
             raise RuntimeError(
                 "session_id is not available because no session exists. "
                 "This typically means you're outside a request context."

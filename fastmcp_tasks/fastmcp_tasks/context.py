@@ -489,7 +489,10 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
     from fastmcp.server.auth import AccessToken
-    from fastmcp.server.dependencies import _background_task_headers
+    from fastmcp.server.dependencies import (
+        _background_task_headers,
+        _background_task_session_id,
+    )
 
     user: AuthenticatedUser | None = None
     if snapshot.access_token_json is not None:
@@ -505,6 +508,7 @@ def _apply_snapshot_to_context(snapshot: TaskContextSnapshot) -> None:
     _background_task_headers.set(
         dict(snapshot.http_headers) if snapshot.http_headers else None
     )
+    _background_task_session_id.set(snapshot.session_id)
 
 
 async def make_task_context() -> Context | None:
