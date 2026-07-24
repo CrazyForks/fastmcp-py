@@ -445,6 +445,15 @@ class ResponseCachingMiddleware(Middleware):
         if isinstance(tool_result, InputRequiredToolResult):
             return tool_result
 
+        # A task-augmented call returns a CreateTaskResult (the tasks extension)
+        # up through this middleware — an acknowledgement that the work was
+        # enqueued, not a cacheable answer, and without a ToolResult's
+        # content/structured_content. Pass any non-ToolResult straight through
+        # rather than crash wrapping it (the crash would fire after the task is
+        # already enqueued, so a client retry could duplicate side effects).
+        if not isinstance(tool_result, ToolResult):
+            return tool_result
+
         cacheable_tool_result: CacheableToolResult = CacheableToolResult.wrap(
             value=tool_result
         )
