@@ -3,17 +3,13 @@
 from __future__ import annotations as _annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import pydantic
 import pydantic_core
 
 if TYPE_CHECKING:
-    from docket import Docket
-    from docket.execution import Execution
-
     from fastmcp.prompts.function_prompt import FunctionPrompt
-import mcp_types
 from mcp import GetPromptResult
 from mcp_types import (
     AudioContent,
@@ -31,7 +27,6 @@ from pydantic.json_schema import SkipJsonSchema
 from fastmcp.utilities.authorization import AuthCheck
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.tasks import TaskConfig, TaskMeta
 from fastmcp.utilities.types import (
     FastMCPBaseModel,
 )
@@ -242,7 +237,6 @@ class Prompt(FastMCPComponent):
         icons: list[Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
-        task: bool | TaskConfig | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> FunctionPrompt:
         """Create a Prompt from a function.
@@ -263,7 +257,6 @@ class Prompt(FastMCPComponent):
             icons=icons,
             tags=tags,
             meta=meta,
-            task=task,
             auth=auth,
         )
 
@@ -316,88 +309,18 @@ class Prompt(FastMCPComponent):
             f"got {type(raw_value).__name__}"
         )
 
-    @overload
     async def _render(
         self,
         arguments: dict[str, Any] | None = None,
-        task_meta: None = None,
-    ) -> PromptResult: ...
+    ) -> PromptResult:
+        """Server entry point for prompt renders.
 
-    @overload
-    async def _render(
-        self,
-        arguments: dict[str, Any] | None,
-        task_meta: TaskMeta,
-    ) -> mcp_types.CreateTaskResult: ...
-
-    async def _render(
-        self,
-        arguments: dict[str, Any] | None = None,
-        task_meta: TaskMeta | None = None,
-    ) -> PromptResult | mcp_types.CreateTaskResult:
-        """Server entry point that handles task routing.
-
-        This allows ANY Prompt subclass to support background execution by setting
-        task_config.mode to "supported" or "required". The server calls this
-        method instead of render() directly.
-
-        Args:
-            arguments: Prompt arguments
-            task_meta: If provided, execute as background task and return
-                CreateTaskResult. If None (default), execute synchronously and
-                return PromptResult.
-
-        Returns:
-            PromptResult when task_meta is None.
-            CreateTaskResult when task_meta is provided.
-
-        Subclasses can override this to customize task routing behavior.
-        For example, FastMCPProviderPrompt overrides to delegate to child
-        middleware without submitting to Docket.
+        The server calls this method instead of render() directly so that
+        subclasses can customize dispatch. For example, FastMCPProviderPrompt
+        overrides this to delegate to child-server middleware.
         """
-        from fastmcp.server.tasks.routing import check_background_task
-
-        task_result = await check_background_task(
-            component=self,
-            task_type="prompt",
-            arguments=arguments,
-            task_meta=task_meta,
-        )
-        if task_result:
-            return task_result
-
-        # Synchronous execution
         result = await self.render(arguments)
         return self.convert_result(result)
-
-    def register_with_docket(self, docket: Docket) -> None:
-        """Register this prompt with docket for background execution."""
-        if not self.task_config.supports_tasks():
-            return
-        docket.register(self.render, names=[self.key])
-
-    async def add_to_docket(  # type: ignore[override]
-        self,
-        docket: Docket,
-        arguments: dict[str, Any] | None,
-        *,
-        fn_key: str | None = None,
-        task_key: str | None = None,
-        **kwargs: Any,
-    ) -> Execution:
-        """Schedule this prompt for background execution via docket.
-
-        Args:
-            docket: The Docket instance
-            arguments: Prompt arguments
-            fn_key: Function lookup key in Docket registry (defaults to self.key)
-            task_key: Redis storage key for the result
-            **kwargs: Additional kwargs passed to docket.add()
-        """
-        lookup_key = fn_key or self.key
-        if task_key:
-            kwargs["key"] = task_key
-        return await docket.add(lookup_key, **kwargs)(arguments)
 
     def get_span_attributes(self) -> dict[str, Any]:
         return super().get_span_attributes() | {

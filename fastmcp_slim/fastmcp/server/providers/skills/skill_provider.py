@@ -98,16 +98,12 @@ class SkillFileTemplate(ResourceTemplate):
         else:
             return full_path.read_bytes()
 
-    async def _read(  # type: ignore[override]
+    async def _read(
         self,
         uri: str,
         params: dict[str, Any],
-        task_meta: Any = None,
-    ) -> ResourceResult:  # ty:ignore[invalid-method-override]
-        """Server entry point - read file directly without creating ephemeral resource.
-
-        Note: task_meta is ignored - this template doesn't support background tasks.
-        """
+    ) -> ResourceResult:
+        """Server entry point - read file directly without creating ephemeral resource."""
         # Call read() directly and convert to ResourceResult
         result = await self.read(arguments=params)
         return self.convert_result(result)

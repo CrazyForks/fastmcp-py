@@ -69,7 +69,7 @@ The server creates spans for each operation using [MCP semantic conventions](htt
 | `tools/call {name}` | Tool execution (e.g., `tools/call get_weather`) |
 | `resources/read` | Resource read (URI in `mcp.resource.uri` attribute, not span name) |
 | `prompts/get {name}` | Prompt render (e.g., `prompts/get greeting`) |
-| `tasks/{operation}` | Task management (`tasks/get`, `tasks/result`, `tasks/list`, or `tasks/cancel`) |
+| `tasks/{operation}` | Task management (`tasks/get`, `tasks/update`, or `tasks/cancel`) |
 
 For mounted servers, an additional `delegate {name}` span shows the delegation to the child server.
 
@@ -100,12 +100,12 @@ tools/call remote_search (CLIENT)
 
 Background task traces have two parts:
 
-- Task submission and management requests use normal client-to-server context propagation. `tasks/get`, `tasks/result`, `tasks/list`, and `tasks/cancel` server spans are descendants of the corresponding FastMCP client spans.
+- Task submission and management requests use normal client-to-server context propagation. `tasks/get`, `tasks/update`, and `tasks/cancel` server spans are descendants of the corresponding FastMCP client spans.
 - Deferred execution runs in a Docket worker. Docket records its `CONSUMER` span as a new trace root with a span link to the submission context, rather than making it a child of the submission span. Custom spans created inside the task are children of that worker span.
 
 Span links preserve the causal relationship without forcing worker sampling to inherit the submit trace's sampling decision. Some tracing backends do not display links prominently, so the worker trace may look disconnected even though the link is present.
 
-Frequent status and list polling can produce more detail than you need. You can drop those client and server spans with a sampler that checks the span name before delegating to `ParentBased`:
+Frequent status polling can produce more detail than you need. You can drop those client and server spans with a sampler that checks the span name before delegating to `ParentBased`:
 
 ```python
 from opentelemetry import trace
@@ -124,7 +124,7 @@ class DropTaskPolls(Sampler):
         self._delegate = ParentBased(ALWAYS_ON)
 
     def should_sample(self, parent_context, trace_id, name, *args, **kwargs):
-        if name in {"tasks/get", "tasks/list"}:
+        if name in {"tasks/get"}:
             return SamplingResult(Decision.DROP)
         return self._delegate.should_sample(
             parent_context,

@@ -14,7 +14,6 @@ from contextlib import (
     AbstractAsyncContextManager,
     asynccontextmanager,
 )
-from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast, overload
@@ -80,7 +79,6 @@ from fastmcp.server.middleware.middleware import (
 from fastmcp.server.mixins import LifespanMixin, MCPOperationsMixin, TransportMixin
 from fastmcp.server.providers import LocalProvider, Provider
 from fastmcp.server.providers.aggregate import AggregateProvider
-from fastmcp.server.tasks.config import TaskConfig, TaskMeta
 from fastmcp.server.telemetry import server_span
 from fastmcp.server.transforms import (
     ToolTransform,
@@ -94,6 +92,7 @@ from fastmcp.tools.tool_transform import ToolTransformConfig
 from fastmcp.utilities.components import FastMCPComponent, _coerce_version
 from fastmcp.utilities.exceptions import HTTP_STATUS_ERRORS, TIMEOUT_ERRORS
 from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.tasks import TaskConfig
 from fastmcp.utilities.types import AnyFunction, FastMCPBaseModel, NotSet, NotSetT
 from fastmcp.utilities.versions import (
     VersionSpec,
@@ -655,7 +654,15 @@ class FastMCP(
         can reach it), its method bindings are wired onto the low-level server,
         and it is recorded for capability advertisement, interception, and
         lifespan entry. Registering two extensions with the same identifier is
-        an error.
+        an error, as is registering after the server's lifespan has started —
+        the extension's lifespan could no longer run, leaving it silently
+        half-active.
+
+        Extensions are served by the server they are registered on. A mounted
+        child's extensions do not propagate to the root: the root serves the
+        wire, so only root-registered extensions advertise capabilities and
+        answer methods (matching the lifespan, which also defers to the root).
+        Register extensions on the server you run.
         """
         from fastmcp.server.extensions import (
             build_method_handler,
@@ -669,6 +676,12 @@ class FastMCP(
             raise ValueError(
                 f"An extension with identifier {extension.identifier!r} is "
                 "already registered."
+            )
+        if self._lifespan_result_set:
+            raise RuntimeError(
+                f"Cannot register extension {extension.identifier!r}: the "
+                "server's lifespan has already started, so the extension's "
+                "lifespan would never run. Register extensions before serving."
             )
 
         extension._bind(self)
@@ -1316,7 +1329,6 @@ class FastMCP(
             return None
         return max(authorized, key=version_sort_key)
 
-    @overload
     async def call_tool(
         self,
         name: str,
@@ -1324,29 +1336,7 @@ class FastMCP(
         *,
         version: VersionSpec | None = None,
         run_middleware: bool = True,
-        task_meta: None = None,
-    ) -> ToolResult: ...
-
-    @overload
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta,
-    ) -> mcp_types.CreateTaskResult: ...
-
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta | None = None,
-    ) -> ToolResult | mcp_types.CreateTaskResult:
+    ) -> ToolResult:
         """Call a tool by name.
 
         This is the public API for executing tools. By default, middleware is applied.
@@ -1357,13 +1347,9 @@ class FastMCP(
             version: Specific version to call. If None, calls highest version.
             run_middleware: If True (default), apply the middleware chain.
                 Set to False when called from middleware to avoid re-applying.
-            task_meta: If provided, execute as a background task and return
-                CreateTaskResult. If None (default), execute synchronously and
-                return ToolResult.
 
         Returns:
-            ToolResult when task_meta is None.
-            CreateTaskResult when task_meta is provided.
+            ToolResult.
 
         A guard tool that requests client input (SEP-2322 multi-round-trip)
         returns an ``InputRequiredToolResult`` (a ``ToolResult`` subclass); it
@@ -1425,7 +1411,6 @@ class FastMCP(
                             context.message.arguments or {},
                             version=version,
                             run_middleware=False,
-                            task_meta=task_meta,
                         )
                     ),
                 )
@@ -1467,10 +1452,8 @@ class FastMCP(
                 if tool is None:
                     raise NotFoundError(f"Unknown tool: {name!r}")
                 span.set_attributes(tool.get_span_attributes())
-                if task_meta is not None and task_meta.fn_key is None:
-                    task_meta = replace(task_meta, fn_key=tool.key)
                 try:
-                    return await tool._run(arguments or {}, task_meta=task_meta)
+                    return await tool._run(arguments or {})
                 except ValidationError as e:
                     # Argument-validation failure (a bad call). FunctionTool
                     # converts pydantic's call-validation error into fastmcp's
@@ -1521,34 +1504,13 @@ class FastMCP(
                         raise ToolError(f"Error calling tool {name!r}") from e
                     raise ToolError(f"Error calling tool {name!r}: {e}") from e
 
-    @overload
     async def read_resource(
         self,
         uri: str,
         *,
         version: VersionSpec | None = None,
         run_middleware: bool = True,
-        task_meta: None = None,
-    ) -> ResourceResult: ...
-
-    @overload
-    async def read_resource(
-        self,
-        uri: str,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta,
-    ) -> mcp_types.CreateTaskResult: ...
-
-    async def read_resource(
-        self,
-        uri: str,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta | None = None,
-    ) -> ResourceResult | mcp_types.CreateTaskResult:
+    ) -> ResourceResult:
         """Read a resource by URI.
 
         This is the public API for reading resources. By default, middleware is applied.
@@ -1559,25 +1521,14 @@ class FastMCP(
             version: Specific version to read. If None, reads highest version.
             run_middleware: If True (default), apply the middleware chain.
                 Set to False when called from middleware to avoid re-applying.
-            task_meta: If provided, execute as a background task and return
-                CreateTaskResult. If None (default), execute synchronously and
-                return ResourceResult.
 
         Returns:
-            ResourceResult when task_meta is None.
-            CreateTaskResult when task_meta is provided.
+            ResourceResult.
 
         Raises:
             NotFoundError: If resource not found or disabled
             ResourceError: If resource read fails
         """
-        # Note: fn_key enrichment happens here after finding the resource/template.
-        # Resources and templates use different key formats:
-        # - Resources use resource.key (derived from the concrete URI)
-        # - Templates use template.key (the template pattern)
-        # For mounted servers, the parent's provider sets fn_key to the
-        # namespaced key before delegating, ensuring correct Docket routing.
-
         async with fastmcp.server.context.Context(fastmcp=self) as ctx:
             if run_middleware:
                 mw_context = MiddlewareContext(
@@ -1596,7 +1547,6 @@ class FastMCP(
                         str(context.message.uri),
                         version=version,
                         run_middleware=False,
-                        task_meta=task_meta,
                     ),
                 )
 
@@ -1619,16 +1569,14 @@ class FastMCP(
                 synthesized = await synthesize_prefab_resource_by_uri(self, uri)
                 if synthesized is not None:
                     span.set_attributes(synthesized.get_span_attributes())
-                    return await synthesized._read(task_meta=task_meta)
+                    return await synthesized._read()
 
                 # Try concrete resources first (transforms + auth via _get_resource)
                 resource = await self.get_resource(uri, version=version)
                 if resource is not None:
                     span.set_attributes(resource.get_span_attributes())
-                    if task_meta is not None and task_meta.fn_key is None:
-                        task_meta = replace(task_meta, fn_key=resource.key)
                     try:
-                        return await resource._read(task_meta=task_meta)
+                        return await resource._read()
                     except FastMCPError as e:
                         logger.log(
                             e.log_level,
@@ -1692,10 +1640,8 @@ class FastMCP(
                         )
                         raise ResourceSecurityError(f"Unknown resource: {uri!r}")
 
-                if task_meta is not None and task_meta.fn_key is None:
-                    task_meta = replace(task_meta, fn_key=template.key)
                 try:
-                    return await template._read(uri, params, task_meta=task_meta)
+                    return await template._read(uri, params)
                 except FastMCPError as e:
                     logger.log(
                         e.log_level, f"Error reading resource {uri!r}", exc_info=True
@@ -1724,7 +1670,6 @@ class FastMCP(
                         raise ResourceError(f"Error reading resource {uri!r}") from e
                     raise ResourceError(f"Error reading resource {uri!r}: {e}") from e
 
-    @overload
     async def render_prompt(
         self,
         name: str,
@@ -1732,29 +1677,7 @@ class FastMCP(
         *,
         version: VersionSpec | None = None,
         run_middleware: bool = True,
-        task_meta: None = None,
-    ) -> PromptResult: ...
-
-    @overload
-    async def render_prompt(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta,
-    ) -> mcp_types.CreateTaskResult: ...
-
-    async def render_prompt(
-        self,
-        name: str,
-        arguments: dict[str, Any] | None = None,
-        *,
-        version: VersionSpec | None = None,
-        run_middleware: bool = True,
-        task_meta: TaskMeta | None = None,
-    ) -> PromptResult | mcp_types.CreateTaskResult:
+    ) -> PromptResult:
         """Render a prompt by name.
 
         This is the public API for rendering prompts. By default, middleware is applied.
@@ -1766,13 +1689,9 @@ class FastMCP(
             version: Specific version to render. If None, renders highest version.
             run_middleware: If True (default), apply the middleware chain.
                 Set to False when called from middleware to avoid re-applying.
-            task_meta: If provided, execute as a background task and return
-                CreateTaskResult. If None (default), execute synchronously and
-                return PromptResult.
 
         Returns:
-            PromptResult when task_meta is None.
-            CreateTaskResult when task_meta is provided.
+            PromptResult.
 
         Raises:
             NotFoundError: If prompt not found or disabled
@@ -1798,7 +1717,6 @@ class FastMCP(
                         context.message.arguments,
                         version=version,
                         run_middleware=False,
-                        task_meta=task_meta,
                     ),
                 )
 
@@ -1816,10 +1734,8 @@ class FastMCP(
                 if prompt is None:
                     raise NotFoundError(f"Unknown prompt: {name!r}")
                 span.set_attributes(prompt.get_span_attributes())
-                if task_meta is not None and task_meta.fn_key is None:
-                    task_meta = replace(task_meta, fn_key=prompt.key)
                 try:
-                    return await prompt._render(arguments, task_meta=task_meta)
+                    return await prompt._render(arguments)
                 except FastMCPError as e:
                     logger.log(
                         e.log_level, f"Error rendering prompt {name!r}", exc_info=True
@@ -2025,7 +1941,6 @@ class FastMCP(
         annotations: Annotations | dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         app: AppConfig | dict[str, Any] | bool | None = None,
-        task: bool | TaskConfig | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
         security: ResourceSecurity | None | InheritSecurity = INHERIT_SECURITY,
     ) -> Callable[[F], F]:
@@ -2125,7 +2040,6 @@ class FastMCP(
             tags=tags,
             annotations=annotations,
             meta=meta,
-            task=task if task is not None else self._support_tasks_by_default,
             auth=auth,
             security=security,
         )
@@ -2155,7 +2069,6 @@ class FastMCP(
         icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
-        task: bool | TaskConfig | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> F: ...
 
@@ -2171,7 +2084,6 @@ class FastMCP(
         icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
-        task: bool | TaskConfig | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> Callable[[F], F]: ...
 
@@ -2186,7 +2098,6 @@ class FastMCP(
         icons: list[mcp_types.Icon] | None = None,
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
-        task: bool | TaskConfig | None = None,
         auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionPrompt]
@@ -2271,7 +2182,6 @@ class FastMCP(
             icons=icons,
             tags=tags,
             meta=meta,
-            task=task if task is not None else self._support_tasks_by_default,
             auth=auth,
         )
 

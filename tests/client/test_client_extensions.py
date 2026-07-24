@@ -1,17 +1,21 @@
 """Tests for surfacing SEP-2133 client extensions on ``fastmcp.Client``.
 
 Covers that ``extensions=`` / ``result_claims=`` are folded into the underlying
-``ClientSession`` kwargs on construction, that user-supplied notification
-bindings *compose* with FastMCP's internal task-status binding rather than
-clobbering it, that both bindings actually fire against a live server, and that
-a claimed ``tools/call`` result is resolved end-to-end through the owning
-extension's resolver.
+``ClientSession`` kwargs on construction, that a claimed ``tools/call`` result is
+resolved end-to-end through the owning extension's resolver, and that FastMCP's
+internal tasks extension (from ``fastmcp-tasks``, imported below) is folded in
+automatically and *composes* with a user's own extensions rather than being
+clobbered by them.
+
+Importing ``fastmcp_tasks`` registers the internal client extension factory
+process-wide, so every ``Client`` built here carries the tasks capability ad and
+its ``resultType: "task"`` claim. These tests assert that composition explicitly.
 """
 
-import asyncio
 from typing import Any, Literal
 
 import pytest
+from fastmcp_tasks.client_models import ClientCreateTaskResult
 from mcp.client.extension import (
     ClaimContext,
     ClientExtension,
@@ -26,12 +30,15 @@ from mcp_types import CallToolRequestParams, CallToolResult, Result, TextContent
 from mcp_types.version import LATEST_MODERN_VERSION
 from pydantic import BaseModel
 
+# Importing the package registers the internal tasks client extension factory, so
+# every Client below folds the tasks extension in. Kept as an explicit import so
+# the composition assertions are deterministic regardless of test import order.
+import fastmcp_tasks  # noqa: F401
 from fastmcp import FastMCP
 from fastmcp.client import Client
-from fastmcp.server.dependencies import get_context
+from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 
 CUSTOM_METHOD = "notifications/x-test/ping"
-TASK_STATUS_METHOD = "notifications/tasks/status"
 EXTENSION_ID = "test.example.com/demo"
 CLAIMED_TYPE = "x-test/claimed"
 
@@ -120,19 +127,19 @@ def _claiming_server() -> SDKServer:
     return server
 
 
-def _binding_methods(client: Client) -> list[str]:
-    bindings = client._session_kwargs.get("notification_bindings") or []
-    return [b.method for b in bindings]
-
-
 def test_extension_folds_into_session_kwargs():
-    """A ClientExtension's ad, claim, and binding reach the session kwargs."""
+    """A ClientExtension's ad and claim reach the session kwargs, alongside tasks."""
     client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
 
-    assert client._session_kwargs.get("extensions") == {EXTENSION_ID: {"enabled": True}}
+    # The tasks extension is auto-folded in beside the user's own.
+    assert client._session_kwargs.get("extensions") == {
+        TASKS_EXTENSION_ID: {},
+        EXTENSION_ID: {"enabled": True},
+    }
     result_claims = client._session_kwargs.get("result_claims")
     assert result_claims is not None
     assert [c.result_type for c in result_claims[EXTENSION_ID]] == [CLAIMED_TYPE]
+    assert [c.result_type for c in result_claims[TASKS_EXTENSION_ID]] == ["task"]
 
 
 def test_extension_populates_claim_by_model_index():
@@ -140,39 +147,62 @@ def test_extension_populates_claim_by_model_index():
     client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
 
     assert client._claim_by_model[ClaimedResult].result_type == CLAIMED_TYPE
+    # The auto-folded tasks claim is indexed too.
+    assert client._claim_by_model[ClientCreateTaskResult].result_type == "task"
 
 
-def test_binding_composes_with_internal_task_binding():
-    """User binding is appended to (not replacing) the task-status binding."""
-    client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
-
-    methods = _binding_methods(client)
-    assert TASK_STATUS_METHOD in methods
-    assert CUSTOM_METHOD in methods
-    # The internal task binding must lead so user bindings extend it.
-    assert methods[0] == TASK_STATUS_METHOD
-
-
-def test_no_extensions_leaves_only_task_binding():
-    """Without extensions, only the internal task-status binding is registered."""
+def test_internal_tasks_extension_present_without_user_extensions():
+    """Even with no user extensions, the tasks claim is auto-registered."""
     client = Client(FastMCP("srv"))
 
-    assert _binding_methods(client) == [TASK_STATUS_METHOD]
-    assert "extensions" not in client._session_kwargs
-    assert "result_claims" not in client._session_kwargs
+    assert client._session_kwargs.get("extensions") == {TASKS_EXTENSION_ID: {}}
+    assert client._claim_by_model[ClientCreateTaskResult].result_type == "task"
+
+
+def test_user_extension_composes_with_internal_tasks_extension():
+    """A user extension is folded in beside the internal tasks extension."""
+    client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
+
+    ad = client._session_kwargs.get("extensions") or {}
+    assert TASKS_EXTENSION_ID in ad
+    assert EXTENSION_ID in ad
+    # Both claims are resolvable.
+    assert set(client._claim_by_model) == {ClaimedResult, ClientCreateTaskResult}
+
+
+def test_user_extension_may_override_internal_tasks_extension():
+    """A user extension declaring the tasks identifier wins; the internal one drops.
+
+    Composition prefers the user's extension: rather than colliding on the shared
+    identifier (which the fold rejects), the internal tasks extension is dropped so
+    a power user can supply their own task-handling extension.
+    """
+
+    class CustomTasks(ClientExtension):
+        identifier = TASKS_EXTENSION_ID
+
+        def settings(self) -> dict[str, Any]:
+            return {"custom": True}
+
+    client = Client(FastMCP("srv"), extensions=[CustomTasks()])
+
+    assert client._session_kwargs.get("extensions") == {
+        TASKS_EXTENSION_ID: {"custom": True}
+    }
+    # The user extension declares no claim, so no task claim is registered.
     assert client._claim_by_model == {}
 
 
 def test_new_preserves_extension_composition():
-    """new() rebuilds the clone with both the task binding and user bindings."""
+    """new() rebuilds the clone with both the tasks extension and user extensions."""
     client = Client(FastMCP("srv"), extensions=[_DemoExtension()])
     clone = client.new()
 
-    methods = _binding_methods(clone)
-    assert methods[0] == TASK_STATUS_METHOD
-    assert CUSTOM_METHOD in methods
-    assert clone._session_kwargs.get("extensions") == {EXTENSION_ID: {"enabled": True}}
+    ad = clone._session_kwargs.get("extensions") or {}
+    assert TASKS_EXTENSION_ID in ad
+    assert EXTENSION_ID in ad
     assert clone._claim_by_model[ClaimedResult].result_type == CLAIMED_TYPE
+    assert clone._claim_by_model[ClientCreateTaskResult].result_type == "task"
 
 
 def test_result_claims_merge_with_extension_claims():
@@ -200,78 +230,12 @@ def test_result_claims_merge_with_extension_claims():
     assert result_claims is not None
     tags = {c.result_type for c in result_claims[EXTENSION_ID]}
     assert tags == {CLAIMED_TYPE, "x-test/extra"}
-    # Both the extension claim and the explicit extra claim are resolvable.
-    assert set(client._claim_by_model) == {ClaimedResult, ExtraClaimed}
-
-
-async def test_user_binding_clobbering_task_method_is_rejected():
-    """A user extension binding the task-status method cannot silently replace it.
-
-    Composition means the internal task binding always leads; a user extension
-    that binds the same method collides with it, and the SDK session rejects the
-    duplicate at connect time rather than letting one silently win.
-    """
-
-    class TaskClobberExtension(ClientExtension):
-        identifier = "test.example.com/clobber"
-
-        def notifications(self):
-            async def _handler(params: PingParams) -> None:
-                return None
-
-            return (
-                NotificationBinding(
-                    method=TASK_STATUS_METHOD,
-                    params_type=PingParams,
-                    handler=_handler,
-                ),
-            )
-
-    client = Client(FastMCP("srv"), extensions=[TaskClobberExtension()])
-    with pytest.raises(RuntimeError, match="duplicate notification binding"):
-        async with client:
-            pass
-
-
-async def test_both_bindings_fire_against_live_server():
-    """The internal task binding and a user extension binding both fire.
-
-    A ``task=True`` tool drives ``notifications/tasks/status`` (the internal
-    binding) while a second tool emits a custom notification the user extension
-    observes, proving the two coexist on one live connection. Pinned to
-    ``mode="legacy"`` because FastMCP task submission is a legacy-era feature.
-    """
-    received: list[PingParams] = []
-    mcp = FastMCP("compose-server")
-
-    @mcp.tool
-    async def emit(value: int) -> int:
-        ctx = get_context()
-        # Emit a custom (non-core) notification straight onto the outbound
-        # channel; unknown methods route to the client's notification bindings.
-        await ctx.session._connection.notify(CUSTOM_METHOD, {"value": value})
-        return value
-
-    @mcp.tool(task=True)
-    async def background(value: int) -> int:
-        await asyncio.sleep(0.02)
-        return value * 2
-
-    client = Client(mcp, extensions=[_DemoExtension(received)], mode="legacy")
-
-    async with client:
-        # The user extension binding fires on the custom notification.
-        await client.call_tool("emit", {"value": 21})
-        # The internal task binding fires on the task-status notification.
-        task = await client.call_tool("background", {"value": 5}, task=True)
-        status = await task.wait(timeout=2.0)
-        # Give the custom-notification queue a moment to drain.
-        await asyncio.sleep(0.1)
-
-    # Internal task binding fired: the task completed via a status notification.
-    assert status.status == "completed"
-    # User extension binding fired: it observed the custom notification.
-    assert [p.value for p in received] == [21]
+    # The extension claim, the explicit extra claim, and the tasks claim resolve.
+    assert set(client._claim_by_model) == {
+        ClaimedResult,
+        ExtraClaimed,
+        ClientCreateTaskResult,
+    }
 
 
 class TestClaimedResultResolution:

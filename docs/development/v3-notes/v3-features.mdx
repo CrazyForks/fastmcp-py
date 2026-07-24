@@ -939,7 +939,7 @@ v3.0 implements MCP SEP-1686 for background task execution via Docket integratio
 **Configuration** (`fastmcp_slim/fastmcp/server/tasks/config.py`):
 
 ```python
-from fastmcp.server.tasks import TaskConfig
+from fastmcp.utilities.tasks import TaskConfig
 
 @mcp.tool(task=TaskConfig(mode="required"))
 async def long_running_task():

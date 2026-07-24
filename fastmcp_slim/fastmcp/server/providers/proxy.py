@@ -51,11 +51,11 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.providers.aggregate import ProviderErrorStrategy
 from fastmcp.server.providers.base import Provider
 from fastmcp.server.server import FastMCP
-from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.telemetry import inject_trace_context
 from fastmcp.tools.base import InputRequiredToolResult, Tool, ToolResult
 from fastmcp.utilities.components import FastMCPComponent, get_fastmcp_metadata
 from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.tasks import TaskConfig
 from fastmcp.utilities.versions import VersionSpec, version_sort_key
 
 if TYPE_CHECKING:
@@ -1352,6 +1352,12 @@ class ProxyClient(Client[ClientTransportT]):
     # ContextVar-dependent and would resolve stale values in the receive loop.
     _proxy_rc_ref: list[Any]
     _proxy_restoring_handler_keys: set[str]
+
+    # A proxy forwards calls; it must not advertise task support to its backend.
+    # Proxied tools run synchronously (forbidden mode), and the proxy has no path
+    # to drive a backend task on the front connection's behalf, so the internal
+    # tasks client extension is not folded into a proxy's backend client.
+    _auto_internal_extensions: bool = False
 
     def __init__(
         self,

@@ -128,6 +128,20 @@ def _warn_sampling_deprecated() -> None:
 
 _current_context: ContextVar[Context | None] = ContextVar("context", default=None)
 
+
+#: Error raised when a tool calls ``ctx.elicit()`` inside a background task.
+#: Background tasks gather input with the guard/return pattern (return an
+#: ``InputRequiredResult``), which the end-and-reenter machinery drives across
+#: worker legs. Imperative elicitation would require blocking a worker on a
+#: client round-trip, which end-and-reenter deliberately does not do.
+_TASK_ELICIT_ERROR = (
+    "Imperative ctx.elicit() is not supported inside a background task. Gather "
+    "input with the guard pattern instead: return an InputRequiredResult from "
+    "the tool (with input_requests), and read ctx.input_responses / "
+    "ctx.request_state when the task re-runs after the client answers."
+)
+
+
 TransportType = Literal["stdio", "sse", "streamable-http"]
 _current_transport: ContextVar[TransportType | None] = ContextVar(
     "transport", default=None
@@ -251,6 +265,14 @@ class Context:
         self._origin_request_id: str | None = origin_request_id
         # Request-scoped state for non-serializable values (serializable=False)
         self._request_state: dict[str, Any] = {}
+        # Multi-round-trip input carried in-task (SEP-2322 guard channel). A
+        # foreground round recovers `input_responses`/`request_state` from the
+        # wire request; a worker has no wire request, so the tasks extension's
+        # in-task loop sets these between rounds and the properties below fall
+        # back to them. The guard tool reads `ctx.input_responses` identically
+        # in both modes — only the transport differs (task store vs wire params).
+        self._task_input_responses: mcp_types.InputResponses | None = None
+        self._task_request_state: str | None = None
 
     @property
     def is_background_task(self) -> bool:
@@ -312,25 +334,9 @@ class Context:
         self._tokens.append(token)
 
         # Set current server for dependency injection (use weakref to avoid reference cycles)
-        from fastmcp.server.dependencies import (
-            _current_docket,
-            _current_server,
-            _current_worker,
-            is_docket_available,
-        )
+        from fastmcp.server.dependencies import _current_server, is_docket_available
 
         self._server_token = _current_server.set(weakref.ref(self.fastmcp))
-
-        # Re-set docket/worker from the server instance so mounted children
-        # inherit the parent's Docket via the ContextVar. Only servers that
-        # own the Docket (the parent) have _docket set; children skip this,
-        # leaving the parent's value in place.
-        if is_docket_available():
-            server = self.fastmcp
-            if server._docket is not None:
-                self._docket_token = _current_docket.set(server._docket)
-            if server._worker is not None:
-                self._worker_token = _current_worker.set(server._worker)
 
         if not is_docket_available():
             # Without docket, the lifespan won't provide a SharedContext,
@@ -342,18 +348,8 @@ class Context:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit the context manager and reset the most recent token."""
-        from fastmcp.server.dependencies import (
-            _current_docket,
-            _current_server,
-            _current_worker,
-        )
+        from fastmcp.server.dependencies import _current_server
 
-        if hasattr(self, "_worker_token"):
-            _current_worker.reset(self._worker_token)
-            del self._worker_token
-        if hasattr(self, "_docket_token"):
-            _current_docket.reset(self._docket_token)
-            del self._docket_token
         if hasattr(self, "_shared_context"):
             await self._shared_context.__aexit__(exc_type, exc_val, exc_tb)
             del self._shared_context
@@ -393,6 +389,25 @@ class Context:
         """
         return fastmcp_request_ctx.get()
 
+    def client_extension_settings(self, identifier: str) -> dict[str, Any] | None:
+        """This request's per-request opt-in settings for an MCP extension.
+
+        SEP-2133 extensions negotiate per request: the client repeats its
+        extension capabilities in each request's ``_meta`` under
+        ``io.modelcontextprotocol/clientCapabilities`` → ``extensions`` →
+        ``identifier``. Returns the declared settings dict (possibly empty) when
+        the extension was opted in for this request, or ``None`` when it was
+        not (or there is no active request). This bridges an extension's
+        ``tools/call`` interceptor — which receives a FastMCP ``Context`` — to
+        the request's declared client capabilities.
+        """
+        rc = self.request_context
+        if rc is None:
+            return None
+        from fastmcp.server.extensions import _extract_client_extension_settings
+
+        return _extract_client_extension_settings(rc.meta, identifier)
+
     def _input_response_params(
         self,
     ) -> mcp_types.InputResponseRequestParams | None:
@@ -426,9 +441,14 @@ class Context:
         keys match the `input_requests` map the tool minted; each value is the
         client's result for that request (an `ElicitResult`, `CreateMessageResult`,
         or `ListRootsResult`).
+
+        In a background task there is no wire request, so this falls back to the
+        responses the in-task guard loop delivered (see the tasks extension).
         """
         params = self._input_response_params()
-        return params.input_responses if params else None
+        if params is not None and params.input_responses is not None:
+            return params.input_responses
+        return self._task_input_responses
 
     @property
     def request_state(self) -> str | None:
@@ -440,9 +460,14 @@ class Context:
         before the tool runs, so tampering is rejected before this is read).
         `None` on the initial round. Use it to carry a small amount of computed
         state across rounds without re-deriving it.
+
+        In a background task there is no wire request, so this falls back to the
+        state the in-task guard loop re-injected (see the tasks extension).
         """
         params = self._input_response_params()
-        return params.request_state if params else None
+        if params is not None and params.request_state is not None:
+            return params.request_state
+        return self._task_request_state
 
     @property
     def lifespan_context(self) -> dict[str, Any]:
@@ -768,6 +793,15 @@ class Context:
         elif self._session is not None:
             session = self._session
         else:
+            # Background task: no live session, but the submitting request's
+            # stable session id was captured in the task snapshot. Use it so
+            # session-scoped state (session_id / get_state / set_state) keeps
+            # working in a worker, keyed to the same client that submitted.
+            from fastmcp.server.dependencies import _background_task_session_id
+
+            task_session_id = _background_task_session_id.get()
+            if task_session_id is not None:
+                return task_session_id
             raise RuntimeError(
                 "session_id is not available because no session exists. "
                 "This typically means you're outside a request context."
@@ -1334,9 +1368,10 @@ class Context:
                 ``value`` field. Same scope rules as ``response_title``.
 
         Note:
-            This method works transparently in both request and background task
-            contexts. In background task mode (SEP-1686), it will set the task
-            status to "input_required" and wait for the client to provide input.
+            Imperative elicitation is not available inside a background task
+            (calling it there raises a ``ToolError``). A task gathers input with
+            the guard pattern: return an ``InputRequiredResult`` and read
+            ``ctx.input_responses`` / ``ctx.request_state`` when the task re-runs.
         """
         if response_type is None and fastmcp.settings.deprecation_warnings:
             warnings.warn(
@@ -1356,24 +1391,22 @@ class Context:
         )
 
         if self.is_background_task:
-            # Background task mode: use task-aware elicitation
-            result = await self._elicit_for_task(
-                message=message,
-                schema=config.schema,
-            )
-        else:
-            # Foreground push path: server-initiated elicitation needs a
-            # back-channel, which the 2026-07-28 era removed (SEP-2577). Raise a
-            # clear era-aware error before hitting the wire instead of the SDK's
-            # opaque "Method not found". Handshake-era behavior is unchanged.
-            if self._is_modern_protocol():
-                raise ToolError(_ELICIT_MODERN_ERROR)
-            # Standard request mode: use session.elicit directly
-            result = await self.session.elicit(
-                message=message,
-                requested_schema=config.schema,
-                related_request_id=self.request_id,
-            )
+            # Background tasks gather input with the guard/return pattern, not
+            # imperative elicitation — the worker never blocks on a client
+            # round-trip. Fail fast with the guidance to use InputRequiredResult.
+            raise ToolError(_TASK_ELICIT_ERROR)
+        # Foreground push path: server-initiated elicitation needs a back-channel,
+        # which the 2026-07-28 era removed (SEP-2577). Raise a clear era-aware
+        # error before hitting the wire instead of the SDK's opaque "Method not
+        # found". Handshake-era behavior is unchanged.
+        if self._is_modern_protocol():
+            raise ToolError(_ELICIT_MODERN_ERROR)
+        # Standard request mode: use session.elicit directly
+        result = await self.session.elicit(
+            message=message,
+            requested_schema=config.schema,
+            related_request_id=self.request_id,
+        )
 
         if result.action == "accept":
             return handle_elicit_accept(config, result.content)
@@ -1383,46 +1416,6 @@ class Context:
             return CancelledElicitation()
         else:
             raise ValueError(f"Unexpected elicitation action: {result.action}")
-
-    async def _elicit_for_task(
-        self,
-        message: str,
-        schema: dict[str, Any],
-    ) -> mcp_types.ElicitResult:
-        """Send an elicitation request from a background task (SEP-1686).
-
-        This method handles elicitation when running in a Docket worker context,
-        where there's no active MCP request. It:
-        1. Sets the task status to "input_required"
-        2. Sends the elicitation request with task metadata
-        3. Waits for the client to provide input via tasks/sendInput
-        4. Returns the result and resumes task execution
-
-        Args:
-            message: The message to display to the user
-            schema: The JSON schema for the expected response
-
-        Returns:
-            ElicitResult with the user's response
-
-        Raises:
-            RuntimeError: If not running in a background task context
-        """
-        if not self.is_background_task:
-            raise RuntimeError(
-                "_elicit_for_task called but not in a background task context"
-            )
-
-        # Import here to avoid circular imports and optional dependency issues
-        from fastmcp.server.tasks.elicitation import elicit_for_task
-
-        return await elicit_for_task(
-            task_id=self._task_id,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
-            session=self._session,
-            message=message,
-            schema=schema,
-            fastmcp=self.fastmcp,
-        )
 
     def _make_state_key(self, key: str) -> str:
         """Create session-prefixed key for state storage."""

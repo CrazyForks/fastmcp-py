@@ -190,8 +190,9 @@ Legacy mode is also what you need for the capabilities that depend on a live ses
 - **[Sampling](/clients/sampling)** — server-initiated LLM completion requests
 - **[Roots](/clients/roots)** — server-initiated requests for the client's roots
 - **[Elicitation](/clients/elicitation)** — server-initiated requests for user input, which modern connections replace with [input-required rounds](/clients/elicitation#input-required-rounds)
-- **[Background tasks](/clients/tasks)** — submitting an operation with `task=True`
 - `client.ping()` and `transport.get_session_id()`
+
+Conversely, [background tasks](/clients/tasks) are **modern-only**: the tasks capability is negotiated over `2026-07-28` connections, so `mode="legacy"` never triggers one and a task-enabled tool just runs synchronously.
 
 A FastMCP server serves both eras, so a default client negotiates the modern one and these raise an era-specific error. Pinning the handshake restores them.
 
@@ -288,7 +289,7 @@ from myproject.extensions import AppsExtension
 client = Client("https://example.com/mcp", extensions=[AppsExtension()])
 ```
 
-Each extension's contributions are threaded into the underlying session. Notification bindings compose with FastMCP's own internal task-status binding rather than replacing it, so an extension that observes a custom notification and FastMCP's task tracking both work on the same connection. When a tool returns a shape an extension claims, `client.call_tool()` resolves it transparently through the owning claim's resolver and hands you back an ordinary result. Result claims and their advertisements are honored only on modern-era connections, so they are inert on a legacy handshake.
+Each extension's contributions are threaded into the underlying session. FastMCP folds in its own internal extension for [background tasks](/clients/tasks) automatically, and your own extensions *compose* with it rather than replacing it — pass your own tasks extension with the same identifier if you need to override it. When a tool returns a shape an extension claims, `client.call_tool()` resolves it transparently through the owning claim's resolver and hands you back an ordinary result. Result claims and their advertisements are honored only on modern-era connections, so they are inert on a legacy handshake.
 
 For the rare case where you need to register additional result claims against an extension that is already advertised, pass them through `result_claims=`, keyed by the extension's identifier. Prefer declaring claims on the extension itself; this parameter merges extra claims with an extension's own.
 

@@ -45,8 +45,6 @@ from pydantic import BaseModel
 from fastmcp.server.dependencies import _lift_meta, bind_request_context
 
 if TYPE_CHECKING:
-    import mcp_types
-
     from fastmcp.server.context import Context
     from fastmcp.server.server import FastMCP
     from fastmcp.tools.base import ToolResult
@@ -58,8 +56,10 @@ __all__ = [
 ]
 
 # What an extension's tools/call interceptor observes and may produce: the tool
-# result, or the claimed CreateTaskResult shape when the call is run as a task.
-ToolCallOutcome: TypeAlias = "ToolResult | mcp_types.CreateTaskResult"
+# result, or an extension-defined wire result model (a `BaseModel` the runner
+# serializes) when the call is short-circuited — e.g. the tasks extension's
+# CreateTaskResult. Core does not interpret the extension's result shape.
+ToolCallOutcome: TypeAlias = "ToolResult | BaseModel"
 
 # A method handler receives the SDK request context plus validated params and
 # returns a bare result model (the runner serializes it).
